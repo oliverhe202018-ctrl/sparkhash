@@ -1,0 +1,28 @@
+# Compiler files
+cache/
+out/
+
+# Commonly ignored directories
+.logs/
+.ignore/
+
+# Broadcast & deployment transaction artifacts (strictly ignored)
+broadcast/
+
+# Docs
+docs/
+
+# Dotenv files
+.env
+.env.*
+!.env.example
+
+# Key files, certificates and secrets
+*.key
+*.pem
+*.keystore
+*.pkcs12
+*.p12
+id_rsa*
+*secret*
+*private_key*

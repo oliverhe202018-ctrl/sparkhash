@@ -1,0 +1,400 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {IToken} from "./interfaces/IToken.sol";
+import {IVault} from "./interfaces/IVault.sol";
+import {IMiner} from "./interfaces/IMiner.sol";
+
+/// @title MinerV1
+/// @notice Core mining logic for epoch-based, share-proportional PoW token distribution.
+/// @dev Designed to be deployed behind a Transparent Upgradeable Proxy.
+contract MinerV1 is Initializable, ReentrancyGuardUpgradeable, IMiner {
+    IToken public token;
+    IVault public vault;
+    address public admin;
+    uint256 public START;
+
+    uint256 public constant EPOCH_LEN = 3600;
+    uint256 public constant CAP = 15;                 // Max shares per address per epoch
+    uint256 public constant RAMP_EPOCHS = 24;         // Warmup ramp duration in epochs
+    uint256 public constant RAMP_START_BPS = 2500;    // 25% starting weight
+    uint256 public constant MINING_CAP = 900_000_000e18;
+    uint256 public constant D0 = 3_000_000e18;        // Day 1 quota
+    uint256 public constant DECAY = 0.9967e18;        // Daily decay: 0.9967
+    uint256 public constant EASIEST = uint256(1) << 222;  // 34 bits
+    uint256 public constant HARDEST = uint256(1) << 220;  // 36 bits
+    uint256 public constant WSCALE = 1e10;            // Weight unit: sqrt(1)*1e6 * 10000 bps
+
+    // Configurable parameters with bounds
+    uint256 public S_STAR;                            // Target counted shares per epoch
+    uint256 public ADDR_CAP_BPS;                      // Max reward share per address (default 2000 = 20%)
+    bool public paused;
+
+    uint256 public lastSynced;
+    uint256 public ema;
+
+    mapping(uint256 => uint256) public epochSeed;
+    mapping(uint256 => uint256) public target;
+    mapping(uint256 => uint256) public totalShares;
+    mapping(uint256 => uint256) public totalWeight;
+    mapping(uint256 => mapping(address => uint16)) public usedMask;
+    mapping(uint256 => mapping(address => uint8)) public counted;
+    mapping(uint256 => mapping(address => uint256)) public userWeight;
+    mapping(uint256 => mapping(address => bool)) public claimed;
+
+    // Per-epoch parameter snapshots: ensures modifying parameters never changes past un-claimed rewards
+    mapping(uint256 => uint256) public epochSStar;
+    mapping(uint256 => uint256) public epochAddrCapBps;
+    address public override guardian;
+
+    event SharesSubmitted(address indexed u, uint256 indexed epoch, uint256 n, uint256 weightAdded);
+    event Claimed(address indexed u, uint256 indexed epoch, uint256 amount);
+    event EpochSynced(uint256 indexed epoch, uint256 target, uint256 ema);
+    event EpochSeedInitialized(uint256 indexed epoch, uint256 seed);
+    event SubmissionsPaused(address indexed account);
+    event SubmissionsUnpaused(address indexed account);
+    event SStarUpdated(uint256 oldValue, uint256 newValue);
+    event AddrCapBpsUpdated(uint256 oldValue, uint256 newValue);
+    event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
+    event GuardianTransferred(address indexed oldGuardian, address indexed newGuardian);
+
+    error OnlyAdmin();
+    error OnlyAdminOrGuardian();
+    error ZeroAddress();
+    error MismatchStart();
+    error MismatchEpochLen();
+    error SubmissionsPausedError();
+    error BadBatchLength();
+    error SyncingRequired();
+    error SeedNotInitialized();
+    error FutureEpoch();
+    error SeedAlreadyInitialized();
+    error PrevSeedNotInitialized();
+    error BlockhashUnavailable();
+    error NoActiveStake();
+    error AddressCapExceeded();
+    error InvalidShareIndex();
+    error DuplicateShareIndex();
+    error InvalidProof();
+    error EpochNotEnded();
+    error AlreadyClaimed();
+    error ZeroWeight();
+    error ParameterOutOfBounds();
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        address _token,
+        address _vault,
+        address _admin,
+        address _guardian,
+        uint256 _start
+    ) external initializer {
+        if (_token == address(0) || _vault == address(0) || _admin == address(0) || _guardian == address(0)) revert ZeroAddress();
+        if (IVault(_vault).START() != _start) revert MismatchStart();
+        if (IVault(_vault).EPOCH_LEN() != EPOCH_LEN) revert MismatchEpochLen();
+
+        __ReentrancyGuard_init();
+
+        token = IToken(_token);
+        vault = IVault(_vault);
+        admin = _admin;
+        guardian = _guardian;
+        START = _start;
+
+        S_STAR = 50_000;
+        ADDR_CAP_BPS = 2000; // 20%
+        target[0] = EASIEST;
+        ema = 50_000;
+        lastSynced = 0;
+
+        epochSStar[0] = 50_000;
+        epochAddrCapBps[0] = 2000;
+    }
+
+    function epoch() public view override returns (uint256) {
+        return block.timestamp < START ? 0 : (block.timestamp - START) / EPOCH_LEN;
+    }
+
+    // --- Quota & Mathematical Models ---
+
+    function _powFixed(uint256 base, uint256 exp) internal pure returns (uint256) {
+        uint256 res = 1e18;
+        uint256 b = base;
+        while (exp > 0) {
+            if (exp & 1 == 1) {
+                res = (res * b) / 1e18;
+            }
+            b = (b * b) / 1e18;
+            exp >>= 1;
+        }
+        return res;
+    }
+
+    /// @notice Daily quota for day d (1-indexed)
+    function dailyQuota(uint256 day) public pure override returns (uint256) {
+        if (day == 0) return 0;
+        uint256 f = _powFixed(DECAY, day - 1);
+        return (D0 * f) / 1e18;
+    }
+
+    /// @notice Standard epoch quota for epoch e
+    function epochQuota(uint256 e) public pure override returns (uint256) {
+        return dailyQuota(e / 24 + 1) / 24;
+    }
+
+    /// @notice Cumulative quota sum of completed full days before day d+1 using geometric series closed form
+    /// @dev Sum_{k=1..d} D0 * r^(k-1) = D0 * (1 - r^d) / (1 - r)
+    ///      Where: D0 = 3,000,000e18, r = 0.9967e18 -> 1 - r = 0.0033e18 = 3.3e15
+    ///      D0 / (1 - r) = 3,000,000e18 / 3.3e15 = 3e24 / 3.3e15 = 3e9 / 3.3 = 30e9 / 33 = 10_000_000_000 / 11.
+    ///      Since (1e18 - r^d) is scaled by 1e18, the formula:
+    ///      (10_000_000_000 * (1e18 - rd)) / 11 gives the exact sum in 18-decimal wei.
+    ///      WARNING: If D0 or DECAY is ever modified, this ratio must be recalculated!
+    function cumulativeDailyQuota(uint256 completedDays) public pure returns (uint256) {
+        if (completedDays == 0) return 0;
+        uint256 rd = _powFixed(DECAY, completedDays);
+        return (10_000_000_000 * (1e18 - rd)) / 11;
+    }
+
+    /// @notice Total scheduled mining quota prior to epoch e (closed form, independent of claim history)
+    function cumulativeQuotaBefore(uint256 e) public pure override returns (uint256) {
+        uint256 completedDays = e / 24;
+        uint256 fullDaysQuota = cumulativeDailyQuota(completedDays);
+        uint256 epochsToday = e % 24;
+        uint256 partialToday = epochsToday * epochQuota(e);
+        return fullDaysQuota + partialToday;
+    }
+
+    /// @notice Effective epoch quota capped at 900M mining cap (flat equal ceiling for all miners in epoch e)
+    function effectiveQuota(uint256 e) public pure override returns (uint256) {
+        uint256 cb = cumulativeQuotaBefore(e);
+        if (cb >= MINING_CAP) return 0;
+        uint256 remaining = MINING_CAP - cb;
+        uint256 eq = epochQuota(e);
+        return remaining < eq ? remaining : eq;
+    }
+
+    /// @notice Minimum epoch weight threshold W_min
+    function wMin(uint256 e) public pure returns (uint256) {
+        uint256 d = e / 24;
+        return (d < 30 ? 10 : d < 90 ? 50 : 100) * WSCALE;
+    }
+
+    function _isqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    function _w(uint256 c) internal pure returns (uint256) {
+        return _isqrt(c * 1e12); // sqrt(c) * 1e6
+    }
+
+    // --- State & PoW Operations ---
+
+    /// @notice Initialize epoch seed lazily using previous blockhash. Required before shares can be submitted.
+    function initEpochSeed(uint256 e) external override {
+        if (e > epoch()) revert FutureEpoch();
+        if (epochSeed[e] != 0) revert SeedAlreadyInitialized();
+        if (e > 0 && epochSeed[e - 1] == 0) revert PrevSeedNotInitialized();
+
+        bytes32 bh = blockhash(block.number - 1);
+        if (bh == bytes32(0)) revert BlockhashUnavailable();
+
+        bytes32 prev = (e == 0) ? bytes32(0) : bytes32(epochSeed[e - 1]);
+        uint256 seed = uint256(keccak256(abi.encode(prev, bh, e, block.chainid, address(this))));
+        epochSeed[e] = seed;
+
+        emit EpochSeedInitialized(e, seed);
+    }
+
+    /// @notice Catch up epoch target and EMA sequentially up to maxSteps. Unprivileged public function.
+    function sync(uint256 maxSteps) public override returns (uint256) {
+        uint256 cur = epoch();
+        uint256 n = lastSynced;
+        if (cur == 0 || n >= cur) {
+            return n;
+        }
+
+        uint256 steps = cur - n;
+        if (maxSteps > 0 && steps > maxSteps) {
+            steps = maxSteps;
+        }
+        uint256 stop = n + steps;
+
+        while (n < stop) {
+            n++;
+            uint256 shares = (n >= 2) ? totalShares[n - 2] : S_STAR;
+            ema = (ema + shares) / 2;
+            uint256 t = target[n - 1];
+            uint256 nt = (ema == 0) ? (t * 125 / 100) : (t * S_STAR / ema);
+            if (nt > t * 125 / 100) nt = t * 125 / 100;
+            if (nt < t * 100 / 125) nt = t * 100 / 125;
+            if (nt > EASIEST) nt = EASIEST;
+            if (nt < HARDEST) nt = HARDEST;
+            target[n] = nt;
+
+            // Snapshot parameters for epoch n
+            epochSStar[n] = S_STAR;
+            epochAddrCapBps[n] = ADDR_CAP_BPS;
+
+            emit EpochSynced(n, nt, ema);
+        }
+        lastSynced = n;
+        return n;
+    }
+
+    function _getRamp(uint256 e, address user) internal view returns (uint256) {
+        (bool active, uint256 since) = vault.status(user);
+        if (!active || e < since + 1) revert NoActiveStake();
+        uint256 age = e - (since + 1);
+        if (age > RAMP_EPOCHS) age = RAMP_EPOCHS;
+        return RAMP_START_BPS + (10000 - RAMP_START_BPS) * age / RAMP_EPOCHS;
+    }
+
+    function _verifyShare(
+        bytes32 es,
+        address user,
+        uint8 k,
+        uint256 nonce,
+        uint256 target_
+    ) internal view returns (bool) {
+        bytes32 sub = keccak256(abi.encode(es, user, uint256(k), address(this), block.chainid));
+        return uint256(keccak256(abi.encode(sub, nonce))) <= target_;
+    }
+
+    /// @notice Submit valid PoW shares for the current epoch.
+    function submitShares(uint8[] calldata ks, uint256[] calldata nonces) external override {
+        if (paused) revert SubmissionsPausedError();
+        if (ks.length != nonces.length || ks.length == 0 || ks.length > CAP) revert BadBatchLength();
+
+        uint256 e = epoch();
+        if (lastSynced < e) {
+            sync(48);
+        }
+        if (lastSynced != e) revert SyncingRequired();
+        if (epochSeed[e] == 0) revert SeedNotInitialized();
+
+        uint256 ramp = _getRamp(e, msg.sender);
+        uint16 mask = usedMask[e][msg.sender];
+        uint8 c = counted[e][msg.sender];
+        if (uint256(c) + ks.length > CAP) revert AddressCapExceeded();
+
+        uint256 t = target[e];
+        bytes32 es = bytes32(epochSeed[e]);
+
+        for (uint256 i = 0; i < ks.length; i++) {
+            uint8 k = ks[i];
+            if (k >= CAP) revert InvalidShareIndex();
+            uint16 bit = uint16(1) << k;
+            if ((mask & bit) != 0) revert DuplicateShareIndex();
+            mask |= bit;
+
+            if (!_verifyShare(es, msg.sender, k, nonces[i], t)) revert InvalidProof();
+        }
+
+        usedMask[e][msg.sender] = mask;
+        counted[e][msg.sender] = c + uint8(ks.length);
+
+        // Telescoping sum optimization: compute total weight increment once
+        uint256 add = (_w(uint256(c) + ks.length) - _w(uint256(c))) * ramp;
+        userWeight[e][msg.sender] += add;
+        totalWeight[e] += add;
+        totalShares[e] += ks.length;
+
+        emit SharesSubmitted(msg.sender, e, ks.length, add);
+    }
+
+    /// @notice Pull-payment claim for finalized epoch rewards. NEVER PAUSABLE.
+    /// @dev Uses epochAddrCapBps snapshot to ensure changes to ADDR_CAP_BPS never alter past ended rewards.
+    function claim(uint256 e) external override nonReentrant {
+        if (e >= epoch()) revert EpochNotEnded();
+        if (claimed[e][msg.sender]) revert AlreadyClaimed();
+        claimed[e][msg.sender] = true;
+
+        uint256 uw = userWeight[e][msg.sender];
+        if (uw == 0) revert ZeroWeight();
+
+        uint256 effQ = effectiveQuota(e);
+        if (effQ == 0) {
+            emit Claimed(msg.sender, e, 0);
+            return;
+        }
+
+        uint256 tw = totalWeight[e];
+        uint256 wm = wMin(e);
+        uint256 denom = tw > wm ? tw : wm;
+
+        uint256 amt = (effQ * uw) / denom;
+
+        // Use snapshot cap for epoch e; fall back to ADDR_CAP_BPS if unrecorded
+        uint256 capBps = epochAddrCapBps[e];
+        if (capBps == 0) capBps = ADDR_CAP_BPS;
+
+        uint256 maxAmt = (effQ * capBps) / 10000;
+        if (amt > maxAmt) amt = maxAmt;
+
+        emit Claimed(msg.sender, e, amt);
+        if (amt > 0) {
+            token.mint(msg.sender, amt);
+        }
+    }
+
+    // --- Admin & Governance ---
+
+    function pauseSubmissions() external override {
+        if (msg.sender != admin && msg.sender != guardian) revert OnlyAdminOrGuardian();
+        paused = true;
+        emit SubmissionsPaused(msg.sender);
+    }
+
+    function unpause() external override {
+        if (msg.sender != admin) revert OnlyAdmin();
+        paused = false;
+        emit SubmissionsUnpaused(msg.sender);
+    }
+
+    function setSStar(uint256 newSStar) external override {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (newSStar < 1_000 || newSStar > 1_000_000) revert ParameterOutOfBounds();
+        uint256 old = S_STAR;
+        S_STAR = newSStar;
+        emit SStarUpdated(old, newSStar);
+    }
+
+    function setAddrCapBps(uint256 newCapBps) external override {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (newCapBps < 500 || newCapBps > 5_000) revert ParameterOutOfBounds();
+        uint256 old = ADDR_CAP_BPS;
+        ADDR_CAP_BPS = newCapBps;
+        emit AddrCapBpsUpdated(old, newCapBps);
+    }
+
+    function transferAdmin(address newAdmin) external {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (newAdmin == address(0)) revert ZeroAddress();
+        address old = admin;
+        admin = newAdmin;
+        emit AdminTransferred(old, newAdmin);
+    }
+
+    function setGuardian(address newGuardian) external {
+        if (msg.sender != admin) revert OnlyAdmin();
+        if (newGuardian == address(0)) revert ZeroAddress();
+        address old = guardian;
+        guardian = newGuardian;
+        emit GuardianTransferred(old, newGuardian);
+    }
+
+    // Reserved storage space for proxy upgrades (reduced by 3 slots for epochSStar, epochAddrCapBps, and guardian)
+    uint256[47] private __gap;
+}
