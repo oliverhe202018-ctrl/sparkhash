@@ -28,3 +28,11 @@ id_rsa*
 # Dryrun and verification output logs
 dryrun-output.txt
 *dryrun*.txt
+__pycache__/
+*.pyc
+.venv_gpu/
+.pytest_cache/
+share_*.json
+test_share_program.json
+test_gpu_share_*.json
+gpu_share_*.json

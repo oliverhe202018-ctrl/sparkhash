@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PoolCoin Multi-threaded PoW Miner for MinerV1 on BSC Testnet (chainId 97)
+
+Calculates valid proof-of-work shares meeting MinerV1 target difficulty.
+Outputs verified share (nonce and hash) to a JSON file.
+
+HARD CONSTRAINTS ENFORCED:
+1. Hardcoded refusal for any chainId != 97 (BSC Testnet only).
+2. Pure read-only RPC & local PoW. Zero private key logic; never reads or touches .env.
+3. Separation of mining and submission: this script ONLY generates shares to JSON.
+"""
+
+import os
+import sys
+import time
+import json
+import struct
+import argparse
+import urllib.request
+import threading
+import multiprocessing as mp
+
+# Chain ID constraint: strictly BSC Testnet
+REQUIRED_CHAIN_ID = 97
+
+# Default addresses and targets on BSC Testnet
+DEFAULT_MINER_CONTRACT = "0x420382a0f874c1F120621f847d81581e8737504e"
+DEFAULT_VAULT_CONTRACT = "0x04aDD681D11F4af72D44BD8cCc6Ee5d12801A1a7"
+DEFAULT_RPC_URL = "https://data-seed-prebsc-1-s1.binance.org:8545"
+DEFAULT_DIFFICULTY_BITS = 34  # 34-bit difficulty: 1 << 222
+DEFAULT_EASIEST_TARGET = 1 << 222  # 34-bit: 2^222
+DEFAULT_HARDEST_TARGET = 1 << 220  # 36-bit: 2^220
+CAP = 15
+
+# Keccak-256 low-level bindings for high-performance hashing
+try:
+    from Crypto.Hash.keccak import _raw_keccak_lib
+    from Crypto.Util._raw_api import ffi
+    HAS_RAW_KECCAK = True
+except Exception:
+    HAS_RAW_KECCAK = False
+
+from eth_hash.auto import keccak as standard_keccak
+
+
+def rpc_call(rpc_url, method, params):
+    """Performs a JSON-RPC call."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000),
+        "method": method,
+        "params": params,
+    }
+    req = urllib.request.Request(
+        rpc_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "PoolCoin-Miner/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        res = json.loads(resp.read().decode("utf-8"))
+        if "error" in res:
+            raise RuntimeError(f"RPC Error ({method}): {res.get('error')}")
+        return res.get("result")
+
+
+def verify_chain_id(rpc_url):
+    """Queries chainId from RPC and asserts it equals 97."""
+    res = rpc_call(rpc_url, "eth_chainId", [])
+    chain_id = int(res, 16) if isinstance(res, str) else int(res)
+    if chain_id != REQUIRED_CHAIN_ID:
+        raise ValueError(
+            f"SECURITY REJECTION: Chain ID {chain_id} != {REQUIRED_CHAIN_ID} (BSC Testnet required)! Refusing to run."
+        )
+    return chain_id
+
+
+def eth_call(rpc_url, to, data):
+    """Simulates eth_call."""
+    tx = {"to": to, "data": "0x" + data}
+    res = rpc_call(rpc_url, "eth_call", [tx, "latest"])
+    if res and res.startswith("0x"):
+        return res[2:]
+    return res or ""
+
+
+def to_checksum_address(address):
+    """Converts address to EIP-55 checksum format."""
+    clean = address.lower().replace("0x", "")
+    h = standard_keccak(clean.encode("utf-8")).hex()
+    return "0x" + "".join(c.upper() if int(h[i], 16) >= 8 else c for i, c in enumerate(clean))
+
+
+def encode_uint256(val):
+    return hex(val)[2:].zfill(64)
+
+
+def encode_address(addr):
+    return addr.lower().replace("0x", "").zfill(64)
+
+
+def compute_sub_hash(epoch_seed_bytes, miner_address, k, miner_contract, chain_id):
+    """
+    Computes inner sub hash:
+    bytes32 sub = keccak256(abi.encode(es, user, uint256(k), address(this), block.chainid));
+    """
+    if len(epoch_seed_bytes) != 32:
+        raise ValueError("epoch_seed must be 32 bytes")
+    
+    clean_user = miner_address.lower().replace("0x", "")
+    user_bytes = bytes.fromhex(clean_user).rjust(32, b"\x00")
+    
+    k_bytes = int(k).to_bytes(32, "big")
+    
+    clean_contract = miner_contract.lower().replace("0x", "")
+    contract_bytes = bytes.fromhex(clean_contract).rjust(32, b"\x00")
+    
+    chain_id_bytes = int(chain_id).to_bytes(32, "big")
+    
+    encoded_sub = epoch_seed_bytes + user_bytes + k_bytes + contract_bytes + chain_id_bytes
+    return standard_keccak(encoded_sub)
+
+
+def verify_share_local(sub_bytes, nonce, target_int):
+    """
+    Verifies outer share hash locally:
+    uint256(keccak256(abi.encode(sub, nonce))) <= target_
+    """
+    nonce_bytes = int(nonce).to_bytes(32, "big")
+    encoded_outer = sub_bytes + nonce_bytes
+    h_bytes = standard_keccak(encoded_outer)
+    h_int = int.from_bytes(h_bytes, "big")
+    return (h_int <= target_int, h_bytes, h_int)
+
+
+def worker_proc(
+    worker_id,
+    num_workers,
+    start_nonce,
+    sub_bytes,
+    target_bytes,
+    b_targets,
+    stop_event,
+    result_queue,
+    stats_queue,
+    chunk_size=50000,
+):
+    """Worker process performing high-speed Keccak-256 PoW search."""
+    if HAS_RAW_KECCAK:
+        state_p = ffi.new("void **")
+        _raw_keccak_lib.keccak_init(state_p, 64, 24)
+        state = state_p[0]
+
+        buf = ffi.new("uint8_t[64]")
+        ffi.memmove(buf, sub_bytes, 32)
+        out = ffi.new("uint8_t[32]")
+        nonce_buf = ffi.buffer(buf + 32, 32)
+
+        reset = _raw_keccak_lib.keccak_reset
+        absorb = _raw_keccak_lib.keccak_absorb
+        squeeze = _raw_keccak_lib.keccak_squeeze
+        pack_into = struct.pack_into
+
+        b0_t, b1_t, b2_t, b3_t, b4_t = b_targets
+        current_nonce = start_nonce + worker_id * chunk_size
+
+        try:
+            while not stop_event.is_set():
+                for i in range(chunk_size):
+                    nonce = current_nonce + i
+                    pack_into(">Q", nonce_buf, 24, nonce)
+                    reset(state)
+                    absorb(state, buf, 64)
+                    squeeze(state, out, 32, 0x01)
+
+                    # Dynamic prefix match based on target difficulty
+                    matched = False
+                    if b0_t == 0 and b1_t == 0 and b2_t == 0 and b3_t == 0:
+                        if out[0] == 0 and out[1] == 0 and out[2] == 0 and out[3] == 0 and out[4] <= b4_t:
+                            matched = True
+                    elif b0_t == 0 and b1_t == 0 and b2_t == 0:
+                        if out[0] == 0 and out[1] == 0 and out[2] == 0 and out[3] <= b3_t:
+                            matched = True
+                    elif b0_t == 0 and b1_t == 0:
+                        if out[0] == 0 and out[1] == 0 and out[2] <= b2_t:
+                            matched = True
+                    elif b0_t == 0:
+                        if out[0] == 0 and out[1] <= b1_t:
+                            matched = True
+                    else:
+                        if out[0] <= b0_t:
+                            matched = True
+
+                    if matched:
+                        h = bytes(ffi.buffer(out, 32))
+                        if h <= target_bytes:
+                            stop_event.set()
+                            result_queue.put((nonce, h.hex()))
+                            return
+                stats_queue.put(chunk_size)
+                current_nonce += num_workers * chunk_size
+        finally:
+            _raw_keccak_lib.keccak_destroy(state)
+    else:
+        current_nonce = start_nonce + worker_id * chunk_size
+        while not stop_event.is_set():
+            for i in range(chunk_size):
+                nonce = current_nonce + i
+                h = standard_keccak(sub_bytes + nonce.to_bytes(32, "big"))
+                if h <= target_bytes:
+                    stop_event.set()
+                    result_queue.put((nonce, h.hex()))
+                    return
+            stats_queue.put(chunk_size)
+            current_nonce += num_workers * chunk_size
+
+
+def monitor_progress(stats_queue, stop_event, target_hashes, log_interval=2.0):
+    """Monitors and prints mining throughput and estimated time."""
+    start_time = time.time()
+    last_time = start_time
+    total_hashes = 0
+    last_hashes = 0
+
+    while not stop_event.is_set():
+        time.sleep(log_interval)
+        now = time.time()
+        batch_sum = 0
+        while not stats_queue.empty():
+            try:
+                batch_sum += stats_queue.get_nowait()
+            except Exception:
+                break
+        total_hashes += batch_sum
+        dt = now - last_time
+        overall_dt = now - start_time
+        if dt > 0 and overall_dt > 0:
+            instant_rate = (total_hashes - last_hashes) / dt
+            avg_rate = total_hashes / overall_dt
+            last_hashes = total_hashes
+            last_time = now
+
+            pct = (total_hashes / target_hashes * 100) if target_hashes > 0 else 0
+            eta_sec = ((target_hashes - total_hashes) / avg_rate) if avg_rate > 0 and total_hashes < target_hashes else 0
+            print(
+                f"[Progress] Hashes: {total_hashes:,.0f} | Speed: {instant_rate/1e6:.2f} MH/s (avg: {avg_rate/1e6:.2f} MH/s) "
+                f"| Done: {pct:.2f}% | Expected ETA: {eta_sec:.1f}s ({eta_sec/60:.1f}m)",
+                flush=True
+            )
+
+
+def mine(args):
+    # Enforce BSC testnet
+    if args.rpc:
+        chain_id = verify_chain_id(args.rpc)
+    else:
+        chain_id = REQUIRED_CHAIN_ID
+
+    miner_addr = to_checksum_address(args.miner)
+    miner_contract = to_checksum_address(args.miner_contract)
+
+    # 1. Resolve Epoch
+    if args.epoch is not None:
+        cur_epoch = args.epoch
+    else:
+        res = eth_call(args.rpc, miner_contract, "900cf0cf")  # epoch()
+        cur_epoch = int(res, 16) if res else 0
+
+    print("=== PoolCoin Multi-Threaded PoW Miner ===")
+    print(f"Target Network:   BSC Testnet (Chain ID {chain_id})")
+    print(f"Miner Contract:   {miner_contract}")
+    print(f"Miner Address:    {miner_addr}")
+    print(f"Current Epoch:    {cur_epoch}")
+
+    # 2. Check StakeVault status if RPC available
+    if args.rpc and not args.skip_stake_check:
+        vault_res = eth_call(args.rpc, DEFAULT_VAULT_CONTRACT, "645b8b1b" + encode_address(miner_addr))
+        if vault_res and len(vault_res) >= 128:
+            active = int(vault_res[:64], 16) != 0
+            since = int(vault_res[64:128], 16)
+            print(f"StakeVault:       Active={active}, DepositEpoch={since}")
+            if not active:
+                print(f"[WARNING] Address {miner_addr} does NOT have active stake in StakeVault! Contract will reject submission.")
+            elif cur_epoch < since + 1:
+                print(f"[WARNING] Address {miner_addr} deposited in epoch {since}. Warmup rule requires epoch >= {since+1}. Current epoch is {cur_epoch}.")
+
+    # 3. Resolve epochSeed
+    if args.seed:
+        epoch_seed_int = int(args.seed, 16) if args.seed.startswith("0x") else int(args.seed)
+    else:
+        seed_data = "4abccd28" + encode_uint256(cur_epoch)  # epochSeed(uint256)
+        res = eth_call(args.rpc, miner_contract, seed_data)
+        epoch_seed_int = int(res, 16) if res else 0
+
+    if epoch_seed_int == 0:
+        raise RuntimeError(
+            f"Epoch seed for epoch {cur_epoch} is 0x0 (not initialized)! "
+            f"Wait for Keeper or call initEpochSeed({cur_epoch}) first."
+        )
+    epoch_seed_bytes = epoch_seed_int.to_bytes(32, "big")
+    print(f"Epoch Seed:       0x{epoch_seed_bytes.hex()}")
+
+    # 4. Resolve Target & Difficulty
+    if args.target:
+        target_int = int(args.target, 16) if args.target.startswith("0x") else int(args.target)
+        diff_bits = 256 - target_int.bit_length()
+    elif args.difficulty_bits:
+        diff_bits = args.difficulty_bits
+        target_int = 1 << (256 - diff_bits)
+    else:
+        target_data = "9811c7c1" + encode_uint256(cur_epoch)  # target(uint256)
+        res = eth_call(args.rpc, miner_contract, target_data)
+        target_int = int(res, 16) if (res and int(res, 16) > 0) else (1 << (256 - DEFAULT_DIFFICULTY_BITS))
+        diff_bits = 256 - target_int.bit_length()
+
+    target_bytes = target_int.to_bytes(32, "big")
+    b_targets = (target_bytes[0], target_bytes[1], target_bytes[2], target_bytes[3], target_bytes[4])
+    expected_trials = 2 ** diff_bits
+    print(f"Target Difficulty: {diff_bits} bits (Target: 0x{target_bytes.hex()[:16]}...)")
+    print(f"Expected Hashes:  2^{diff_bits} = {expected_trials:,}")
+
+    # 5. Resolve Share Index k
+    if args.k is not None:
+        k = args.k
+    else:
+        mask_data = "1107d89b" + encode_uint256(cur_epoch) + encode_address(miner_addr)
+        res = eth_call(args.rpc, miner_contract, mask_data)
+        used_mask = int(res, 16) if res else 0
+        k = None
+        for cand_k in range(CAP):
+            if (used_mask & (1 << cand_k)) == 0:
+                k = cand_k
+                break
+        if k is None:
+            raise RuntimeError(f"Miner address {miner_addr} has exhausted all 15 shares for epoch {cur_epoch}!")
+        print(f"Selected Share k: {k} (usedMask: 0x{used_mask:04x})")
+
+    if k < 0 or k >= CAP:
+        raise ValueError(f"Invalid share index k={k}; must be 0 <= k < 15")
+
+    sub_bytes = compute_sub_hash(epoch_seed_bytes, miner_addr, k, miner_contract, chain_id)
+    print(f"Sub Hash:         0x{sub_bytes.hex()}")
+    print(f"Worker Threads:   {args.threads}")
+    print(f"Fast CFFI Engine: {HAS_RAW_KECCAK}")
+    print("==========================================")
+
+    # 6. Launch Mining
+    stop_event = mp.Event()
+    result_queue = mp.Queue()
+    stats_queue = mp.Queue()
+
+    workers = []
+    chunk_size = 50000
+    start_time = time.time()
+
+    for wid in range(args.threads):
+        p = mp.Process(
+            target=worker_proc,
+            args=(
+                wid,
+                args.threads,
+                args.start_nonce,
+                sub_bytes,
+                target_bytes,
+                b_targets,
+                stop_event,
+                result_queue,
+                stats_queue,
+                chunk_size,
+            ),
+        )
+        p.start()
+        workers.append(p)
+
+    mon_thread = threading.Thread(
+        target=monitor_progress,
+        args=(stats_queue, stop_event, expected_trials),
+        daemon=True,
+    )
+    mon_thread.start()
+
+    print("[Miner] Mining started... Press Ctrl+C to abort.", flush=True)
+
+    try:
+        found_nonce, found_hash = result_queue.get()
+        stop_event.set()
+    except KeyboardInterrupt:
+        print("\n[Miner] Keyboard interrupt received! Stopping workers...")
+        stop_event.set()
+        for p in workers:
+            p.join(timeout=1.0)
+        sys.exit(1)
+
+    for p in workers:
+        p.join()
+
+    elapsed = time.time() - start_time
+    total_hashes = 0
+    while not stats_queue.empty():
+        try:
+            total_hashes += stats_queue.get_nowait()
+        except Exception:
+            break
+
+    # Verify result independently
+    valid, check_hash, check_int = verify_share_local(sub_bytes, found_nonce, target_int)
+    if not valid:
+        raise RuntimeError(f"FATAL: Local verification failed for mined nonce {found_nonce}!")
+
+    actual_diff_bits = 256 - check_int.bit_length()
+    avg_rate = total_hashes / elapsed if elapsed > 0 else 0
+
+    print(f"\n[SUCCESS] Share Found!")
+    print(f"Nonce:            {found_nonce} (0x{found_nonce:x})")
+    print(f"Share Hash:       0x{found_hash}")
+    print(f"Effective Bits:   {actual_diff_bits} bits (required >= {diff_bits})")
+    print(f"Elapsed Time:     {elapsed:.2f} s ({elapsed/60:.2f} min)")
+    print(f"Total Hashes:     {total_hashes:,.0f}")
+    print(f"Average Hashrate: {avg_rate/1e6:.2f} MH/s")
+
+    # 7. Write Output JSON
+    output_data = {
+        "miner": miner_addr,
+        "minerContract": miner_contract,
+        "chainId": chain_id,
+        "epoch": cur_epoch,
+        "k": k,
+        "epochSeed": "0x" + epoch_seed_bytes.hex(),
+        "target": "0x" + target_bytes.hex(),
+        "difficultyBits": diff_bits,
+        "actualDifficultyBits": actual_diff_bits,
+        "nonce": hex(found_nonce),
+        "nonceDecimal": found_nonce,
+        "hash": "0x" + found_hash,
+        "timestamp": int(time.time()),
+        "elapsedSeconds": round(elapsed, 2),
+        "hashesChecked": total_hashes,
+        "averageHashrate": round(avg_rate, 2),
+    }
+
+    out_file = args.out or f"share_{miner_addr[:8]}_epoch{cur_epoch}_k{k}.json"
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=2)
+    print(f"Share successfully saved to: {out_file}")
+    print("\nNext step: Run submission simulation with:")
+    print(f"  python script/submit_share.py --file {out_file}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PoolCoin Multi-threaded PoW Miner (BSC Testnet)")
+    parser.add_argument("--miner", type=str, required=True, help="Miner wallet address")
+    parser.add_argument("--epoch", type=int, default=None, help="Epoch number (queries RPC if omitted)")
+    parser.add_argument("--k", type=int, default=None, help="Share index 0..14 (auto-selected if omitted)")
+    parser.add_argument("--rpc", type=str, default=DEFAULT_RPC_URL, help="BSC Testnet RPC URL")
+    parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="Miner proxy contract address")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=max(1, (os.cpu_count() or 4) - 1),
+        help="Number of worker processes (default: total cores - 1)",
+    )
+    parser.add_argument("--difficulty-bits", type=int, default=DEFAULT_DIFFICULTY_BITS, help="Difficulty in leading zero bits (default: 34)")
+    parser.add_argument("--target", type=str, default=None, help="Explicit target override (hex or int)")
+    parser.add_argument("--seed", type=str, default=None, help="Explicit epochSeed override (hex or int)")
+    parser.add_argument("--start-nonce", type=int, default=0, help="Starting nonce offset")
+    parser.add_argument("--skip-stake-check", action="store_true", help="Skip StakeVault stake check")
+    parser.add_argument("--out", type=str, default=None, help="Output JSON file path")
+
+    args = parser.parse_args()
+    mine(args)
+
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    main()
