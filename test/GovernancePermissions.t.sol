@@ -261,4 +261,10 @@ contract GovernancePermissionsTest is Test {
 
         assertEq(miner.S_STAR(), 70_000, "S_STAR updated through Timelock after delay");
     }
+    function test_CancellerRoleAssignedToProposerNotGuardian() public view {
+        assertTrue(timelock.hasRole(timelock.CANCELLER_ROLE(), timelockProposer), "Proposer has CANCELLER_ROLE by OZ default");
+        assertFalse(timelock.hasRole(timelock.CANCELLER_ROLE(), guardian), "Guardian does NOT have CANCELLER_ROLE");
+        assertFalse(timelock.hasRole(timelock.PROPOSER_ROLE(), guardian), "Guardian does NOT have PROPOSER_ROLE");
+        assertFalse(timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), guardian), "Guardian does NOT have DEFAULT_ADMIN_ROLE");
+    }
 }

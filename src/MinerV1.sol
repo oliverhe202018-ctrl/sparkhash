@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IToken} from "./interfaces/IToken.sol";
 import {IVault} from "./interfaces/IVault.sol";
 import {IMiner} from "./interfaces/IMiner.sol";
@@ -10,7 +10,7 @@ import {IMiner} from "./interfaces/IMiner.sol";
 /// @title MinerV1
 /// @notice Core mining logic for epoch-based, share-proportional PoW token distribution.
 /// @dev Designed to be deployed behind a Transparent Upgradeable Proxy.
-contract MinerV1 is Initializable, ReentrancyGuardUpgradeable, IMiner {
+contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     IToken public token;
     IVault public vault;
     address public admin;
@@ -99,7 +99,6 @@ contract MinerV1 is Initializable, ReentrancyGuardUpgradeable, IMiner {
         if (IVault(_vault).START() != _start) revert MismatchStart();
         if (IVault(_vault).EPOCH_LEN() != EPOCH_LEN) revert MismatchEpochLen();
 
-        __ReentrancyGuard_init();
 
         token = IToken(_token);
         vault = IVault(_vault);

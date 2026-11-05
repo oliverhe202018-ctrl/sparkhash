@@ -91,18 +91,18 @@ forge script script/Deploy.s.sol
 ```
 
 - **Gas 实测值与差异说明**:
-  - 本地无广播演练测得总 Gas 消耗为 **7,420,265**（实测值，包含核心合约部署、权限原子交接与链上前置/后置完整校验）；
+  - 本地无广播演练测得总 Gas 消耗为 **7,405,909**（实测值，依赖 OpenZeppelin v5.7.0，包含核心合约部署、权限原子交接与链上前置/后置完整校验；旧版本 v5.0.2 为 7,420,265，旧版本,仅供对比）；
   - 各合约独立部署 Gas 实测消耗（来自 `forge test --gas-report`）：
-    - `TimelockController`: 1,605,592 (实测)
-    - `Token`: 767,965 (实测)
-    - `StakeVault`: 1,005,383 (实测)
-    - `MinerV1` 实现合约: 1,791,275 (实测)
-    - `TransparentUpgradeableProxy`: 949,736 (实测)
+    - `TimelockController`: 1,605,592 (实测) [旧版本 v5.0.2: 1,605,592, 仅供对比]
+    - `Token`: 768,181 (实测) [旧版本 v5.0.2: 767,965, 旧版本,仅供对比]
+    - `StakeVault`: 1,027,373 (实测) [旧版本 v5.0.2: 1,005,383, 旧版本,仅供对比]
+    - `MinerV1` 实现合约: 1,795,332 (实测) [旧版本 v5.0.2: 1,791,275, 旧版本,仅供对比]
+    - `TransparentUpgradeableProxy`: 909,088 (实测) [旧版本 v5.0.2: 949,736, 旧版本,仅供对比]
   - 历史上不同演练阶段出现的微弱 Gas 差异（如 6.68M vs 7.41M）**原因未验证**，未实测项（如真实测试网多笔交易打包开销与单笔工厂部署开销）均保持**估算**。
 
 ### 2.3 部署前严格核验清单 (Pre-Deployment Checklist)
 
-在发起实际部署交易前，必须对以下 14 个硬性检查点逐一确认：
+在发起实际部署交易前，必须对以下 15 个硬性检查点逐一确认：
 
 - [ ] **1. START 时间戳严格一致**: `StakeVault` 与 `MinerV1` 的 `START` 必须传入完全相同的未来时间戳，确保质押与挖矿轮次起点一致。
 - [ ] **2. DEPOSIT 质押金参数有效**: 默认 0.01 BNB，且必须满足 `MIN_DEPOSIT <= DEPOSIT <= MAX_DEPOSIT`。
@@ -134,6 +134,10 @@ forge script script/Deploy.s.sol
 - [ ] **14. 依赖版本确切锁定 (`git submodule status`)**:
   - 验证能否完全复现取决于 OpenZeppelin 等核心依赖的确切版本；
   - 执行 `git submodule status` 获取确切 Commit SHA 与版本 Tag，并将其完整记录保存至部署档案中。
+- [ ] **15. 真实测试网 EVM 兼容性验证原则 (不可替代性)**:
+  - **核心原则**：**真实测试网部署是验证 EVM 兼容性的唯一手段，dry-run 不能代替**；
+  - 本地 Foundry 沙箱演练（dry-run）仅验证本地 EVM 虚拟机的执行逻辑与 Gas 消耗，无法代替真实 BSC 链上节点客户端（如 BSC Geth）对 Cancun 操作码（如 PUSH0, MCOPY, TSTORE/TLOAD）的实际解释与网络硬分叉边界行为；
+  - 在进入任何生产部署前，必须在真实 BSC 测试网（Chapel, chainid=97）实际广播部署并运行完整的测试用例与交互验收，彻底排除底层操作码不兼容风险。
 
 ### 2.4 部署后链上验收清单 (Post-Deployment Acceptance Checklist)
 
@@ -176,10 +180,24 @@ forge script script/Deploy.s.sol
    - 必须执行 `git submodule status`，并将其实际输出妥善保存记录至部署档案中：
      ```shell
      git submodule status
-     # 实测依赖版本锁定基线输出：
+     # 实测依赖版本锁定基线输出 (当前升级基线为 OpenZeppelin v5.7.0):
      # +f3dae6e6ee381f25eb6a246f7da9b85c91a68219 lib/forge-std (v1.17.0)
-     # +dbb6104ce834628e473d2173bbc9d47f81a9eec3 lib/openzeppelin-contracts (v5.0.0-12-gdbb6104c / tag: v5.0.2)
+     # +cab19933c33c2ad1d4c7a84864a3601dddfd16f3 lib/openzeppelin-contracts (v5.7.0)
+     # +14f52c54d3a1eefbda3d4071efba24d3c1e07e8a lib/openzeppelin-contracts-upgradeable (v5.7.0)
+     #
+     # [历史旧版本依赖锁定,仅供对比]:
+     # +dbb6104ce834628e473d2173bbc9d47f81a9eec3 lib/openzeppelin-contracts (tag: v5.0.2)
      # +723f8cab09cdae1aca9ec9cc1cfa040c2d4b06c1 lib/openzeppelin-contracts-upgradeable (v5.0.2)
+     ```
+   - **记录 Storage Layout 基线 SHA-256 哈希**:
+     ```shell
+     # 当前升级基线哈希 (v5.7.0):
+     # storage-layout.baseline.json: 035cb90b1ffbe49847d3691a84ead630ce0aca88a2857c26704d6faa00bee2b5
+     # storage-layout.baseline.txt:  a4686c571b7aae66dd498e7c62a4051f7845dde4c971add72dbeb18ed17c374a
+     #
+     # [历史旧版本基线哈希,仅供对比 (v5.0.2)]:
+     # storage-layout.baseline.json: 777546b0564f4e17b9e4b7ecf69130c3a22a635e2e086579e2db4c12d4b8da2c
+     # storage-layout.baseline.txt:  1132bf40ab5c71898244851a02a83532220698aea12c9cefef4c26d3f57a1976
      ```
 3. **记录 Foundry 工具链版本 (`forge --version`)**:
    - 运行 `foundryup` 确保本地 Foundry CLI 为最新发布版本，规避已知 API V2 请求构造兼容性缺陷；

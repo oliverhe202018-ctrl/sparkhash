@@ -9,8 +9,6 @@ out/
 # Broadcast & deployment transaction artifacts (strictly ignored)
 broadcast/
 
-# Docs
-docs/
 
 # Dotenv files
 .env
@@ -26,3 +24,7 @@ docs/
 id_rsa*
 *secret*
 *private_key*
+
+# Dryrun and verification output logs
+dryrun-output.txt
+*dryrun*.txt
