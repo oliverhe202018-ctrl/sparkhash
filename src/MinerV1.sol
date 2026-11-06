@@ -50,6 +50,9 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     mapping(uint256 => uint256) public epochAddrCapBps;
     address public override guardian;
 
+    // Slot 20: unallocated dilution gap (B3)
+    mapping(uint256 => uint256) public unallocatedGap;
+
     event SharesSubmitted(address indexed u, uint256 indexed epoch, uint256 n, uint256 weightAdded);
     event Claimed(address indexed u, uint256 indexed epoch, uint256 amount);
     event EpochSynced(uint256 indexed epoch, uint256 target, uint256 ema);
@@ -264,6 +267,21 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
         uint256 stop = n + steps;
 
         while (n < stop) {
+            // Settle completed epoch (n)
+            uint256 settledEpoch = n;
+            uint256 effQ = effectiveQuota(settledEpoch);
+            uint256 tw = totalWeight[settledEpoch];
+            uint256 wm = wMin(settledEpoch);
+            uint256 b3 = 0;
+            if (effQ > 0) {
+                if (tw < wm) {
+                    uint256 allocatable = (effQ * tw) / wm;
+                    b3 = effQ - allocatable;
+                }
+            }
+            unallocatedGap[settledEpoch] = b3;
+            emit EpochSettled(settledEpoch, effQ, tw, wm, b3);
+
             n++;
             uint256 shares = (n >= 2) ? totalShares[n - 2] : S_STAR;
             ema = (ema + shares) / 2;
@@ -373,8 +391,13 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
         if (capBps == 0) capBps = ADDR_CAP_BPS;
 
         uint256 maxAmt = (effQ * capBps) / 10000;
-        if (amt > maxAmt) amt = maxAmt;
+        uint256 cappedOverflow = 0;
+        if (amt > maxAmt) {
+            cappedOverflow = amt - maxAmt;
+            amt = maxAmt;
+        }
 
+        emit RewardClaimed(msg.sender, e, amt, cappedOverflow);
         emit Claimed(msg.sender, e, amt);
         if (amt > 0) {
             token.mint(msg.sender, amt);
@@ -428,5 +451,6 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     }
 
     // Reserved storage space for proxy upgrades (reduced by 3 slots for epochSStar, epochAddrCapBps, and guardian)
-    uint256[47] private __gap;
+    // Reserved storage space for proxy upgrades (reduced by 1 slot from 47 to 46 for unallocatedGap)
+    uint256[46] private __gap;
 }

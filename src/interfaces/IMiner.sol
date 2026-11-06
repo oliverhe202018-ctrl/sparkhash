@@ -2,6 +2,20 @@
 pragma solidity ^0.8.24;
 
 interface IMiner {
+    event EpochSettled(
+        uint256 indexed epoch,
+        uint256 effectiveQuota,
+        uint256 totalWeight,
+        uint256 wMin,
+        uint256 unallocatedDilution
+    );
+    event RewardClaimed(
+        address indexed miner,
+        uint256 indexed epoch,
+        uint256 claimedAmount,
+        uint256 cappedOverflow
+    );
+
     function epoch() external view returns (uint256);
     function guardian() external view returns (address);
     function initEpochSeed(uint256 targetEpoch) external;
@@ -9,6 +23,7 @@ interface IMiner {
     function sync(uint256 maxSteps) external returns (uint256);
     function submitShares(uint8[] calldata ks, uint256[] calldata nonces) external;
     function claim(uint256 e) external;
+    function unallocatedGap(uint256 epoch) external view returns (uint256);
     function pauseSubmissions() external;
     function unpause() external;
     function setSStar(uint256 newSStar) external;
