@@ -86,7 +86,7 @@ class TestFunctionSelectors(unittest.TestCase):
         self.assertEqual(SELECTOR_EPOCH, "900cf0cf")          # epoch()
         self.assertEqual(SELECTOR_LAST_SYNCED, "93afb4c5")    # lastSynced()
         self.assertEqual(SELECTOR_EPOCH_SEED, "4abccd28")     # epochSeed(uint256)
-        self.assertEqual(SELECTOR_INIT_EPOCH_SEED, "0e2a5ea2")# initEpochSeed(uint256)
+        self.assertEqual(SELECTOR_INIT_EPOCH_SEED, "d9d9c33c")  # initEpochSeed(uint256,uint256)
         self.assertEqual(SELECTOR_SYNC, "b1357bf9")           # sync(uint256)
 
 
@@ -140,7 +140,7 @@ class TestKeeperBotDryRun(unittest.TestCase):
             self.assertIn("Target Contract: 0x420382a0f874c1f120621f847d81581e8737504e", combined_logs)
             self.assertIn("On-Chain Epoch:  0", combined_logs)
             self.assertIn("Chain ID:        97", combined_logs)
-            self.assertIn("initEpochSeed(0)", combined_logs)
+            self.assertIn("initEpochSeed(0, 24)", combined_logs)
             self.assertIn("Gas Price:", combined_logs)
             self.assertIn("Nonce:", combined_logs)
 
@@ -190,8 +190,8 @@ class TestKeeperBotSpeedupRetry(unittest.TestCase):
             max_retries=2
         )
 
-        calldata = "0x0e2a5ea2" + "00" * 32
-        receipt = bot.send_transaction(calldata, "initEpochSeed(0)", "initEpochSeed(0)")
+        calldata = "0xd9d9c33c" + "00" * 64
+        receipt = bot.send_transaction(calldata, "initEpochSeed(0, 24)", "initEpochSeed(0, 24)")
 
         self.assertIsNotNone(receipt)
         self.assertEqual(len(broadcasted_txs), 2)
@@ -254,8 +254,9 @@ class TestErrorDecoding(unittest.TestCase):
 
 
 class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
+    @patch("time.sleep")
     @patch("script.keeper.rpc_call")
-    def test_cur_3_all_uninitialized_sends_in_order_0_1_2_3_with_incrementing_nonce(self, mock_rpc):
+    def test_cur_3_all_uninitialized_sends_in_order_0_1_2_3_with_incrementing_nonce(self, mock_rpc, mock_sleep):
         """
         Requirement 3: cur=3 and seeds 0..3 uninitialized.
         Must send in order 0, 1, 2, 3 with incrementing nonces, confirming each before sending next.
@@ -294,7 +295,7 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                     return "0x0000000000000000000000000000000000000000000000000000000000000000"
                 elif sel == SELECTOR_INIT_EPOCH_SEED:
                     # Preflight check simulation
-                    target_epoch = int(tx_data[8:], 16)
+                    target_epoch = int(tx_data[8:72], 16)
                     preflight_calls.append(target_epoch)
                     return "0x" # Preflight succeeds
                 return "0x"
@@ -338,7 +339,9 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
 
             # Function selector must be initEpochSeed (0e2a5ea2)
             self.assertTrue(calldata.startswith(SELECTOR_INIT_EPOCH_SEED))
-            epoch_arg = int(calldata[8:], 16)
+            epoch_arg = int(calldata[8:72], 16)
+            steps_arg = int(calldata[72:136], 16)
+            self.assertEqual(steps_arg, 24)
             target_epochs.append(epoch_arg)
 
         # Order must be strictly 0, 1, 2, 3
@@ -347,8 +350,9 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
         # Nonces must strictly increment: e.g. 10, 11, 12, 13
         self.assertEqual(nonces, [10, 11, 12, 13])
 
+    @patch("time.sleep")
     @patch("script.keeper.rpc_call")
-    def test_cur_3_stops_when_intermediate_preflight_fails(self, mock_rpc):
+    def test_cur_3_stops_when_intermediate_preflight_fails(self, mock_rpc, mock_sleep):
         """
         Requirement 3: cur=3 and seeds 0..3 uninitialized.
         When intermediate preflight fails (e.g. at epoch 2), bot must stop and NOT send epoch 2 or 3.
@@ -383,7 +387,7 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                 elif sel == SELECTOR_EPOCH_SEED:
                     return "0x0000000000000000000000000000000000000000000000000000000000000000"
                 elif sel == SELECTOR_INIT_EPOCH_SEED:
-                    target_epoch = int(tx_data[8:], 16)
+                    target_epoch = int(tx_data[8:72], 16)
                     preflight_calls.append(target_epoch)
                     if target_epoch == 2:
                         # Preflight for epoch 2 fails with PrevSeedNotInitialized (0x4105720d)
@@ -423,8 +427,9 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
             combined_alerts = " ".join(alert_msgs)
             self.assertIn("PrevSeedNotInitialized", combined_alerts)
 
+    @patch("time.sleep")
     @patch("script.keeper.rpc_call")
-    def test_cur_3_stops_when_intermediate_tx_reverts(self, mock_rpc):
+    def test_cur_3_stops_when_intermediate_tx_reverts(self, mock_rpc, mock_sleep):
         """
         Requirement 3: cur=3 and seeds 0..3 uninitialized.
         When intermediate transaction reverts on-chain (e.g. at epoch 1), bot must stop and NOT send epoch 2 or 3.

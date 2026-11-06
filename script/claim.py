@@ -47,6 +47,9 @@ ERROR_SELECTORS = {
 }
 
 SEL_CLAIM = "0x379607f5"           # claim(uint256)
+SELECTOR_INIT_EPOCH_SEED = "0xd9d9c33c"  # initEpochSeed(uint256,uint256)
+EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
+EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
 SEL_EPOCH = "0x900cf0cf"           # epoch() -> uint256
 SEL_TOKEN = "0xfc0c546a"           # token() -> address
 SEL_ADDR_CAP_BPS = "0xbc9c68ae"    # ADDR_CAP_BPS() -> uint256

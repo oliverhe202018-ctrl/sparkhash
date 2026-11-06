@@ -8,13 +8,16 @@ Monitors MinerV1 state:
 Includes gas price floor (>=0.1 gwei), multiplier, and replacement (speed-up) retry with identical nonce.
 """
 
-import os, sys, time, json, argparse, urllib.request, urllib.error, re
+import os, sys, time, json, argparse, urllib.request, urllib.error, re, random
 
 # Contract function selectors (verified against MinerV1 compiled ABI)
 SELECTOR_EPOCH = "900cf0cf"          # epoch() -> uint256
 SELECTOR_LAST_SYNCED = "93afb4c5"    # lastSynced() -> uint256
 SELECTOR_EPOCH_SEED = "4abccd28"     # epochSeed(uint256) -> uint256
-SELECTOR_INIT_EPOCH_SEED = "0e2a5ea2"# initEpochSeed(uint256)
+SELECTOR_INIT_EPOCH_SEED = "d9d9c33c"  # initEpochSeed(uint256,uint256)
+SELECTOR_INIT_EPOCH_SEED_SINGLE = "0e2a5ea2"  # initEpochSeed(uint256) (legacy)
+EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
+EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
 SELECTOR_SYNC = "b1357bf9"           # sync(uint256) -> uint256
 
 DEFAULT_MIN_GAS_PRICE_GWEI = 0.1
@@ -203,12 +206,13 @@ class KeeperBot:
     def __init__(self, rpc_url, miner_address, private_key=None, keeper_address=None,
                  dry_run=True, poll_interval=15, min_gas_price_gwei=DEFAULT_MIN_GAS_PRICE_GWEI,
                  gas_multiplier=DEFAULT_GAS_MULTIPLIER, tx_timeout=DEFAULT_TX_TIMEOUT,
-                 max_retries=DEFAULT_MAX_RETRIES):
+                 max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=24):
         self.rpc_url = rpc_url
         self.miner = miner_address.strip().lower() if miner_address and isinstance(miner_address, str) else (miner_address or "")
         self.private_key = private_key
         self.dry_run = dry_run
         self.poll_interval = poll_interval
+        self.max_seed_steps = max_seed_steps
         self.min_gas_price_gwei = float(min_gas_price_gwei)
         self.gas_multiplier = float(gas_multiplier)
         self.tx_timeout = int(tx_timeout)
@@ -518,12 +522,21 @@ class KeeperBot:
             self.log("ACTION", f"Epoch seeds uninitialized from {min_e} to {cur_epoch}. Initializing sequentially...")
 
         for e in range(min_e, cur_epoch + 1):
-            calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(e)
-            func_desc = f"initEpochSeed({e})"
+            if not self.dry_run:
+                jitter = random.uniform(0.0, 3.0)
+                self.log("ACTION", f"Applying {jitter:.2f}s random jitter before sending initEpochSeed...")
+                time.sleep(jitter)
+            calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(e) + encode_uint256(self.max_seed_steps)
+            func_desc = f"initEpochSeed({e}, {self.max_seed_steps})"
             receipt = self.send_transaction(calldata, func_desc, func_desc)
             if not self.is_receipt_successful(receipt):
                 self.alert(f"Failed to confirm {func_desc}. Stopping seed initialization sequence.")
                 break
+            if receipt and isinstance(receipt, dict):
+                for log in receipt.get("logs", []):
+                    topics = log.get("topics", [])
+                    if topics and topics[0].lower() == EVENT_EPOCH_SETTLED_TOPIC.lower():
+                        self.log("EVENT", f"Observed EpochSettled event in tx {func_desc}")
 
     def handle_sync_lag(self, cur_epoch, last_synced):
         if last_synced < cur_epoch:

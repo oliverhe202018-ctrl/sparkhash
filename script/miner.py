@@ -21,6 +21,7 @@ import argparse
 import urllib.request
 import threading
 import multiprocessing as mp
+import random
 
 # Chain ID constraint: strictly BSC Testnet
 REQUIRED_CHAIN_ID = 97
@@ -33,6 +34,9 @@ DEFAULT_DIFFICULTY_BITS = 34  # 34-bit difficulty: 1 << 222
 DEFAULT_EASIEST_TARGET = 1 << 222  # 34-bit: 2^222
 DEFAULT_HARDEST_TARGET = 1 << 220  # 36-bit: 2^220
 CAP = 15
+SELECTOR_INIT_EPOCH_SEED = "d9d9c33c"  # initEpochSeed(uint256,uint256)
+EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
+EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
 
 # Keccak-256 low-level bindings for high-performance hashing
 try:
@@ -250,6 +254,50 @@ def monitor_progress(stats_queue, stop_event, target_hashes, log_interval=2.0):
             )
 
 
+
+def backfill_epoch_seed(rpc_url, miner_contract, cur_epoch, private_key=None, max_steps=24):
+    """Sends initEpochSeed(cur_epoch, max_steps) backfill transaction when seed is 0."""
+    calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(cur_epoch) + encode_uint256(max_steps)
+    if private_key:
+        try:
+            from eth_account import Account
+            clean_key = private_key.strip()
+            if clean_key.startswith("0x"):
+                clean_key = clean_key[2:]
+            account = Account.from_key(bytes.fromhex(clean_key))
+            sender = account.address
+            res_nonce = rpc_call(rpc_url, "eth_getTransactionCount", [sender, "latest"])
+            nonce = int(res_nonce, 16) if res_nonce else 0
+            res_gp = rpc_call(rpc_url, "eth_gasPrice", [])
+            gas_price = int(res_gp, 16) if res_gp else 1000000000
+            tx_dict = {
+                "nonce": nonce,
+                "gasPrice": gas_price,
+                "gas": 300000,
+                "to": miner_contract,
+                "value": 0,
+                "data": bytes.fromhex(calldata[2:]),
+                "chainId": REQUIRED_CHAIN_ID,
+            }
+            signed = account.sign_transaction(tx_dict)
+            tx_hash = rpc_call(rpc_url, "eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
+            print(f"[BACKFILL] Broadcasted initEpochSeed({cur_epoch}, {max_steps}) tx: {tx_hash}")
+            time.sleep(2)
+            return tx_hash
+        except Exception as exc:
+            print(f"[BACKFILL] Failed to broadcast backfill tx: {exc}")
+            return None
+    else:
+        try:
+            tx_obj = {"to": miner_contract, "data": calldata}
+            tx_hash = rpc_call(rpc_url, "eth_sendTransaction", [tx_obj])
+            print(f"[BACKFILL] Sent initEpochSeed tx via unlocked node: {tx_hash}")
+            time.sleep(1)
+            return tx_hash
+        except Exception:
+            print("[BACKFILL] No private key provided to sign backfill transaction. Provide via --private-key or MINER_PRIVATE_KEY.")
+            return None
+
 def mine(args):
     # Enforce BSC testnet
     if args.rpc:
@@ -294,9 +342,19 @@ def mine(args):
         epoch_seed_int = int(res, 16) if res else 0
 
     if epoch_seed_int == 0:
+        print(f"[INFO] Epoch {cur_epoch} seed is 0x0 (not initialized). Discovered uninitialized seed.")
+        jitter = random.uniform(0.0, 3.0)
+        print(f"[JITTER] Applying {jitter:.2f}s random jitter before sending backfill transaction...")
+        time.sleep(jitter)
+        pk = getattr(args, "private_key", None) or os.environ.get("MINER_PRIVATE_KEY") or os.environ.get("PRIVATE_KEY")
+        backfill_epoch_seed(args.rpc, miner_contract, cur_epoch, private_key=pk, max_steps=getattr(args, "max_seed_steps", 24))
+        res = eth_call(args.rpc, miner_contract, seed_data)
+        epoch_seed_int = int(res, 16) if res else 0
+
+    if epoch_seed_int == 0:
         raise RuntimeError(
             f"Epoch seed for epoch {cur_epoch} is 0x0 (not initialized)! "
-            f"Wait for Keeper or call initEpochSeed({cur_epoch}) first."
+            f"Backfill transaction was not completed or failed. Wait for Keeper or call initEpochSeed({cur_epoch}, 24)."
         )
     epoch_seed_bytes = epoch_seed_int.to_bytes(32, "big")
     print(f"Epoch Seed:       0x{epoch_seed_bytes.hex()}")

@@ -57,6 +57,10 @@ SEL_ADDR_CAP_BPS = "0xbc9c68ae"   # ADDR_CAP_BPS() -> uint256
 SEL_VAULT_STATUS = "0x645b8b1b"   # status(address) -> (bool, uint256)
 SEL_VAULT_STAKES = "0x16934fc4"   # stakes(address) -> (uint64, uint64, bool, uint128)
 SEL_TOKEN_BALANCE = "0x70a08231"  # balanceOf(address) -> uint256
+SEL_UNALLOCATED_GAP = "0xca6875f7"  # unallocatedGap(uint256) -> uint256
+SELECTOR_INIT_EPOCH_SEED = "0xd9d9c33c"  # initEpochSeed(uint256,uint256)
+EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
+EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
 
 
 def to_checksum_address(address):
@@ -238,17 +242,19 @@ def inspect_status(args):
             reward_queries.append(("eth_call", [{"to": miner_contract, "data": "0x" + keccak(b"totalWeight(uint256)").hex()[:8] + encode(["uint256"], [e]).hex()}, "latest"]))
             reward_queries.append(("eth_call", [{"to": miner_contract, "data": "0x" + keccak(b"wMin(uint256)").hex()[:8] + encode(["uint256"], [e]).hex()}, "latest"]))
             reward_queries.append(("eth_call", [{"to": miner_contract, "data": "0x" + keccak(b"epochAddrCapBps(uint256)").hex()[:8] + encode(["uint256"], [e]).hex()}, "latest"]))
+            reward_queries.append(("eth_call", [{"to": miner_contract, "data": SEL_UNALLOCATED_GAP + encode(["uint256"], [e]).hex()}, "latest"]))
             reward_meta.append(e)
 
     reward_results_map = {}
     if reward_queries:
         r_results = rpc_batch_call(rpc_url, reward_queries)
         for idx, e in enumerate(reward_meta):
-            bi = idx * 4
+            bi = idx * 5
             effQ = decode(["uint256"], bytes.fromhex(r_results[bi][2:]))[0]
             tw = decode(["uint256"], bytes.fromhex(r_results[bi + 1][2:]))[0]
             wm = decode(["uint256"], bytes.fromhex(r_results[bi + 2][2:]))[0]
             capBps = decode(["uint256"], bytes.fromhex(r_results[bi + 3][2:]))[0]
+            unalloc_gap = decode(["uint256"], bytes.fromhex(r_results[bi + 4][2:]))[0] if len(r_results) > bi + 4 and r_results[bi + 4] else 0
             if capBps == 0:
                 capBps = default_addr_cap_bps
             reward_results_map[e] = {
@@ -256,6 +262,7 @@ def inspect_status(args):
                 "totalWeight": tw,
                 "wMin": wm,
                 "capBps": capBps,
+                "unallocatedGap": unalloc_gap,
             }
 
     print("【2. 轮次参与明细 (Per-Epoch Participation & Credited Shares)】")

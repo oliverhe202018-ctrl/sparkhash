@@ -23,6 +23,7 @@ import argparse
 import urllib.request
 import threading
 import numpy as np
+import random
 
 # Chain ID constraint: strictly BSC Testnet
 REQUIRED_CHAIN_ID = 97
@@ -35,6 +36,9 @@ DEFAULT_DIFFICULTY_BITS = 34  # 34-bit difficulty: 1 << 222
 DEFAULT_EASIEST_TARGET = 1 << 222  # 34-bit: 2^222
 DEFAULT_HARDEST_TARGET = 1 << 220  # 36-bit: 2^220
 CAP = 15
+SELECTOR_INIT_EPOCH_SEED = "d9d9c33c"  # initEpochSeed(uint256,uint256)
+EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
+EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
 
 # Default batch size: 16,777,216 nonces (~15-30ms per kernel on RTX 4060 Ti)
 # Well within Windows WDDM TDR watchdog limit (2000ms)
@@ -431,9 +435,19 @@ def mine(args):
         epoch_seed_int = int(res, 16) if res else 0
 
     if epoch_seed_int == 0:
+        print(f"[INFO] Epoch {cur_epoch} seed is 0x0 (not initialized). Discovered uninitialized seed.")
+        jitter = random.uniform(0.0, 3.0)
+        print(f"[JITTER] Applying {jitter:.2f}s random jitter before sending backfill transaction...")
+        time.sleep(jitter)
+        pk = getattr(args, "private_key", None) or os.environ.get("MINER_PRIVATE_KEY") or os.environ.get("PRIVATE_KEY")
+        backfill_epoch_seed(args.rpc, miner_contract, cur_epoch, private_key=pk, max_steps=getattr(args, "max_seed_steps", 24))
+        res = eth_call(args.rpc, miner_contract, seed_data)
+        epoch_seed_int = int(res, 16) if res else 0
+
+    if epoch_seed_int == 0:
         raise RuntimeError(
             f"Epoch seed for epoch {cur_epoch} is 0x0 (not initialized)! "
-            f"Wait for Keeper or call initEpochSeed({cur_epoch}) first."
+            f"Backfill transaction was not completed or failed. Wait for Keeper or call initEpochSeed({cur_epoch}, 24)."
         )
     epoch_seed_bytes = epoch_seed_int.to_bytes(32, "big")
     print(f"Epoch Seed:       0x{epoch_seed_bytes.hex()}")
@@ -636,6 +650,8 @@ def main():
     parser.add_argument("--start-nonce", type=int, default=0, help="Starting nonce offset")
     parser.add_argument("--skip-stake-check", action="store_true", help="Skip StakeVault stake check")
     parser.add_argument("--out", type=str, default=None, help="Output JSON file path")
+    parser.add_argument("--private-key", type=str, default=None, help="Private key for seed backfill transaction if seed is 0")
+    parser.add_argument("--max-seed-steps", type=int, default=24, help="Max seed steps for backfill (default: 24)")
 
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Nonces per GPU batch (default: 16M)")
     parser.add_argument("--device-idx", type=int, default=0, help="OpenCL GPU device index (default: 0)")
