@@ -32,10 +32,10 @@ REQUIRED_CHAIN_ID = 97
 DEFAULT_MINER_CONTRACT = "0x420382a0f874c1F120621f847d81581e8737504e"
 DEFAULT_VAULT_CONTRACT = "0x04aDD681D11F4af72D44BD8cCc6Ee5d12801A1a7"
 DEFAULT_RPC_URL = "https://data-seed-prebsc-1-s1.binance.org:8545"
-DEFAULT_DIFFICULTY_BITS = 34  # 34-bit difficulty: 1 << 222
-DEFAULT_EASIEST_TARGET = 1 << 222  # 34-bit: 2^222
-DEFAULT_HARDEST_TARGET = 1 << 220  # 36-bit: 2^220
-CAP = 15
+DEFAULT_DIFFICULTY_BITS = 32  # 32-bit difficulty: 1 << 224
+DEFAULT_EASIEST_TARGET = 1 << 224  # 32-bit: 2^224
+DEFAULT_HARDEST_TARGET = 1 << 221  # 35-bit: 2^221
+CAP = 6
 SELECTOR_INIT_EPOCH_SEED = "d9d9c33c"  # initEpochSeed(uint256,uint256)
 EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
 EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
@@ -488,7 +488,7 @@ def mine(args):
         print(f"Selected Share k: {k} (usedMask: 0x{used_mask:04x})")
 
     if k < 0 or k >= CAP:
-        raise ValueError(f"Invalid share index k={k}; must be 0 <= k < 15")
+        raise ValueError(f"Invalid share index k={k}; must be 0 <= k < 6")
 
     sub_bytes = compute_sub_hash(epoch_seed_bytes, miner_addr, k, miner_contract, chain_id)
     sub_lanes = struct.unpack("<4Q", sub_bytes)
@@ -641,10 +641,10 @@ def main():
     parser = argparse.ArgumentParser(description="PoolCoin GPU-Accelerated PoW Miner (BSC Testnet)")
     parser.add_argument("--miner", type=str, required=True, help="Miner wallet address")
     parser.add_argument("--epoch", type=int, default=None, help="Epoch number (queries RPC if omitted)")
-    parser.add_argument("--k", type=int, default=None, help="Share index 0..14 (auto-selected if omitted)")
+    parser.add_argument("--k", type=int, default=None, help="Share index 0..5 (auto-selected if omitted)")
     parser.add_argument("--rpc", type=str, default=DEFAULT_RPC_URL, help="BSC Testnet RPC URL")
     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="Miner proxy contract address")
-    parser.add_argument("--difficulty-bits", type=int, default=DEFAULT_DIFFICULTY_BITS, help="Difficulty in leading zero bits (default: 34)")
+    parser.add_argument("--difficulty-bits", type=int, default=DEFAULT_DIFFICULTY_BITS, help="Difficulty in leading zero bits (default: 32)")
     parser.add_argument("--target", type=str, default=None, help="Explicit target override (hex or int)")
     parser.add_argument("--seed", type=str, default=None, help="Explicit epochSeed override (hex or int)")
     parser.add_argument("--start-nonce", type=int, default=0, help="Starting nonce offset")

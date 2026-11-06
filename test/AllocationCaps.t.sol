@@ -74,9 +74,9 @@ contract AllocationCapsTest is Test {
         bytes32 slot = keccak256(abi.encode(uint256(1), uint256(10)));
         vm.store(address(miner), slot, bytes32(uint256(1) << 248));
 
-        uint8[] memory ks = new uint8[](15);
-        uint256[] memory nonces = new uint256[](15);
-        for (uint8 i = 0; i < 15; i++) {
+        uint8[] memory ks = new uint8[](6);
+        uint256[] memory nonces = new uint256[](6);
+        for (uint8 i = 0; i < 6; i++) {
             ks[i] = i;
             nonces[i] = _mineNonce(1, alice, i);
         }

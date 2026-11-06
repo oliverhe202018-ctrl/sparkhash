@@ -107,10 +107,10 @@ contract Benchmark34BitTest is Test {
         assertTrue(gasUsed > 0);
     }
 
-    function test_BenchmarkGas_15_Shares() public {
-        uint8[] memory ks = new uint8[](15);
-        uint256[] memory nonces = new uint256[](15);
-        for (uint8 i = 0; i < 15; i++) {
+    function test_BenchmarkGas_6_Shares() public {
+        uint8[] memory ks = new uint8[](6);
+        uint256[] memory nonces = new uint256[](6);
+        for (uint8 i = 0; i < 6; i++) {
             ks[i] = i;
             nonces[i] = _mineNonce(alice, i);
         }
@@ -120,24 +120,24 @@ contract Benchmark34BitTest is Test {
         miner.submitShares(ks, nonces);
         uint256 gasUsed = gasStart - gasleft();
 
-        console.log("Gas for 15 shares full cap batch submission:", gasUsed);
+        console.log("Gas for 6 shares full cap batch submission:", gasUsed);
         assertTrue(gasUsed > 0);
     }
 
     function test_OptimizationSavingsDifferential() public pure {
         // Compare the cost of computing sqrt inside loop vs outside loop
-        // Unoptimized (old skeleton): for N=15, 15 iterations each doing 2 sqrt calculations
-        // = 30 sqrt operations, plus 15 storage SSTORE operations
+        // Unoptimized (old skeleton): for N=6, 6 iterations each doing 2 sqrt calculations
+        // = 12 sqrt operations, plus 6 storage SSTORE operations
         // Optimized: exactly 2 sqrt operations total, plus 1 storage SSTORE operation
-        // Sqrt operations reduced: 30 -> 2 (93.3% reduction in math ops)
-        // Storage SSTORE reduced: 15 -> 1 (93.3% reduction in SSTOREs)
-        uint256 unoptimizedSqrtCalls = 30;
+        // Sqrt operations reduced: 12 -> 2 (83.3% reduction in math ops)
+        // Storage SSTORE reduced: 6 -> 1 (83.3% reduction in SSTOREs)
+        uint256 unoptimizedSqrtCalls = 12;
         uint256 optimizedSqrtCalls = 2;
-        uint256 unoptimizedSstores = 15;
+        uint256 unoptimizedSstores = 6;
         uint256 optimizedSstores = 1;
 
-        assertEq(unoptimizedSqrtCalls - optimizedSqrtCalls, 28);
-        assertEq(unoptimizedSstores - optimizedSstores, 14);
+        assertEq(unoptimizedSqrtCalls - optimizedSqrtCalls, 10);
+        assertEq(unoptimizedSstores - optimizedSstores, 5);
     }
 
     function test_VerifyReal34BitTargetVerificationGas() public view {

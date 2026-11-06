@@ -21,8 +21,8 @@ contract DifficultyTest is Test {
     uint256 public constant DEPOSIT = 0.01 ether;
     uint256 public start;
 
-    uint256 public constant EASIEST = uint256(1) << 222;
-    uint256 public constant HARDEST = uint256(1) << 220;
+    uint256 public constant EASIEST = uint256(1) << 224;
+    uint256 public constant HARDEST = uint256(1) << 221;
 
     function setUp() public {
         start = block.timestamp + 1000;
@@ -54,7 +54,7 @@ contract DifficultyTest is Test {
     }
 
     function test_DifficultyBoundsClampedAtEasiestAndHardest() public {
-        // Zero shares repeatedly should never exceed EASIEST (34 bits)
+        // Zero shares repeatedly should never exceed EASIEST (32 bits)
         vm.warp(start + 20 * 3600);
         miner.sync(20);
 
@@ -65,7 +65,7 @@ contract DifficultyTest is Test {
         }
         assertEq(miner.target(20), EASIEST);
 
-        // Extreme massive shares should never fall below HARDEST (36 bits)
+        // Extreme massive shares should never fall below HARDEST (35 bits)
         for (uint256 i = 19; i <= 35; i++) {
             _setTotalShares(i, 10_000_000);
         }
@@ -112,7 +112,7 @@ contract DifficultyTest is Test {
 
     function test_Convergence11EpochsUnder10xHashrateSurge() public {
         // Exact reproduction of the architect's 10x hashrate surge scenario:
-        // Baseline: S_STAR = 50,000. Target starts at EASIEST = 1 << 222.
+        // Baseline: S_STAR = 50,000. Target starts at EASIEST = 1 << 224.
         // Epoch 0: normal (50,000 shares)
         // Epoch 1: normal (50,000 shares)
         // From Epoch 2 onward: 10x hashrate surge (500,000 shares in each epoch)
@@ -153,15 +153,21 @@ contract DifficultyTest is Test {
         uint256 t9 = miner.target(9);
         assertEq(t9, t8 * 100 / 125);
 
-        // Epoch 10: 7th drop of 0.8 would reach 0.2097 * EASIEST, so it clamps to HARDEST (0.25 * EASIEST)!
-        // Across 11 total rounds (Epoch 0 through 10), convergence to HARDEST is complete.
         uint256 t10 = miner.target(10);
-        assertEq(t10, HARDEST, "Epoch 10 (11th round) must hit HARDEST");
+        assertEq(t10, t9 * 100 / 125);
 
-        // Epoch 11..15: remains locked at HARDEST
-        assertEq(miner.target(11), HARDEST);
-        assertEq(miner.target(12), HARDEST);
-        assertEq(miner.target(13), HARDEST);
+        uint256 t11 = miner.target(11);
+        assertEq(t11, t10 * 100 / 125);
+
+        uint256 t12 = miner.target(12);
+        assertEq(t12, t11 * 100 / 125);
+
+        // Epoch 13: 10th drop of 0.8 would reach 0.1074 * EASIEST, so it clamps to HARDEST (0.125 * EASIEST)!
+        // Across 14 total rounds (Epoch 0 through 13), convergence to HARDEST is complete.
+        uint256 t13 = miner.target(13);
+        assertEq(t13, HARDEST, "Epoch 13 (14th round) must hit HARDEST");
+
+        // Epoch 14..15: remains locked at HARDEST
         assertEq(miner.target(14), HARDEST);
         assertEq(miner.target(15), HARDEST);
     }

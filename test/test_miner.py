@@ -50,5 +50,16 @@ class TestMinerSeedBackfillAndJitter(unittest.TestCase):
         self.assertEqual(status.SELECTOR_INIT_EPOCH_SEED, "0xd9d9c33c")
         self.assertEqual(status.SEL_UNALLOCATED_GAP, "0xca6875f7")
 
+    def test_parameter_updates_cap_and_difficulty(self):
+        self.assertEqual(miner.CAP, 6)
+        self.assertEqual(miner_gpu.CAP, 6)
+        self.assertEqual(status.CAP, 6)
+        self.assertEqual(miner.DEFAULT_DIFFICULTY_BITS, 32)
+        self.assertEqual(miner_gpu.DEFAULT_DIFFICULTY_BITS, 32)
+        self.assertEqual(miner.DEFAULT_EASIEST_TARGET, 1 << 224)
+        self.assertEqual(miner.DEFAULT_HARDEST_TARGET, 1 << 221)
+        self.assertEqual(miner_gpu.DEFAULT_EASIEST_TARGET, 1 << 224)
+        self.assertEqual(miner_gpu.DEFAULT_HARDEST_TARGET, 1 << 221)
+
 if __name__ == "__main__":
     unittest.main()

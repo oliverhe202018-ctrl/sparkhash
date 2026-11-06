@@ -106,9 +106,9 @@ contract ReplayAndBoundariesTest is Test {
         miner.submitShares(ks1, nonces1);
     }
 
-    function test_RevertIfKGe15() public {
+    function test_RevertIfKGe6() public {
         uint8[] memory ks = new uint8[](1);
-        ks[0] = 15; // k >= CAP (15)
+        ks[0] = 6; // k >= CAP (6)
         uint256[] memory nonces = new uint256[](1);
         nonces[0] = 123;
 

@@ -287,10 +287,10 @@ contract MinerShareVerificationTest is Test {
         miner.submitShares(ks, nonces);
     }
 
-    /// @notice Rejection Test 5: k >= 15 (CAP) MUST revert with InvalidShareIndex.
-    function test_RevertIfShareIndexGe15() public {
+    /// @notice Rejection Test 5: k >= 6 (CAP) MUST revert with InvalidShareIndex.
+    function test_RevertIfShareIndexGe6() public {
         uint8[] memory ks = new uint8[](1);
-        ks[0] = 15; // CAP is 15, valid indices are 0..14
+        ks[0] = 6; // CAP is 6, valid indices are 0..5
         uint256[] memory nonces = new uint256[](1);
         nonces[0] = 12345;
 

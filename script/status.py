@@ -45,7 +45,7 @@ DEFAULT_RPC_URLS = [
 RAMP_EPOCHS = 24
 RAMP_START_BPS = 2500
 WSCALE = 10**10
-CAP = 15
+CAP = 6
 ADDR_CAP_BPS_DEFAULT = 2000
 
 # Function selectors
@@ -128,7 +128,7 @@ def calculate_warmup_weight(epoch, since, active):
 def format_used_mask(mask):
     """Formats a 15-bit uint16 mask into binary representation and list of active ks."""
     active_ks = [k for k in range(CAP) if (mask & (1 << k)) != 0]
-    binary_str = f"{mask:015b}"
+    binary_str = f"{mask:06b}"
     k_str = ", ".join(str(k) for k in active_ks) if active_ks else "无"
     return f"0b{binary_str} (0x{mask:04x}) [已用 k 索引: {k_str}]"
 

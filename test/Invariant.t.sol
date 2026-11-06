@@ -140,26 +140,17 @@ contract InvariantTest is StdInvariant, Test {
     // --- Unit / Fuzz property tests ---
 
     function test_WMonotonicityAndExactReferenceValues() public view {
-        uint256[16] memory refW = [
+        uint256[7] memory refW = [
             uint256(0),
             1_000_000,
             1_414_213,
             1_732_050,
             2_000_000,
             2_236_067,
-            2_449_489,
-            2_645_751,
-            2_828_427,
-            3_000_000,
-            3_162_277,
-            3_316_624,
-            3_464_101,
-            3_605_551,
-            3_741_657,
-            3_872_983
+            2_449_489
         ];
 
-        for (uint256 c = 0; c < 16; c++) {
+        for (uint256 c = 0; c < 7; c++) {
             uint256 calculated = harness.exposed_w(c);
             assertEq(calculated, refW[c], "Reference value mismatch for _w(c)");
             if (c > 0) {

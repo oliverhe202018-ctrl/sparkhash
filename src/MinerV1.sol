@@ -17,14 +17,14 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     uint256 public START;
 
     uint256 public constant EPOCH_LEN = 3600;
-    uint256 public constant CAP = 15;                 // Max shares per address per epoch
+    uint256 public constant CAP = 6;                 // Max shares per address per epoch
     uint256 public constant RAMP_EPOCHS = 24;         // Warmup ramp duration in epochs
     uint256 public constant RAMP_START_BPS = 2500;    // 25% starting weight
     uint256 public constant MINING_CAP = 900_000_000e18;
     uint256 public constant D0 = 3_000_000e18;        // Day 1 quota
     uint256 public constant DECAY = 0.9967e18;        // Daily decay: 0.9967
-    uint256 public constant EASIEST = uint256(1) << 222;  // 34 bits
-    uint256 public constant HARDEST = uint256(1) << 220;  // 36 bits
+    uint256 public constant EASIEST = uint256(1) << 224;  // 32 bits
+    uint256 public constant HARDEST = uint256(1) << 221;  // 35 bits
     uint256 public constant WSCALE = 1e10;            // Weight unit: sqrt(1)*1e6 * 10000 bps
     uint256 public constant MAX_SEED_STEPS = 24;
 
