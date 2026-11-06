@@ -86,6 +86,7 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     error AlreadyClaimed();
     error ZeroWeight();
     error ParameterOutOfBounds();
+    error InvalidMaxSteps();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -205,13 +206,21 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     // --- State & PoW Operations ---
 
     /// @notice Initialize epoch seed with batched backfill support.
+    /// @dev Binary search precondition:
+    /// The set of initialized epochs is guaranteed to ALWAYS be a contiguous prefix [0, ..., K-1].
+    /// Seeds are strictly initialized sequentially from start upwards without skipping.
+    /// Therefore, epochSeed[e] != 0 is monotonic (true for e < K, false for e >= K).
+    /// This monotonicity is the fundamental invariant that guarantees binary search uniquely
+    /// and correctly locates the earliest uninitialized epoch start.
+    /// If targetEpoch is already initialized, the prefix property guarantees that all epochs
+    /// from 0 to targetEpoch are already initialized (no gaps can exist), so it safely returns targetEpoch.
     /// @param targetEpoch Target epoch to initialize up to.
-    /// @param maxSteps Maximum number of uninitialized epochs to process in this call.
+    /// @param maxSteps Maximum number of uninitialized epochs to process in this call (must be > 0).
     /// @return The last epoch successfully initialized in this call.
     function initEpochSeed(uint256 targetEpoch, uint256 maxSteps) public override returns (uint256) {
         if (targetEpoch > epoch()) revert FutureEpoch();
-        if (epochSeed[targetEpoch] != 0) revert SeedAlreadyInitialized();
-        if (maxSteps == 0) maxSteps = MAX_SEED_STEPS;
+        if (epochSeed[targetEpoch] != 0) return targetEpoch;
+        if (maxSteps == 0) revert InvalidMaxSteps();
 
         // Find the earliest uninitialized epoch up to target
         uint256 start = 0;

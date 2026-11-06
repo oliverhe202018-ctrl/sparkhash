@@ -103,9 +103,12 @@ contract MinerV1Test is Test {
         uint256 seed0 = miner.epochSeed(0);
         assertTrue(seed0 != 0);
 
-        // Cannot re-init
-        vm.expectRevert(MinerV1.SeedAlreadyInitialized.selector);
-        miner.initEpochSeed(0);
+        // Target already initialized is a no-op that returns targetEpoch without reverting
+        uint256 reInit = miner.initEpochSeed(0, 10);
+        assertEq(reInit, 0);
+        assertEq(miner.epochSeed(0), seed0);
+        miner.initEpochSeed(0); // single-param wrapper also no-op
+        assertEq(miner.epochSeed(0), seed0);
 
         // Future epoch reverts
         vm.expectRevert(MinerV1.FutureEpoch.selector);

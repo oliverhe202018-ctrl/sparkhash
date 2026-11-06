@@ -118,9 +118,9 @@ contract EpochSeedBackfillTest is Test {
         assertEq(last5, 100);
         assertTrue(miner.epochSeed(100) != 0);
 
-        // Call 6: target already initialized -> SeedAlreadyInitialized revert
-        vm.expectRevert(MinerV1.SeedAlreadyInitialized.selector);
-        miner.initEpochSeed(100, 20);
+        // Call 6: target already initialized -> returns targetEpoch (no-op, does not revert)
+        uint256 last6 = miner.initEpochSeed(100, 20);
+        assertEq(last6, 100);
 
         // Verify all 100 epochs are non-zero and hash chain is consistent
         for (uint256 e = 1; e <= 99; e++) {
@@ -198,5 +198,81 @@ contract EpochSeedBackfillTest is Test {
         // Should have initialized 0..23 (24 steps)
         assertTrue(miner.epochSeed(23) != 0);
         assertEq(miner.epochSeed(24), 0);
+    }
+
+    /// @notice Requirement 1(a): Calling future epoch reverts with FutureEpoch.
+    function test_PrefixProperty_FutureEpochReverts() public {
+        vm.warp(start + 5 * 3600 + 1);
+        assertEq(miner.epoch(), 5);
+
+        vm.expectRevert(MinerV1.FutureEpoch.selector);
+        miner.initEpochSeed(6, 10);
+    }
+
+    /// @notice Requirement 1(a) & 1(c): maxSteps == 0 reverts with InvalidMaxSteps.
+    function test_PrefixProperty_MaxStepsZeroReverts() public {
+        vm.warp(start + 5 * 3600 + 1);
+        assertEq(miner.epoch(), 5);
+
+        vm.expectRevert(MinerV1.InvalidMaxSteps.selector);
+        miner.initEpochSeed(5, 0);
+    }
+
+    /// @notice Requirement 1(a) & 1(b): Calling with already initialized epoch is no-op returning targetEpoch.
+    function test_PrefixProperty_AlreadyInitializedNoOp() public {
+        vm.warp(start + 10 * 3600 + 1);
+        miner.initEpochSeed(4, 10);
+        for (uint256 e = 0; e <= 4; e++) {
+            assertTrue(miner.epochSeed(e) != 0, "seed should be initialized");
+        }
+        uint256 seed2Before = miner.epochSeed(2);
+
+        uint256 res = miner.initEpochSeed(2, 5);
+        assertEq(res, 2);
+        assertEq(miner.epochSeed(2), seed2Before);
+
+        res = miner.initEpochSeed(4, 5);
+        assertEq(res, 4);
+
+        for (uint256 e = 5; e <= 10; e++) {
+            assertEq(miner.epochSeed(e), 0, "future seed must remain 0");
+        }
+    }
+
+    /// @notice Requirement 1(a): maxSteps greater than gap initializes all remaining epochs up to target.
+    function test_PrefixProperty_MaxStepsGreaterThanGap() public {
+        vm.warp(start + 8 * 3600 + 1);
+        miner.initEpochSeed(2, 10);
+
+        uint256 last = miner.initEpochSeed(8, 50);
+        assertEq(last, 8);
+
+        for (uint256 e = 0; e <= 8; e++) {
+            assertTrue(miner.epochSeed(e) != 0, "seed should be initialized");
+        }
+        assertEq(miner.epochSeed(9), 0, "epoch 9 must not be initialized");
+    }
+
+    /// @notice Requirement 1(a): Proves initialized epochs ALWAYS form a contiguous prefix [0, ..., K-1].
+    function test_PrefixProperty_ContiguousPrefixInvariant() public {
+        vm.warp(start + 30 * 3600 + 1);
+        assertEq(miner.epoch(), 30);
+
+        uint256[5] memory steps = [uint256(3), uint256(7), uint256(5), uint256(10), uint256(15)];
+        uint256 expectedK = 0;
+
+        for (uint256 i = 0; i < steps.length; i++) {
+            uint256 s = steps[i];
+            uint256 lastInit = miner.initEpochSeed(30, s);
+            expectedK = (expectedK + s > 31) ? 31 : expectedK + s;
+            assertEq(lastInit, expectedK - 1, "lastInit should match K-1");
+
+            for (uint256 e = 0; e < expectedK; e++) {
+                assertTrue(miner.epochSeed(e) != 0, "seed in prefix must be non-zero");
+            }
+            for (uint256 e = expectedK; e <= 30; e++) {
+                assertEq(miner.epochSeed(e), 0, "seed outside prefix must be zero");
+            }
+        }
     }
 }
