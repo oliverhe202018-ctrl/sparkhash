@@ -4,7 +4,8 @@ pragma solidity ^0.8.24;
 interface IMiner {
     function epoch() external view returns (uint256);
     function guardian() external view returns (address);
-    function initEpochSeed(uint256 e) external;
+    function initEpochSeed(uint256 targetEpoch) external;
+    function initEpochSeed(uint256 targetEpoch, uint256 maxSteps) external returns (uint256);
     function sync(uint256 maxSteps) external returns (uint256);
     function submitShares(uint8[] calldata ks, uint256[] calldata nonces) external;
     function claim(uint256 e) external;

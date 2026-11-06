@@ -26,6 +26,7 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     uint256 public constant EASIEST = uint256(1) << 222;  // 34 bits
     uint256 public constant HARDEST = uint256(1) << 220;  // 36 bits
     uint256 public constant WSCALE = 1e10;            // Weight unit: sqrt(1)*1e6 * 10000 bps
+    uint256 public constant MAX_SEED_STEPS = 24;
 
     // Configurable parameters with bounds
     uint256 public S_STAR;                            // Target counted shares per epoch
@@ -200,20 +201,52 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
 
     // --- State & PoW Operations ---
 
-    /// @notice Initialize epoch seed lazily using previous blockhash. Required before shares can be submitted.
-    function initEpochSeed(uint256 e) external override {
-        if (e > epoch()) revert FutureEpoch();
-        if (epochSeed[e] != 0) revert SeedAlreadyInitialized();
-        if (e > 0 && epochSeed[e - 1] == 0) revert PrevSeedNotInitialized();
+    /// @notice Initialize epoch seed with batched backfill support.
+    /// @param targetEpoch Target epoch to initialize up to.
+    /// @param maxSteps Maximum number of uninitialized epochs to process in this call.
+    /// @return The last epoch successfully initialized in this call.
+    function initEpochSeed(uint256 targetEpoch, uint256 maxSteps) public override returns (uint256) {
+        if (targetEpoch > epoch()) revert FutureEpoch();
+        if (epochSeed[targetEpoch] != 0) revert SeedAlreadyInitialized();
+        if (maxSteps == 0) maxSteps = MAX_SEED_STEPS;
 
-        bytes32 bh = blockhash(block.number - 1);
-        if (bh == bytes32(0)) revert BlockhashUnavailable();
+        // Find the earliest uninitialized epoch up to target
+        uint256 start = 0;
+        if (epochSeed[0] != 0) {
+            uint256 low = 0;
+            uint256 high = targetEpoch;
+            while (low < high) {
+                uint256 mid = (low + high) / 2;
+                if (epochSeed[mid] != 0) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            start = low;
+        }
 
-        bytes32 prev = (e == 0) ? bytes32(0) : bytes32(epochSeed[e - 1]);
-        uint256 seed = uint256(keccak256(abi.encode(prev, bh, e, block.chainid, address(this))));
-        epochSeed[e] = seed;
+        uint256 curEpoch = epoch();
+        bytes32 curBh = blockhash(block.number - 1);
+        uint256 lastInit = start;
+        uint256 count = 0;
 
-        emit EpochSeedInitialized(e, seed);
+        for (uint256 e = start; e <= targetEpoch && count < maxSteps; e++) {
+            bytes32 prev = (e == 0) ? bytes32(0) : bytes32(epochSeed[e - 1]);
+            bytes32 bh = (e == curEpoch) ? curBh : bytes32(0);
+            uint256 seed = uint256(keccak256(abi.encode(prev, bh, e, block.chainid, address(this))));
+            epochSeed[e] = seed;
+            emit EpochSeedInitialized(e, seed);
+            lastInit = e;
+            count++;
+        }
+
+        return lastInit;
+    }
+
+    /// @notice Backward-compatible wrapper defaulting to MAX_SEED_STEPS.
+    function initEpochSeed(uint256 targetEpoch) external override {
+        initEpochSeed(targetEpoch, MAX_SEED_STEPS);
     }
 
     /// @notice Catch up epoch target and EMA sequentially up to maxSteps. Unprivileged public function.
