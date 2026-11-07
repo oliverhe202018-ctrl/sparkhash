@@ -54,7 +54,6 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     mapping(uint256 => uint256) public unallocatedGap;
 
     event SharesSubmitted(address indexed u, uint256 indexed epoch, uint256 n, uint256 weightAdded);
-    event Claimed(address indexed u, uint256 indexed epoch, uint256 amount);
     event EpochSynced(uint256 indexed epoch, uint256 target, uint256 ema);
     event EpochSeedInitialized(uint256 indexed epoch, uint256 seed);
     event SubmissionsPaused(address indexed account);
@@ -386,7 +385,6 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
         uint256 effQ = effectiveQuota(e);
         if (effQ == 0) {
             emit RewardClaimed(msg.sender, e, 0, 0);
-            emit Claimed(msg.sender, e, 0);
             return;
         }
 
@@ -408,7 +406,6 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
         }
 
         emit RewardClaimed(msg.sender, e, amt, cappedOverflow);
-        emit Claimed(msg.sender, e, amt);
         if (amt > 0) {
             token.mint(msg.sender, amt);
         }
