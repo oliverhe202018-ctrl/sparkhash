@@ -1,0 +1,18 @@
+{
+  "miner": "0x0000000000000000000000000000000000000010",
+  "minerContract": "0x5991A2dF15A8F6A256D3Ec51E99254Cd3fb576A9",
+  "chainId": 97,
+  "epoch": 1,
+  "k": 0,
+  "epochSeed": "0x2755c9f580902c8ba1b9aed50e0413ba02ef5001993043bbac928217ff386921",
+  "target": "0x0001000000000000000000000000000000000000000000000000000000000000",
+  "difficultyBits": 16,
+  "actualDifficultyBits": 18,
+  "nonce": "0x1aa54",
+  "nonceDecimal": 109140,
+  "hash": "0x00003562eade57ff72e58b0b9ecc13e6ee5fbb31c2ac23caf5fded7f304e643b",
+  "timestamp": 1793873313,
+  "elapsedSeconds": 0.3,
+  "hashesChecked": 50000,
+  "averageHashrate": 169161.72
+}

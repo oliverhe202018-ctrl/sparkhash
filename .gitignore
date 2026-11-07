@@ -33,6 +33,9 @@ __pycache__/
 .venv_gpu/
 .pytest_cache/
 share_*.json
-test_share_program.json
+/test_share_program.json
 test_gpu_share_*.json
 gpu_share_*.json
+
+# Personal vault notes
+docs/personal-vault-*

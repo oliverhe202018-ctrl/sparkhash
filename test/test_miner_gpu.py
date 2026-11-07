@@ -106,7 +106,10 @@ def test_reproduce_test_share_program():
     """
     import pyopencl as cl
 
-    with open("test_share_program.json", "r", encoding="utf-8") as f:
+    fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "test_share_program.json")
+    if not os.path.exists(fixture_path):
+        fixture_path = "test/fixtures/test_share_program.json"
+    with open(fixture_path, "r", encoding="utf-8") as f:
         known_data = json.load(f)
 
     sub_bytes = miner_gpu.compute_sub_hash(

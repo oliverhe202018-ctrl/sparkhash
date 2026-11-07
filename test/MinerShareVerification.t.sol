@@ -351,7 +351,7 @@ contract MinerShareVerificationTest is Test {
     /// @notice Confirms contract accepts the exact share JSON file produced by miner.py
     function test_AcceptsProgramMinedShareFromFile() public {
         uint256 epochNum = 1;
-        string memory json = vm.readFile("test_share_program.json");
+        string memory json = vm.readFile("test/fixtures/test_share_program.json");
         address minerAddr = vm.parseJsonAddress(json, ".miner");
         uint8 k = uint8(vm.parseJsonUint(json, ".k"));
         uint256 nonce = vm.parseJsonUint(json, ".nonceDecimal");
