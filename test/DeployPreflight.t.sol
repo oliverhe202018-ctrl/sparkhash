@@ -19,6 +19,8 @@ contract DeployPreflightTest is Test {
         vm.deal(deployer, 100 ether);
         deployScript = new DeployScript();
         vm.setEnv("PRIVATE_KEY", vm.toString(deployerKey));
+        vm.setEnv("TIMELOCK_MIN_DELAY", "172800");
+        vm.setEnv("DISCLOSURE_TIMELOCK_DELAY", "172800");
     }
 
     function test_PreflightPassesWithValidSafes() public {

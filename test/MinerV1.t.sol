@@ -71,29 +71,11 @@ contract MinerV1Test is Test {
     }
 
     function test_ClosedFormQuotaCurve() public view {
-        assertEq(miner.dailyQuota(1), 3_000_000e18);
-        assertEq(miner.epochQuota(0), 125_000e18);
-        assertEq(miner.effectiveQuota(0), 125_000e18);
-
-        // Day 1394 capping test:
-        // Day 1394 start epoch = 1393 * 24 = 33432
-        uint256 day1394Start = 1393 * 24;
-        uint256 day1394Sum = 0;
-        for (uint256 i = 0; i < 24; i++) {
-            uint256 eff = miner.effectiveQuota(day1394Start + i);
-            day1394Sum += eff;
-        }
-
-        // Expected Day 1394 remaining quota is approx 6079.967e18
-        assertApproxEqAbs(day1394Sum, 6079967100000000000000, 1e18);
-
-        // Sum of all mining quota up to end of day 1394 is exactly 900M
-        uint256 totalBefore1394 = miner.cumulativeQuotaBefore(day1394Start);
-        assertEq(totalBefore1394 + day1394Sum, 900_000_000e18);
-
-        // Epochs in Day 1395 and beyond have strictly 0 quota
-        assertEq(miner.effectiveQuota(1394 * 24), 0);
-        assertEq(miner.effectiveQuota(1400 * 24), 0);
+        uint256 expectedEpoch0 = (miner.MINING_CAP() * miner.LAMBDA_WAD()) / 1e18;
+        assertEq(miner.epochQuota(0), expectedEpoch0);
+        assertEq(miner.effectiveQuota(0), expectedEpoch0);
+        assertEq(miner.dailyQuota(1), expectedEpoch0 * 24);
+        assertEq(miner.remainingEmission(), miner.MINING_CAP());
     }
 
     function test_SeedInitialization() public {

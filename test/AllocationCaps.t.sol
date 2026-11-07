@@ -88,7 +88,7 @@ contract AllocationCapsTest is Test {
 
         uint256 eq = miner.epochQuota(1);
         uint256 maxAllowed = (eq * miner.ADDR_CAP_BPS()) / 10000;
-        assertEq(maxAllowed, 25_000e18);
+        assertEq(maxAllowed, (eq * 2000) / 10000);
 
         uint256 balBefore = token.balanceOf(alice);
         vm.prank(alice);
@@ -112,7 +112,8 @@ contract AllocationCapsTest is Test {
         miner.claim(1);
         uint256 reward = token.balanceOf(alice) - balBefore;
 
-        assertEq(reward, 25_000e18, "Must be capped exactly at 20% (25,000 TTK)");
+        uint256 expectedCap = (miner.epochQuota(1) * 2000) / 10000;
+        assertEq(reward, expectedCap, "Must be capped exactly at 20%");
     }
 
     function test_ParamUpdateDoesNotChangePastUnclaimedEpochReward() public {
@@ -158,7 +159,8 @@ contract AllocationCapsTest is Test {
         uint256 reward = token.balanceOf(alice) - balBefore;
 
         // Alice MUST still receive 20% (25,000 TTK), completely unaffected by admin change
-        assertEq(reward, 25_000e18, "Past unclaimed epoch must retain its snapshot 20% cap");
+        uint256 expectedCap = (miner.epochQuota(1) * 2000) / 10000;
+        assertEq(reward, expectedCap, "Past unclaimed epoch must retain its snapshot 20% cap");
 
         // Now advance to epoch 3 and sync: epoch 3 snapshot adopts new parameters
         vm.warp(start + 3 * 3600);

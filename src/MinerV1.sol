@@ -21,6 +21,7 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     uint256 public constant RAMP_EPOCHS = 24;         // Warmup ramp duration in epochs
     uint256 public constant RAMP_START_BPS = 2500;    // 25% starting weight
     uint256 public constant MINING_CAP = 900_000_000e18;
+    uint256 public constant LAMBDA_WAD = 137_639_085_754_704; // p=99% over 1394 days (33,456 epochs)
     uint256 public constant D0 = 3_000_000e18;        // Day 1 quota
     uint256 public constant DECAY = 0.9967e18;        // Daily decay: 0.9967
     uint256 public constant EASIEST = uint256(1) << 224;  // 32 bits
@@ -52,6 +53,12 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
 
     // Slot 20: unallocated dilution gap (B3)
     mapping(uint256 => uint256) public unallocatedGap;
+
+    // Slot 21: remaining unallocated mining emission R (initially 900M)
+    uint256 public remainingEmission;
+
+    // Slot 22: fixed baseline quota for settled epochs
+    mapping(uint256 => uint256) public settledEpochQuota;
 
     event SharesSubmitted(address indexed u, uint256 indexed epoch, uint256 n, uint256 weightAdded);
     event EpochSynced(uint256 indexed epoch, uint256 target, uint256 ema);
@@ -118,6 +125,7 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
 
         epochSStar[0] = 50_000;
         epochAddrCapBps[0] = 2000;
+        remainingEmission = MINING_CAP;
     }
 
     function epoch() public view override returns (uint256) {
@@ -139,47 +147,33 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
         return res;
     }
 
-    /// @notice Daily quota for day d (1-indexed)
-    function dailyQuota(uint256 day) public pure override returns (uint256) {
-        if (day == 0) return 0;
-        uint256 f = _powFixed(DECAY, day - 1);
-        return (D0 * f) / 1e18;
+    /// @notice Effective epoch quota (view). If epoch is settled, returns frozen quota; else returns current estimated quota
+    function effectiveQuota(uint256 e) public view override returns (uint256) {
+        if (e < lastSynced) {
+            return settledEpochQuota[e];
+        }
+        return (remainingEmission * LAMBDA_WAD) / 1e18;
     }
 
     /// @notice Standard epoch quota for epoch e
-    function epochQuota(uint256 e) public pure override returns (uint256) {
-        return dailyQuota(e / 24 + 1) / 24;
+    function epochQuota(uint256 e) public view override returns (uint256) {
+        return effectiveQuota(e);
     }
 
-    /// @notice Cumulative quota sum of completed full days before day d+1 using geometric series closed form
-    /// @dev Sum_{k=1..d} D0 * r^(k-1) = D0 * (1 - r^d) / (1 - r)
-    ///      Where: D0 = 3,000,000e18, r = 0.9967e18 -> 1 - r = 0.0033e18 = 3.3e15
-    ///      D0 / (1 - r) = 3,000,000e18 / 3.3e15 = 3e24 / 3.3e15 = 3e9 / 3.3 = 30e9 / 33 = 10_000_000_000 / 11.
-    ///      Since (1e18 - r^d) is scaled by 1e18, the formula:
-    ///      (10_000_000_000 * (1e18 - rd)) / 11 gives the exact sum in 18-decimal wei.
-    ///      WARNING: If D0 or DECAY is ever modified, this ratio must be recalculated!
-    function cumulativeDailyQuota(uint256 completedDays) public pure returns (uint256) {
-        if (completedDays == 0) return 0;
-        uint256 rd = _powFixed(DECAY, completedDays);
-        return (10_000_000_000 * (1e18 - rd)) / 11;
+    /// @notice Daily quota for day d (1-indexed estimate based on start epoch of day d)
+    function dailyQuota(uint256 day) public view override returns (uint256) {
+        if (day == 0) return 0;
+        return effectiveQuota((day - 1) * 24) * 24;
     }
 
-    /// @notice Total scheduled mining quota prior to epoch e (closed form, independent of claim history)
-    function cumulativeQuotaBefore(uint256 e) public pure override returns (uint256) {
-        uint256 completedDays = e / 24;
-        uint256 fullDaysQuota = cumulativeDailyQuota(completedDays);
-        uint256 epochsToday = e % 24;
-        uint256 partialToday = epochsToday * epochQuota(e);
-        return fullDaysQuota + partialToday;
+    /// @notice Cumulative quota allocated/minted prior to epoch e
+    function cumulativeDailyQuota(uint256 /* completedDays */) public view returns (uint256) {
+        return MINING_CAP - remainingEmission;
     }
 
-    /// @notice Effective epoch quota capped at 900M mining cap (flat equal ceiling for all miners in epoch e)
-    function effectiveQuota(uint256 e) public pure override returns (uint256) {
-        uint256 cb = cumulativeQuotaBefore(e);
-        if (cb >= MINING_CAP) return 0;
-        uint256 remaining = MINING_CAP - cb;
-        uint256 eq = epochQuota(e);
-        return remaining < eq ? remaining : eq;
+    /// @notice Total scheduled mining quota allocated/minted prior to epoch e
+    function cumulativeQuotaBefore(uint256 /* e */) public view override returns (uint256) {
+        return MINING_CAP - remainingEmission;
     }
 
     /// @notice Minimum epoch weight threshold W_min
@@ -277,23 +271,30 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
         while (n < stop) {
             // Settle completed epoch (n)
             uint256 settledEpoch = n;
-            uint256 effQ = effectiveQuota(settledEpoch);
+            uint256 q_e = (remainingEmission * LAMBDA_WAD) / 1e18;
+            settledEpochQuota[settledEpoch] = q_e;
+
             uint256 tw = totalWeight[settledEpoch];
             uint256 wm = wMin(settledEpoch);
+            uint256 allocatable = 0;
             uint256 b3 = 0;
-            if (effQ > 0) {
-                if (tw < wm) {
-                    uint256 allocatable = (effQ * tw) / wm;
-                    b3 = effQ - allocatable;
+            if (q_e > 0) {
+                if (tw >= wm) {
+                    allocatable = q_e;
+                } else {
+                    allocatable = (q_e * tw) / wm;
+                    b3 = q_e - allocatable;
                 }
             }
+            remainingEmission -= allocatable;
             unallocatedGap[settledEpoch] = b3;
-            emit EpochSettled(settledEpoch, effQ, tw, wm, b3);
+            emit EpochSettled(settledEpoch, q_e, tw, wm, b3);
 
             n++;
             uint256 shares = (n >= 2) ? totalShares[n - 2] : S_STAR;
             ema = (ema + shares) / 2;
             uint256 t = target[n - 1];
+            if (t > EASIEST) t = EASIEST;
             uint256 nt = (ema == 0) ? (t * 125 / 100) : (t * S_STAR / ema);
             if (nt > t * 125 / 100) nt = t * 125 / 100;
             if (nt < t * 100 / 125) nt = t * 100 / 125;
@@ -376,13 +377,17 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     /// @dev Uses epochAddrCapBps snapshot to ensure changes to ADDR_CAP_BPS never alter past ended rewards.
     function claim(uint256 e) external override nonReentrant {
         if (e >= epoch()) revert EpochNotEnded();
+        if (lastSynced <= e) {
+            sync(48);
+            if (lastSynced <= e) revert SyncingRequired();
+        }
         if (claimed[e][msg.sender]) revert AlreadyClaimed();
         claimed[e][msg.sender] = true;
 
         uint256 uw = userWeight[e][msg.sender];
         if (uw == 0) revert ZeroWeight();
 
-        uint256 effQ = effectiveQuota(e);
+        uint256 effQ = settledEpochQuota[e];
         if (effQ == 0) {
             emit RewardClaimed(msg.sender, e, 0, 0);
             return;
@@ -403,6 +408,7 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
         if (amt > maxAmt) {
             cappedOverflow = amt - maxAmt;
             amt = maxAmt;
+            remainingEmission += cappedOverflow;
         }
 
         emit RewardClaimed(msg.sender, e, amt, cappedOverflow);
@@ -459,5 +465,6 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
 
     // Reserved storage space for proxy upgrades (reduced by 3 slots for epochSStar, epochAddrCapBps, and guardian)
     // Reserved storage space for proxy upgrades (reduced by 1 slot from 47 to 46 for unallocatedGap)
-    uint256[46] private __gap;
+    // Reserved storage space for proxy upgrades (reduced by 2 slots from 46 to 44 for remainingEmission and settledEpochQuota)
+    uint256[44] private __gap;
 }

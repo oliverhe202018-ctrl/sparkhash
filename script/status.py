@@ -58,6 +58,8 @@ SEL_VAULT_STATUS = "0x645b8b1b"   # status(address) -> (bool, uint256)
 SEL_VAULT_STAKES = "0x16934fc4"   # stakes(address) -> (uint64, uint64, bool, uint128)
 SEL_TOKEN_BALANCE = "0x70a08231"  # balanceOf(address) -> uint256
 SEL_UNALLOCATED_GAP = "0xca6875f7"  # unallocatedGap(uint256) -> uint256
+SEL_REMAINING_EMISSION = "0xb547df86"  # remainingEmission() -> uint256
+SEL_SETTLED_EPOCH_QUOTA = "0x67ef6de5"  # settledEpochQuota(uint256) -> uint256
 SELECTOR_INIT_EPOCH_SEED = "0xd9d9c33c"  # initEpochSeed(uint256,uint256)
 EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
 EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
@@ -170,6 +172,7 @@ def inspect_status(args):
         ("eth_call", [{"to": miner_contract, "data": SEL_TOKEN}, "latest"]),
         ("eth_call", [{"to": miner_contract, "data": SEL_VAULT}, "latest"]),
         ("eth_call", [{"to": miner_contract, "data": SEL_ADDR_CAP_BPS}, "latest"]),
+        ("eth_call", [{"to": miner_contract, "data": SEL_REMAINING_EMISSION}, "latest"]),
     ]
     core_results = rpc_batch_call(rpc_url, core_calls)
     cur_epoch = int(core_results[0], 16)
@@ -177,6 +180,7 @@ def inspect_status(args):
     token_contract = to_checksum_address("0x" + core_results[2][-40:])
     vault_contract = to_checksum_address("0x" + core_results[3][-40:])
     default_addr_cap_bps = decode(["uint256"], bytes.fromhex(core_results[4][2:]))[0]
+    remaining_emission = decode(["uint256"], bytes.fromhex(core_results[5][2:]))[0] if len(core_results) > 5 and core_results[5] else 0
 
     # 3. Fetch Miner Staking & Token Balance
     user_calls = [
@@ -216,6 +220,7 @@ def inspect_status(args):
     print(f"  [*] 协议同步轮次 (lastSynced): Epoch {last_synced} ({sync_status})")
     print(f"  [*] 当前轮预热权重 (ramp):    {cur_ramp_desc}")
     print(f"  [*] Token 余额 (TTK):         {token_balance_wei / 1e18:.6f} TTK ({token_balance_wei} wei)")
+    print(f"  [*] 剩余未分配配额 (R):       {remaining_emission / 1e18:.4f} TTK (上限 900,000,000 TTK)")
     print("-" * 78)
 
     # 4. Fetch per-epoch participation

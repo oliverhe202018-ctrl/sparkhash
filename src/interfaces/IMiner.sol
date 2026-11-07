@@ -28,8 +28,10 @@ interface IMiner {
     function unpause() external;
     function setSStar(uint256 newSStar) external;
     function setAddrCapBps(uint256 newCapBps) external;
-    function effectiveQuota(uint256 e) external pure returns (uint256);
-    function epochQuota(uint256 e) external pure returns (uint256);
-    function dailyQuota(uint256 d) external pure returns (uint256);
-    function cumulativeQuotaBefore(uint256 e) external pure returns (uint256);
+    function effectiveQuota(uint256 e) external view returns (uint256);
+    function epochQuota(uint256 e) external view returns (uint256);
+    function dailyQuota(uint256 d) external view returns (uint256);
+    function cumulativeQuotaBefore(uint256 e) external view returns (uint256);
+    function remainingEmission() external view returns (uint256);
+    function settledEpochQuota(uint256 e) external view returns (uint256);
 }

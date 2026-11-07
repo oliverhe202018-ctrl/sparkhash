@@ -207,7 +207,8 @@ contract ReplayAndBoundariesTest is Test {
         miner.claim(1);
         uint256 reward = token.balanceOf(alice) - balBefore;
 
-        assertEq(reward, 3_125e18);
+        uint256 expectedReward = (miner.epochQuota(1) * 25) / 1000;
+        assertEq(reward, expectedReward);
     }
 
     function test_ClaimZeroWeightReverts() public {
@@ -242,6 +243,9 @@ contract ReplayAndBoundariesTest is Test {
         // Avoid looping 33,600 times by setting lastSynced directly in storage (slot 7)
         bytes32 lastSyncedSlot = bytes32(uint256(7));
         vm.store(address(miner), lastSyncedSlot, bytes32(exhaustedEpoch));
+
+        // Under progress emission, quota is exhausted when remainingEmission is 0 (slot 21)
+        vm.store(address(miner), bytes32(uint256(21)), bytes32(0));
 
         // Fast target for exhausted epoch
         bytes32 slot = keccak256(abi.encode(exhaustedEpoch, uint256(10)));

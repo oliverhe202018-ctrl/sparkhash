@@ -214,6 +214,7 @@ contract BaselineUpgradeTest is Test {
         assertTrue(miner.epochSeed(6) != 0, "epochSeed(6) should be initialized via legacy wrapper");
 
         // (d) Test sync settles epoch and sets unallocatedGap
+        vm.store(address(proxy), bytes32(uint256(21)), bytes32(uint256(900_000_000e18)));
         miner.sync(2);
         uint256 gap1 = miner.unallocatedGap(1);
         assertTrue(gap1 > 0, "unallocatedGap(1) should be populated after sync");

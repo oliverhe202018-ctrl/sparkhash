@@ -53,6 +53,8 @@ EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d3859
 SEL_EPOCH = "0x900cf0cf"           # epoch() -> uint256
 SEL_TOKEN = "0xfc0c546a"           # token() -> address
 SEL_ADDR_CAP_BPS = "0xbc9c68ae"    # ADDR_CAP_BPS() -> uint256
+SEL_REMAINING_EMISSION = "0xb547df86"   # remainingEmission() -> uint256
+SEL_SETTLED_EPOCH_QUOTA = "0x67ef6de5"  # settledEpochQuota(uint256) -> uint256
 
 
 def parse_reward_claimed(log):
