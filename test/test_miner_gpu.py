@@ -18,7 +18,11 @@ import json
 import time
 import struct
 import pytest
-import numpy as np
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 # Ensure root directory in sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +36,8 @@ from Crypto.Hash import keccak as pycrypto_keccak
 def _check_opencl_gpu():
     if os.environ.get("NO_GPU", "").strip() in ("1", "true", "True") or os.environ.get("SKIP_GPU_TESTS", "").strip() in ("1", "true", "True"):
         return False, "OpenCL GPU tests skipped: disabled via NO_GPU / SKIP_GPU_TESTS environment variable"
+    if not getattr(miner_gpu, "HAS_PYOPENCL", False) or np is None:
+        return False, "OpenCL GPU tests skipped: pyopencl or numpy runtime not installed"
     try:
         devices = miner_gpu.detect_devices()
         if len(devices) > 0:

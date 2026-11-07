@@ -7,8 +7,20 @@ Calculates mean hashes, ratio to 2^n, and 95% Student-t confidence interval.
 """
 
 import sys, os, time, struct, math
-import numpy as np
-import pyopencl as cl
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    import pyopencl as cl
+except ImportError:
+    cl = None
+
+import pytest
+if cl is None or np is None:
+    pytestmark = pytest.mark.skip(reason="pyopencl or numpy runtime not installed")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:

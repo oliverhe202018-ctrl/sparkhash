@@ -1,7 +1,15 @@
 import sys, os, time, struct, math
-import numpy as np
 import threading
 import multiprocessing as mp
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+import pytest
+if np is None:
+    pytestmark = pytest.mark.skip(reason="numpy not installed")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
