@@ -26,6 +26,12 @@
 
 在本地编译通过（`solc = 0.8.38`, `evm_version = "cancun"`, `optimizer_runs = 200`）后，通过以下命令部署新的实现逻辑合约：
 
+- **版本对照标签**：`mainnet-rc1`
+- **MinerV1 部署字节码哈希 (`keccak256(forge inspect MinerV1 bytecode)`)**：
+  `0x984ee72eb6fc6e7d72200ba36fa87fd179314151207c5d574e8305e4a22e1ee0`
+- **字节码大小**：8,628 字节 (17,256 十六进制字符)
+- **校验依据**：演练部署前应比对本地编译字节码 keccak256 必须与上述对照哈希 100% 吻合，确保链上落合约与经过审计测试的代码完全一致。
+
 ```bash
 # 环境变量配置
 RPC_URL="https://data-seed-prebsc-1-s1.binance.org:8545/"
@@ -210,20 +216,17 @@ cast calldata "execute(address,uint256,bytes,bytes32,bytes32)"   0xd8ab4f2b12a37
 2. **`claim(epoch)` 领奖与铸币事件验证**：
    - 对持有有效份额并已结算的轮次发起 `claim`：
      `cast send 0x420382a0f874c1F120621f847d81581e8737504e "claim(uint256)" <e> --rpc-url "$RPC_URL" --account <keystore 名称> --legacy --gas-price 1000000000`
-   - **当前合约实际发出事件确认**（根据 `src/MinerV1.sol:346-347` 与 `src/interfaces/IMiner.sol`）：
-     - 当 `effectiveQuota > 0` 时，`claim` 函数将**先后发出两个事件**：
-       1. **`RewardClaimed` 事件**（新版结构化领奖与溢出截断事件）：
+   - **当前合约实际发出事件确认**（根据 `src/MinerV1.sol` 与 `src/interfaces/IMiner.sol`）：
+     - **旧版冗余 `Claimed` 事件已彻底移除**，由四参数结构化 `RewardClaimed` 事件统一承接：
+       - **`RewardClaimed` 事件**（结构化领奖与溢出截断事件）：
           - **Topic 0**：`0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a`（由 `cast sig-event "RewardClaimed(address,uint256,uint256,uint256)"` 核对确认）
           - **Topic 1 (miner)**：矿工地址 (`address indexed`)
           - **Topic 2 (epoch)**：结算轮次 (`uint256 indexed`)
-          - **Data**：`claimedAmount` (实际领取数额，受 20% 单地址上限截断), `cappedOverflow` (因超限被截断数额)
-       2. **`Claimed` 事件**（向后兼容旧版前端与索引器）：
-          - **Topic 0**：`0x987d620f307ff6b94d58743cb7a7509f24071586a77759b77c2d4e29f75a2f9a`（由 `cast sig-event "Claimed(address,uint256,uint256)"` 核对确认）
-          - **Topic 1 (u)**：矿工地址 (`address indexed`)
-          - **Topic 2 (epoch)**：结算轮次 (`uint256 indexed`)
-          - **Data (amount)**：提取奖励数额（严格受 20% 单地址上限截断约束）
-     - 当 `effectiveQuota == 0` 时，仅触发 `Claimed(msg.sender, e, 0)` 并直接返回。
-   - 伴随检查代币转账：代币合约触发 `Transfer(address(0), miner, amount)` 确认 ERC20 Mint 成功；
+          - **Data (32 bytes × 2 = 64 bytes)**：
+            - `claimedAmount`：实际领取数额（严格受 20% 单地址硬顶截断约束）
+            - `cappedOverflow`：因超出 20% 硬顶而被截断的溢出数额（沉淀记入 `unallocatedGap`）
+     - 当 `effectiveQuota == 0` 时，仅触发 `RewardClaimed(msg.sender, e, 0, 0)` 并直接返回。
+   - 伴随检查代币转账：当 `claimedAmount > 0` 时，代币合约触发 `Transfer(address(0), miner, amount)` 确认 ERC20 Mint 成功；当 `claimedAmount == 0` 时不触发代币铸造；
    - 伴随检查稀释记账：读取 `unallocatedGap(epoch)`，确认超出 20% 上限的被截断数额与因未满员导致的配额差额被精准沉淀记账。
 
 ---

@@ -234,6 +234,12 @@ event RewardClaimed(
 );
 ```
 
+> **架构决策说明：移除冗余旧版 `Claimed` 事件**
+> 在 mainnet-v2 规范下，旧版 3 参数事件 `Claimed(address indexed u, uint256 indexed epoch, uint256 amount)` 已从 `src/MinerV1.sol` 与 `src/interfaces/IMiner.sol` 中彻底移除，全系统统一采用 4 参数结构化事件 `RewardClaimed`。
+> 1. **消除冗余开销**：避免在每笔 `claim` 交易中重复 emit 两个语义重叠的领奖事件，节省约 1,800 Gas；
+> 2. **数据完整性**：`RewardClaimed` 完整携带实领代币 (`claimedAmount`) 与硬顶截断代币 (`cappedOverflow`)，满足四分桶资金守恒公式链上实时审计需要；
+> 3. **统一链下监听**：链下脚本（`script/monitor.py`、`script/claim.py`、`script/keeper.py` 等）统一订阅 `0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a` 并解析 4 个参数。
+
 #### B. Foundry 不变性测试 (Invariant Tests) 规格
 在 `test/MinerV1Invariant.t.sol` 中构建系统不变量：
 1. **配额上界不变量**：对于任意轮次 $e$，已铸造总额恒不大于有效配额：
