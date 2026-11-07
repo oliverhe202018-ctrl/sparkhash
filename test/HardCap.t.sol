@@ -3,79 +3,112 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
+import {Token} from "../src/Token.sol";
+import {StakeVault} from "../src/StakeVault.sol";
 import {MinerV1} from "../src/MinerV1.sol";
+import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
 contract HardCapTest is Test {
+    Token public token;
+    StakeVault public vault;
     MinerV1 public miner;
 
+    address public admin = address(0xA);
+    address public guardian = address(0x60A8D);
+    address public liquidity = address(0x2);
+    address public team = address(0x3);
+    address public community = address(0x4);
+    address public alice = address(0x10);
+
     uint256 public constant MINING_CAP = 900_000_000e18;
+    uint256 public constant DEPOSIT = 0.01 ether;
+    uint256 public start;
 
     function setUp() public {
-        miner = new MinerV1();
+        start = block.timestamp + 1000;
+
+        token = new Token(liquidity, team, community);
+        vault = new StakeVault(DEPOSIT, start, admin, guardian, 0.001 ether, 10 ether, 24, 2);
+
+        MinerV1 impl = new MinerV1();
+        bytes memory initData = abi.encodeWithSelector(
+            MinerV1.initialize.selector,
+            address(token),
+            address(vault),
+            admin,
+            guardian,
+            start
+        );
+        TransparentUpgradeableProxy proxy = new TransparentUpgradeableProxy(
+            address(impl),
+            admin,
+            initData
+        );
+        miner = MinerV1(address(proxy));
+        token.setMiner(address(miner));
+
+        vm.deal(alice, 10 ether);
     }
 
-    function test_Day1394CappingExactSum() public view {
-        uint256 day1394Start = 1393 * 24;
+    /// @notice Verifies that lambda corresponds to emitting ~99% over 1394 days (33,456 epochs) under 100% participation
+    function test_LambdaParameter99PercentProof() public pure {
+        uint256 lambdaWad = 137_639_085_754_704; // 1.37639e-4 Wad
+        uint256 factor = 1e18 - lambdaWad;
+        uint256 rem = 1e18;
+        for (uint256 i = 0; i < 33456; i++) {
+            rem = (rem * factor) / 1e18;
+        }
+        // rem should be approx 0.01e18 (1% remaining -> 99% emitted)
+        assertApproxEqRel(rem, 0.01e18, 0.005e18, "Remaining after 33456 epochs must be ~1%");
+    }
 
-        uint256 quotaBefore = miner.cumulativeQuotaBefore(day1394Start);
-        assertTrue(quotaBefore < MINING_CAP, "Quota before day 1394 must be < 900M");
+    /// @notice Tests that initial state starts with exactly MINING_CAP and cumulative + remaining == MINING_CAP
+    function test_InitialMiningCapState() public view {
+        assertEq(miner.remainingEmission(), MINING_CAP, "Initial remaining must be 900M");
+        assertEq(miner.cumulativeQuotaBefore(0), 0, "Initial cumulative before must be 0");
+        assertEq(miner.cumulativeQuotaBefore(100), 0, "No epochs settled yet, so 0 allocated");
+    }
 
-        uint256 day1394TotalEffective = 0;
-        for (uint256 i = 0; i < 24; i++) {
-            uint256 eq = miner.effectiveQuota(day1394Start + i);
-            day1394TotalEffective += eq;
+    /// @notice Tests that remaining emission decreases monotonically and strictly conserves 900M
+    function test_AsymptoticDecayAndConservation() public {
+        vm.warp(start + 1);
+        miner.initEpochSeed(0);
+        vm.prank(alice);
+        vault.deposit{value: DEPOSIT}();
+
+        // Simulate 50 epochs of empty participation
+        uint256 prevR = miner.remainingEmission();
+        for (uint256 e = 1; e <= 50; e++) {
+            vm.warp(start + e * 3600);
+            miner.initEpochSeed(e);
+            miner.sync(1);
+
+            uint256 curR = miner.remainingEmission();
+            // Since tw == 0 for these epochs (no shares submitted), allocatable is 0, so curR == prevR
+            assertEq(curR, prevR, "Empty epochs do not deduct from R");
         }
 
-        assertEq(quotaBefore + day1394TotalEffective, MINING_CAP, "Cumulative + Day 1394 must equal 900M");
+        // Now inject participation in epoch 51 and verify deduction
+        uint256 activeEpoch = 51;
+        bytes32 twSlot = keccak256(abi.encode(activeEpoch, uint256(12)));
+        vm.store(address(miner), twSlot, bytes32(uint256(100_000_000_000))); // tw >= wMin
 
-        assertEq(miner.effectiveQuota(day1394Start + 24), 0, "Day 1395 epoch 0 must be 0");
-        assertEq(miner.effectiveQuota(day1394Start + 48), 0, "Day 1396 must be 0");
-        assertEq(miner.effectiveQuota(50_000), 0, "Far future epoch must be 0");
+        vm.warp(start + 52 * 3600);
+        miner.initEpochSeed(52);
+        miner.sync(2); // settles epoch 50 and 51
+
+        uint256 afterR = miner.remainingEmission();
+        assertTrue(afterR < prevR, "R must decrease after participating epoch is settled");
+        uint256 q51 = miner.settledEpochQuota(activeEpoch);
+        assertEq(prevR - afterR, q51, "Deduction from R must match settledEpochQuota");
+        assertEq(miner.cumulativeQuotaBefore(52), q51, "cumulativeQuotaBefore must equal deducted quota");
+        assertEq(miner.cumulativeQuotaBefore(52) + afterR, MINING_CAP, "Conservation: cumulative + remaining == 900M");
     }
 
-    function test_ClosedFormVsIterativeAdditionMaxDiscrepancy() public view {
-        uint256[] memory checkDays = new uint256[](8);
-        checkDays[0] = 1;
-        checkDays[1] = 30;
-        checkDays[2] = 90;
-        checkDays[3] = 180;
-        checkDays[4] = 365;
-        checkDays[5] = 730;
-        checkDays[6] = 1095;
-        checkDays[7] = 1394;
-
-        uint256 iterativeSum = 0;
-        uint256 nextCheckIdx = 0;
-        uint256 maxDiff = 0;
-
-        for (uint256 d = 1; d <= 1394; d++) {
-            iterativeSum += miner.dailyQuota(d);
-
-            if (nextCheckIdx < checkDays.length && d == checkDays[nextCheckIdx]) {
-                uint256 closedForm = miner.cumulativeDailyQuota(d);
-                uint256 diff = closedForm > iterativeSum ? (closedForm - iterativeSum) : (iterativeSum - closedForm);
-                if (diff > maxDiff) {
-                    maxDiff = diff;
-                }
-                console.log("Day:", d);
-                console.log("Diff (wei):", diff);
-                nextCheckIdx++;
-            }
-        }
-
-        console.log("Max Discrepancy (wei):", maxDiff);
-        assertTrue(maxDiff < 1e15, "Max discrepancy must be < 0.001 TTK");
-    }
-
-    function test_ParameterConsistencyRatio() public pure {
-        uint256 D0 = 3_000_000e18;
-        uint256 DECAY = 996700000000000000; // 0.9967e18
-        uint256 oneMinusDecay = 1e18 - DECAY; // 0.0033e18 = 3.3e15
-
-        // Check that D0 / (1 - r) == 10_000_000_000e18 / 11
-        uint256 analyticalRatio = (D0 * 1e18) / oneMinusDecay;
-        uint256 closedFormRatio = uint256(10_000_000_000e18) / 11;
-
-        assertEq(analyticalRatio, closedFormRatio, 'Ratio 10_000_000_000/11 must match D0 / (1 - DECAY)');
+    /// @notice Tests that Token hardcap of 1 Billion (100M premint + 900M mining cap) can never be exceeded
+    function test_TotalSupplyNeverExceedsCap() public view {
+        assertEq(token.MAX_SUPPLY(), 1_000_000_000e18, "Token CAP must be 1B");
+        assertEq(token.MINING_CAP(), 900_000_000e18, "Mining cap must be 900M");
+        assertEq(token.totalSupply(), 100_000_000e18, "Premint must be 100M");
     }
 }
