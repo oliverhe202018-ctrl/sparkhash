@@ -63,6 +63,24 @@ EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c
 EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
 
 
+def parse_reward_claimed(log):
+    """
+    Parses on-chain RewardClaimed event log with 4 parameters:
+    (miner, epoch, claimed_amount, capped_overflow)
+    """
+    topics = log.get("topics", [])
+    if len(topics) < 3:
+        return None
+    miner = "0x" + topics[1][-40:].lower()
+    epoch = int(topics[2], 16)
+    data = log.get("data", "0x")
+    if data.startswith("0x"):
+        data = data[2:]
+    data = data.ljust(128, "0")
+    claimed_amount = int(data[0:64], 16)
+    capped_overflow = int(data[64:128], 16)
+    return miner, epoch, claimed_amount, capped_overflow
+
 def to_checksum_address(address):
     clean = address.lower().replace("0x", "")
     h = keccak(clean.encode("utf-8")).hex()

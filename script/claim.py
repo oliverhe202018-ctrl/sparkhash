@@ -55,6 +55,24 @@ SEL_TOKEN = "0xfc0c546a"           # token() -> address
 SEL_ADDR_CAP_BPS = "0xbc9c68ae"    # ADDR_CAP_BPS() -> uint256
 
 
+def parse_reward_claimed(log):
+    """
+    Parses on-chain RewardClaimed event log with 4 parameters:
+    (miner, epoch, claimed_amount, capped_overflow)
+    """
+    topics = log.get("topics", [])
+    if len(topics) < 3:
+        return None
+    miner = "0x" + topics[1][-40:].lower()
+    epoch = int(topics[2], 16)
+    data = log.get("data", "0x")
+    if data.startswith("0x"):
+        data = data[2:]
+    data = data.ljust(128, "0")
+    claimed_amount = int(data[0:64], 16)
+    capped_overflow = int(data[64:128], 16)
+    return miner, epoch, claimed_amount, capped_overflow
+
 def to_checksum_address(address):
     clean = address.lower().replace("0x", "")
     h = keccak(clean.encode("utf-8")).hex()

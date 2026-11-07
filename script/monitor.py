@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PoolCoin Fair Distribution Monitor
-Reads on-chain SharesSubmitted, Claimed, and EpochSynced events.
+Reads on-chain SharesSubmitted, RewardClaimed, and EpochSynced events.
 Computes per-epoch Top 10 address share concentration and Gini coefficient.
 Directly verifies the core thesis: "Is distribution sufficiently decentralized and fair?"
 """
@@ -9,8 +9,36 @@ Directly verifies the core thesis: "Is distribution sufficiently decentralized a
 import os, sys, time, json, argparse, urllib.request, urllib.error
 
 TOPIC_SHARES_SUBMITTED = "0xf50e89c738e371409f94eeeac48fe75568269cfaed112e683bf11d4b4684b214"
-TOPIC_CLAIMED = "0x987d620f307ff6b94d58743cb7a7509f24071586a77759b77c2d4e29f75a2f9a"
+TOPIC_REWARD_CLAIMED = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
 TOPIC_EPOCH_SYNCED = "0xc7457f76c4fde7f674686f6aa699ce92c9830d6cd0f54b406f4249acb3aa5e41"
+
+def parse_reward_claimed(log_or_topics, data=None):
+    """
+    Parses on-chain RewardClaimed event log.
+    Signature: RewardClaimed(address indexed miner, uint256 indexed epoch, uint256 claimedAmount, uint256 cappedOverflow)
+    Returns: (miner_address, epoch, claimed_amount, capped_overflow)
+    """
+    if isinstance(log_or_topics, dict):
+        topics = log_or_topics.get("topics", [])
+        data = log_or_topics.get("data", "0x")
+    else:
+        topics = log_or_topics
+        data = data or "0x"
+
+    if len(topics) < 3:
+        raise ValueError("Invalid topics count for RewardClaimed: expected at least 3 (signature, miner, epoch)")
+
+    miner = "0x" + topics[1][-40:].lower()
+    epoch = int(topics[2], 16)
+
+    if isinstance(data, str) and data.startswith("0x"):
+        data = data[2:]
+    data_str = (data if isinstance(data, str) else "").ljust(128, "0")
+    claimed_amount = int(data_str[0:64], 16)
+    capped_overflow = int(data_str[64:128], 16)
+    return miner, epoch, claimed_amount, capped_overflow
+
+parse_reward_claimed_log = parse_reward_claimed
 
 def load_env(env_path=".env"):
     config = {}
@@ -57,8 +85,11 @@ class EpochStats:
         self.user_shares[user] = self.user_shares.get(user, 0) + n
         self.user_weights[user] = self.user_weights.get(user, 0) + weight
 
-    def add_claim(self, user, amount):
+    def add_claim(self, user, amount, overflow=0):
         self.user_claims[user] = self.user_claims.get(user, 0) + amount
+        if not hasattr(self, "user_overflows"):
+            self.user_overflows = {}
+        self.user_overflows[user] = self.user_overflows.get(user, 0) + overflow
 
     def summarize(self):
         total_shares = sum(self.user_shares.values())
@@ -160,9 +191,50 @@ def main():
             "address": miner_addr,
             "fromBlock": hex(args.from_block),
             "toBlock": args.to_block,
-            "topics": [[TOPIC_SHARES_SUBMITTED, TOPIC_CLAIMED, TOPIC_EPOCH_SYNCED]]
+            "topics": [[TOPIC_SHARES_SUBMITTED, TOPIC_REWARD_CLAIMED, TOPIC_EPOCH_SYNCED]]
         }])
-        print("Fetched " + str(len(logs)) + " event logs. Analyzing per-epoch Gini coefficients...")
+        print(f"Fetched {len(logs)} event logs. Analyzing per-epoch Gini coefficients...")
+        epoch_stats = {}
+        for log in (logs or []):
+            topics = log.get("topics", [])
+            if not topics:
+                continue
+            topic0 = topics[0].lower()
+            if topic0 == TOPIC_REWARD_CLAIMED.lower():
+                miner, epoch, claimed_amt, capped_overflow = parse_reward_claimed(log)
+                if epoch not in epoch_stats:
+                    epoch_stats[epoch] = EpochStats(epoch)
+                epoch_stats[epoch].add_claim(miner, claimed_amt, capped_overflow)
+            elif topic0 == TOPIC_SHARES_SUBMITTED.lower():
+                user = "0x" + topics[1][-40:].lower()
+                epoch = int(topics[2], 16)
+                data = log.get("data", "0x")
+                if data.startswith("0x"):
+                    data = data[2:]
+                data = data.ljust(128, "0")
+                n = int(data[0:64], 16)
+                weight = int(data[64:128], 16)
+                if epoch not in epoch_stats:
+                    epoch_stats[epoch] = EpochStats(epoch)
+                epoch_stats[epoch].add_shares(user, n, weight)
+
+        if epoch_stats:
+            for epoch_id in sorted(epoch_stats.keys()):
+                summary = epoch_stats[epoch_id].summarize()
+                print(f"\n[Epoch {epoch_id} On-Chain Fairness Report]")
+                print(f"  Active Addresses: {summary['stakers']} | Total Shares Counted: {summary['total_shares']}")
+                print(f"  Top 10 Address Share Ratio: {summary['top10_shares_pct']:.2f}% | Gini Coefficient (Shares): {summary['gini_shares']:.4f}")
+                print(f"  Top 10 Reward Distribution: {summary['top10_claims_pct']:.2f}% | Gini Coefficient (Rewards): {summary['gini_claims']:.4f}")
+                print(f"  Total Claimed TTK: {summary['total_claimed_ttk']:.6f} TTK")
+                if summary["gini_claims"] < 0.4:
+                    verdict = "HEALTHY / DECENTRALIZED (Low concentration)"
+                elif summary["gini_claims"] < 0.7:
+                    verdict = "MODERATE CONCENTRATION (Acceptable under 20% cap)"
+                else:
+                    verdict = "HIGH RISK / MONOPOLY TENDENCY (Sybil cluster alert!)"
+                print(f"  Fairness Diagnostic: {verdict}")
+        else:
+            print("No matching event logs found in the specified block range.")
     except Exception as e:
         print("RPC query failed: " + str(e) + ". Falling back to --demo view.")
         run_mock_demo()

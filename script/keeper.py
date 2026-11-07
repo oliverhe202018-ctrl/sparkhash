@@ -159,6 +159,24 @@ def eth_call(rpc_url, to, data):
         return res[2:]
     return res or ""
 
+def parse_reward_claimed(log):
+    """
+    Parses on-chain RewardClaimed event log with 4 parameters:
+    (miner, epoch, claimed_amount, capped_overflow)
+    """
+    topics = log.get("topics", [])
+    if len(topics) < 3:
+        return None
+    miner = "0x" + topics[1][-40:].lower()
+    epoch = int(topics[2], 16)
+    data = log.get("data", "0x")
+    if data.startswith("0x"):
+        data = data[2:]
+    data = data.ljust(128, "0")
+    claimed_amount = int(data[0:64], 16)
+    capped_overflow = int(data[64:128], 16)
+    return miner, epoch, claimed_amount, capped_overflow
+
 def encode_uint256(val):
     return hex(val)[2:].zfill(64)
 
