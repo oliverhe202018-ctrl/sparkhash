@@ -29,6 +29,23 @@ import script.miner_gpu as miner_gpu
 from Crypto.Hash import keccak as pycrypto_keccak
 
 
+def _check_opencl_gpu():
+    if os.environ.get("NO_GPU", "").strip() in ("1", "true", "True") or os.environ.get("SKIP_GPU_TESTS", "").strip() in ("1", "true", "True"):
+        return False, "OpenCL GPU tests skipped: disabled via NO_GPU / SKIP_GPU_TESTS environment variable"
+    try:
+        devices = miner_gpu.detect_devices()
+        if len(devices) > 0:
+            return True, ""
+        return False, "No OpenCL GPU device detected (requires OpenCL runtime and compatible GPU hardware)"
+    except Exception as e:
+        return False, f"OpenCL GPU detection failed: {e}"
+
+
+HAS_OPENCL_GPU, SKIP_OPENCL_REASON = _check_opencl_gpu()
+requires_opencl_gpu = pytest.mark.skipif(not HAS_OPENCL_GPU, reason=SKIP_OPENCL_REASON)
+
+
+@requires_opencl_gpu
 def test_gpu_device_detection():
     """Verifies that OpenCL detects the NVIDIA RTX 4060 Ti GPU."""
     devices = miner_gpu.detect_devices()
@@ -40,6 +57,7 @@ def test_gpu_device_detection():
     assert primary["global_mem_mb"] > 4000, f"Expected >4GB VRAM, got {primary['global_mem_mb']} MB"
 
 
+@requires_opencl_gpu
 def test_keccak_correctness_1m_random_nonces():
     """
     Requirement 3:
@@ -99,6 +117,7 @@ def test_keccak_correctness_1m_random_nonces():
     assert mismatches == 0, f"Detected {mismatches} mismatches between GPU and PyCryptodome!"
 
 
+@requires_opencl_gpu
 def test_reproduce_test_share_program():
     """
     Requirement 3:
@@ -193,6 +212,7 @@ def test_chain_id_security_enforcement():
         miner_gpu.rpc_call = original_rpc
 
 
+@requires_opencl_gpu
 def test_reduced_difficulty_mining(tmp_path):
     """
     Requirement 6: Small scale verification at reduced difficulty (e.g. 20 bits).
