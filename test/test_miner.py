@@ -7,6 +7,7 @@ import script.miner as miner
 import script.miner_gpu as miner_gpu
 import script.claim as claim
 import script.status as status
+import script.monitor as monitor
 
 class TestMinerSeedBackfillAndJitter(unittest.TestCase):
     def test_backfill_epoch_seed_signs_and_broadcasts_tx(self):
@@ -49,6 +50,49 @@ class TestMinerSeedBackfillAndJitter(unittest.TestCase):
     def test_status_script_has_unallocated_gap_selector(self):
         self.assertEqual(status.SELECTOR_INIT_EPOCH_SEED, "0xd9d9c33c")
         self.assertEqual(status.SEL_UNALLOCATED_GAP, "0xca6875f7")
+
+    def test_monitor_script_reward_claimed_parsing(self):
+        self.assertEqual(monitor.TOPIC_REWARD_CLAIMED, "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a")
+        self.assertFalse(hasattr(monitor, "TOPIC_CLAIMED"))
+
+        # Test 4-parameter RewardClaimed log parsing
+        miner_addr = "0x1111111111111111111111111111111111111111"
+        epoch = 12
+        claimed_amt = 500 * 10**18
+        overflow = 100 * 10**18
+        topic1 = "0x000000000000000000000000" + miner_addr[2:].lower()
+        topic2 = hex(epoch)
+        data = "0x" + hex(claimed_amt)[2:].zfill(64) + hex(overflow)[2:].zfill(64)
+        mock_log = {
+            "topics": [monitor.TOPIC_REWARD_CLAIMED, topic1, topic2],
+            "data": data
+        }
+        miner_out, epoch_out, amt_out, overflow_out = monitor.parse_reward_claimed(mock_log)
+        self.assertEqual(miner_out, miner_addr.lower())
+        self.assertEqual(epoch_out, epoch)
+        self.assertEqual(amt_out, claimed_amt)
+        self.assertEqual(overflow_out, overflow)
+
+    def test_claim_and_keeper_scripts_reward_claimed_parsing(self):
+        self.assertEqual(claim.EVENT_REWARD_CLAIMED_TOPIC, "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a")
+        import script.keeper as keeper
+        self.assertEqual(keeper.EVENT_REWARD_CLAIMED_TOPIC, "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a")
+
+        miner_addr = "0x2222222222222222222222222222222222222222"
+        epoch = 25
+        claimed_amt = 123456789
+        overflow = 987654321
+        topic1 = "0x000000000000000000000000" + miner_addr[2:].lower()
+        topic2 = hex(epoch)
+        data = "0x" + hex(claimed_amt)[2:].zfill(64) + hex(overflow)[2:].zfill(64)
+        mock_log = {
+            "topics": [claim.EVENT_REWARD_CLAIMED_TOPIC, topic1, topic2],
+            "data": data
+        }
+        res_claim = claim.parse_reward_claimed(mock_log)
+        self.assertEqual(res_claim, (miner_addr.lower(), epoch, claimed_amt, overflow))
+        res_keeper = keeper.parse_reward_claimed(mock_log)
+        self.assertEqual(res_keeper, (miner_addr.lower(), epoch, claimed_amt, overflow))
 
     def test_parameter_updates_cap_and_difficulty(self):
         self.assertEqual(miner.CAP, 6)

@@ -29,7 +29,6 @@ contract ReplayAndBoundariesTest is Test {
         uint256 claimedAmount,
         uint256 cappedOverflow
     );
-    event Claimed(address indexed u, uint256 indexed epoch, uint256 amount);
 
     function setUp() public {
         start = block.timestamp + 1000;
@@ -273,8 +272,6 @@ contract ReplayAndBoundariesTest is Test {
 
         vm.expectEmit(true, true, false, true, address(miner));
         emit RewardClaimed(alice, exhaustedEpoch, 0, 0);
-        vm.expectEmit(true, true, false, true, address(miner));
-        emit Claimed(alice, exhaustedEpoch, 0);
 
         vm.prank(alice);
         miner.claim(exhaustedEpoch);
