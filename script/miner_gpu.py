@@ -22,8 +22,14 @@ import struct
 import argparse
 import urllib.request
 import threading
-import numpy as np
 import random
+
+HAS_NUMPY = False
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    np = None
 
 # Chain ID constraint: strictly BSC Testnet
 REQUIRED_CHAIN_ID = 97
@@ -386,6 +392,11 @@ def verify_share_local(sub_bytes, nonce, target_int):
 
 
 def mine(args):
+    if not HAS_PYOPENCL or not HAS_NUMPY:
+        raise RuntimeError(
+            "No compatible OpenCL GPU or numpy runtime found! Please ensure pyopencl, numpy, and GPU drivers are installed.\n"
+            "Setup command: uv pip install pyopencl numpy --python .venv_gpu"
+        )
     devices = detect_devices()
     if not devices:
         raise RuntimeError(
