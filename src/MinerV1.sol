@@ -385,6 +385,7 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
 
         uint256 effQ = effectiveQuota(e);
         if (effQ == 0) {
+            emit RewardClaimed(msg.sender, e, 0, 0);
             emit Claimed(msg.sender, e, 0);
             return;
         }

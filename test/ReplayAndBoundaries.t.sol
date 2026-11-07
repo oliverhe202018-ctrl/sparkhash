@@ -23,6 +23,14 @@ contract ReplayAndBoundariesTest is Test {
     uint256 public constant DEPOSIT = 0.01 ether;
     uint256 public start;
 
+    event RewardClaimed(
+        address indexed miner,
+        uint256 indexed epoch,
+        uint256 claimedAmount,
+        uint256 cappedOverflow
+    );
+    event Claimed(address indexed u, uint256 indexed epoch, uint256 amount);
+
     function setUp() public {
         start = block.timestamp + 1000;
 
@@ -262,6 +270,12 @@ contract ReplayAndBoundariesTest is Test {
         vm.warp(start + (exhaustedEpoch + 1) * 3600);
 
         uint256 balBefore = token.balanceOf(alice);
+
+        vm.expectEmit(true, true, false, true, address(miner));
+        emit RewardClaimed(alice, exhaustedEpoch, 0, 0);
+        vm.expectEmit(true, true, false, true, address(miner));
+        emit Claimed(alice, exhaustedEpoch, 0);
+
         vm.prank(alice);
         miner.claim(exhaustedEpoch);
         uint256 claimedAmt = token.balanceOf(alice) - balBefore;
