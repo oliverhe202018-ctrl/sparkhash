@@ -52,7 +52,7 @@ contract HardCapTest is Test {
 
     /// @notice Verifies that lambda corresponds to emitting ~99% over 1394 days (33,456 epochs) under 100% participation
     function test_LambdaParameter99PercentProof() public pure {
-        uint256 lambdaWad = 137_639_085_754_704; // 1.37639e-4 Wad
+        uint256 lambdaWad = 137_639_085_754_731; // 1.37639e-4 Wad
         uint256 factor = 1e18 - lambdaWad;
         uint256 rem = 1e18;
         for (uint256 i = 0; i < 33456; i++) {

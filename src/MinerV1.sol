@@ -21,7 +21,7 @@ contract MinerV1 is Initializable, ReentrancyGuard, IMiner {
     uint256 public constant RAMP_EPOCHS = 24;         // Warmup ramp duration in epochs
     uint256 public constant RAMP_START_BPS = 2500;    // 25% starting weight
     uint256 public constant MINING_CAP = 900_000_000e18;
-    uint256 public constant LAMBDA_WAD = 137_639_085_754_704; // p=99% over 1394 days (33,456 epochs)
+    uint256 public constant LAMBDA_WAD = 137_639_085_754_731; // p=99% over 1394 days (33,456 epochs)
     uint256 public constant D0 = 3_000_000e18;        // Day 1 quota
     uint256 public constant DECAY = 0.9967e18;        // Daily decay: 0.9967
     uint256 public constant EASIEST = uint256(1) << 224;  // 32 bits

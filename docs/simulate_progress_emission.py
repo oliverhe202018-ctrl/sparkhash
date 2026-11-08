@@ -3,8 +3,11 @@ Progress-Indexed Emission Simulation Script for PoolCoin MinerV2
 Compares existing Calendar-based Decay vs Progress-Indexed Emission (q_e = lambda * R_e).
 """
 
+from decimal import Decimal, getcontext
 import math
 import random
+
+getcontext().prec = 50
 
 MINING_CAP = 900_000_000.0  # 900M
 D0 = 3_000_000.0            # Day 1 daily quota
@@ -43,8 +46,14 @@ def effective_quota_cal(e):
 def calculate_lambda(p, n_epochs=N_1394):
     """
     (1 - lambda)^n = 1 - p  =>  lambda = 1 - (1 - p)^(1/n)
+    Calculated using high-precision Decimal to avoid float64 precision loss.
     """
-    return 1.0 - (1.0 - p) ** (1.0 / n_epochs)
+    p_dec = Decimal(str(p))
+    lam = Decimal(1) - (Decimal(1) - p_dec) ** (Decimal(1) / Decimal(n_epochs))
+    return float(lam)
+
+CONTRACT_LAMBDA_WAD_99 = 137_639_085_754_731
+EXACT_LAMBDA_WAD_99 = 137_639_085_754_731
 
 LAMBDAS = {
     'p=98%': calculate_lambda(0.98),
@@ -113,7 +122,10 @@ if __name__ == '__main__':
         lam_wad = int(round(lam * 1e18))
         q0 = MINING_CAP * lam
         d0 = q0 * 24
-        print(f"Tier {p:7s} | lambda = {lam:.12e} | Wad = {lam_wad:20d} | Epoch 0 Quota = {q0:10.2f} TTK | Day 1 Quota = {d0:10.2f} TTK")
+        extra = ""
+        if p == "p=99%":
+            extra = f" | Contract Wad = {CONTRACT_LAMBDA_WAD_99} (diff = {CONTRACT_LAMBDA_WAD_99 - lam_wad})"
+        print(f"Tier {p:7s} | lambda = {lam:.12e} | Wad = {lam_wad:15d} | Epoch 0 Quota = {q0:10.2f} TTK | Day 1 Quota = {d0:10.2f} TTK{extra}")
 
     print("\nRunning 10-year hourly simulation (87,600 epochs)...")
     res = run_all_simulations()
@@ -130,3 +142,19 @@ if __name__ == '__main__':
             h = res[(m, sc)]
             row = [f"{h[y][1]*100:.2f}%" for y in [1, 2, 3, 5, 10]]
             print(f"| {m} | {sc} | " + " | ".join(row) + " |")
+    print("\n### Absolute Emission Summary Table (Million TTK / M)")
+    print("| Model (Scenario) | Year 1 | Year 2 | Year 3 | Year 5 | Year 10 |")
+    print("| :--- | :---: | :---: | :---: | :---: | :---: |")
+
+    key_scenarios = [
+        ('Calendar', '100%'),
+        ('Calendar', '50%'),
+        ('Calendar', 'Fluctuating'),
+        ('Progress (p=99%)', '100%'),
+        ('Progress (p=99%)', '50%'),
+        ('Progress (p=99%)', 'Fluctuating'),
+    ]
+    for m, sc in key_scenarios:
+        h = res[(m, sc)]
+        row = [f"{h[y][0]/1e6:.2f} M" for y in [1, 2, 3, 5, 10]]
+        print(f"| {m} ({sc}) | " + " | ".join(row) + " |")
