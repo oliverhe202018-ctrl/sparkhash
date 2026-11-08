@@ -43,6 +43,9 @@ DEFAULT_EASIEST_TARGET = 1 << 224  # 32-bit: 2^224
 DEFAULT_HARDEST_TARGET = 1 << 221  # 35-bit: 2^221
 CAP = 6
 SELECTOR_INIT_EPOCH_SEED = "d9d9c33c"  # initEpochSeed(uint256,uint256)
+SELECTOR_VAULT = "fbfa77cf"  # vault()
+SELECTOR_STATUS = "645b8b1b"  # status(address)
+HEX_CHARACTERS = set("0123456789abcdefABCDEF")
 EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
 EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
 
@@ -357,6 +360,95 @@ def encode_address(addr):
     return addr.lower().replace("0x", "").zfill(64)
 
 
+def get_miner_vault(rpc_url: str, miner_contract: str) -> str:
+    """
+    Queries vault() on the miner contract and strictly validates the returned address.
+    """
+    try:
+        res = eth_call(rpc_url, miner_contract, SELECTOR_VAULT)
+    except Exception as e:
+        raise RuntimeError(f"RPC call failed while querying vault(): {type(e).__name__}") from None
+
+    if not res or not isinstance(res, str):
+        raise RuntimeError("Query vault() returned empty response from RPC")
+
+    raw = res[2:] if res.startswith("0x") else res
+    if len(raw) != 64:
+        raise RuntimeError(
+            f"Query vault() returned malformed ABI data length: expected 64 hex characters (32 bytes), got {len(raw)}"
+        )
+
+    if any(c not in HEX_CHARACTERS for c in raw):
+        raise RuntimeError("Query vault() returned invalid hex encoding")
+
+    high_bytes = raw[:24]
+    if high_bytes != "0" * 24:
+        raise RuntimeError("Query vault() returned invalid ABI address encoding: high 12 bytes are non-zero")
+
+    addr_hex = raw[24:64]
+    if addr_hex == "0" * 40:
+        raise RuntimeError("Query vault() returned zero address (0x0000000000000000000000000000000000000000)")
+
+    return to_checksum_address("0x" + addr_hex)
+
+
+def get_stake_status(rpc_url: str, vault_contract: str, miner_addr: str) -> tuple:
+    """
+    Queries status(address) on the vault contract and strictly validates the returned (bool active, uint256 since).
+    """
+    call_data = SELECTOR_STATUS + encode_address(miner_addr)
+    try:
+        res = eth_call(rpc_url, vault_contract, call_data)
+    except Exception as e:
+        raise RuntimeError(f"RPC call failed while querying status(): {type(e).__name__}") from None
+
+    if not res or not isinstance(res, str):
+        raise RuntimeError("Query status() returned empty response from RPC")
+
+    raw = res[2:] if res.startswith("0x") else res
+    if len(raw) != 128:
+        raise RuntimeError(
+            f"Query status() returned malformed ABI data length: expected 128 hex characters (64 bytes), got {len(raw)}"
+        )
+
+    if any(c not in HEX_CHARACTERS for c in raw):
+        raise RuntimeError("Query status() returned invalid hex encoding")
+
+    word0 = raw[:64]
+    word1 = raw[64:128]
+
+    bool_val = int(word0, 16)
+    if bool_val not in (0, 1):
+        raise RuntimeError(f"Query status() returned invalid ABI bool value (must be 0 or 1, got {bool_val})")
+
+    active = (bool_val == 1)
+    since = int(word1, 16)
+    return (active, since)
+
+
+def verify_stake(rpc_url: str, miner_contract: str, miner_addr: str, cur_epoch: int) -> tuple:
+    """
+    Dynamically queries vault() from miner_contract and verifies stake eligibility for miner_addr.
+    Returns (vault_contract, active, since) on success.
+    Raises RuntimeError on failure.
+    """
+    vault_contract = get_miner_vault(rpc_url, miner_contract)
+    active, since = get_stake_status(rpc_url, vault_contract, miner_addr)
+
+    if not active:
+        raise RuntimeError(
+            f"Stake check failed: miner {miner_addr} does not have active stake in StakeVault {vault_contract}"
+        )
+
+    if cur_epoch < since + 1:
+        raise RuntimeError(
+            f"Stake check failed: miner {miner_addr} deposited in epoch {since}, "
+            f"warmup requires epoch >= {since + 1}, but current epoch is {cur_epoch}"
+        )
+
+    return (vault_contract, active, since)
+
+
 def compute_sub_hash(epoch_seed_bytes, miner_address, k, miner_contract, chain_id):
     """
     Computes inner sub hash matching MinerV1.sol line 270:
@@ -426,16 +518,12 @@ def mine(args):
     print(f"Current Epoch:    {cur_epoch}")
 
     # 2. Check StakeVault status if RPC available
-    if args.rpc and not args.skip_stake_check:
-        vault_res = eth_call(args.rpc, DEFAULT_VAULT_CONTRACT, "645b8b1b" + encode_address(miner_addr))
-        if vault_res and len(vault_res) >= 128:
-            active = int(vault_res[:64], 16) != 0
-            since = int(vault_res[64:128], 16)
-            print(f"StakeVault:       Active={active}, DepositEpoch={since}")
-            if not active:
-                print(f"[WARNING] Address {miner_addr} does NOT have active stake in StakeVault! Contract will reject submission.")
-            elif cur_epoch < since + 1:
-                print(f"[WARNING] Address {miner_addr} deposited in epoch {since}. Warmup rule requires epoch >= {since+1}. Current epoch is {cur_epoch}.")
+    if args.skip_stake_check:
+        print("[WARNING] --skip-stake-check specified: \u672a\u9a8c\u8bc1\u8d28\u62bc\u8d44\u683c (stake eligibility not verified).")
+    elif args.rpc:
+        vault_contract, active, since = verify_stake(args.rpc, miner_contract, miner_addr, cur_epoch)
+        print(f"StakeVault:       {vault_contract}")
+        print(f"Stake Status:     Active={active}, DepositEpoch={since}")
 
     # 3. Resolve epochSeed
     if args.seed:

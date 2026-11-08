@@ -18,6 +18,10 @@ import json
 import time
 import struct
 import pytest
+import io
+from contextlib import redirect_stdout
+import unittest
+from unittest.mock import patch, MagicMock
 
 try:
     import numpy as np
@@ -265,3 +269,432 @@ def test_reduced_difficulty_mining(tmp_path):
     )
     assert valid, "Locally verified share failed!"
     assert "0x" + h_bytes.hex() == data["hash"]
+
+
+class MiningStoppedAtGpuBoundary(Exception):
+    """
+    Test sentinel exception raised at the deterministic boundary
+    immediately after prechecks/hashing and before real OpenCL GPU initialization.
+    """
+    pass
+
+
+class TestDynamicVaultAndStakeEligibility(unittest.TestCase):
+    """
+    Offline regression tests for dynamic StakeVault resolution and eligibility checks.
+    Fully mocked: no real RPC, no real GPU, no transactions.
+    """
+    MINER_PROXY_A = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
+    VAULT_B = "0x40b92431de886Ea46117407c8f7123a31FB3F744"
+    MINER_ADDR = "0x2e9e19f7F1D3a2b01ba5BbA7c37E58398568d82c"
+
+    def _encode_address_ret(self, addr_hex: str) -> str:
+        clean = addr_hex.lower().replace("0x", "")
+        return "0" * 24 + clean
+
+    def _encode_status_ret(self, active: bool, since: int) -> str:
+        w0 = (1 if active else 0).to_bytes(32, "big").hex()
+        w1 = since.to_bytes(32, "big").hex()
+        return w0 + w1
+
+    def test_dynamic_vault_resolution(self):
+        """A. Dynamic Vault Resolution: queries vault() on miner proxy to find Vault B instead of DEFAULT_VAULT_CONTRACT."""
+        calls = []
+
+        def mock_eth_call(rpc_url, to, data):
+            calls.append((to.lower(), data))
+            if to.lower() == self.MINER_PROXY_A.lower() and data == miner_gpu.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_B)
+            if to.lower() == self.VAULT_B.lower() and data.startswith(miner_gpu.SELECTOR_STATUS):
+                return self._encode_status_ret(active=True, since=0)
+            return ""
+
+        with patch("script.miner_gpu.eth_call", side_effect=mock_eth_call):
+            vault_res, active, since = miner_gpu.verify_stake(
+                "http://mock-rpc", self.MINER_PROXY_A, self.MINER_ADDR, cur_epoch=1
+            )
+            self.assertEqual(vault_res.lower(), self.VAULT_B.lower())
+            self.assertTrue(active)
+            self.assertEqual(since, 0)
+
+            # Assert status query went to Vault B, never to DEFAULT_VAULT_CONTRACT
+            queried_addresses = [c[0] for c in calls]
+            self.assertIn(self.MINER_PROXY_A.lower(), queried_addresses)
+            self.assertIn(self.VAULT_B.lower(), queried_addresses)
+            self.assertNotIn(miner_gpu.DEFAULT_VAULT_CONTRACT.lower(), queried_addresses)
+
+    def test_normal_eligibility(self):
+        """B. Normal eligibility: active=true, depositEpoch=0, epoch=1 passes."""
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner_gpu.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_B)
+            if data.startswith(miner_gpu.SELECTOR_STATUS):
+                return self._encode_status_ret(active=True, since=0)
+            return ""
+
+        with patch("script.miner_gpu.eth_call", side_effect=mock_eth_call):
+            vault, active, since = miner_gpu.verify_stake(
+                "http://mock-rpc", self.MINER_PROXY_A, self.MINER_ADDR, cur_epoch=1
+            )
+            self.assertTrue(active)
+            self.assertEqual(since, 0)
+            self.assertEqual(vault.lower(), self.VAULT_B.lower())
+
+    def test_not_staked_fails_before_gpu(self):
+        """C. Not staked: active=false raises error and exits before GPU starts."""
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner_gpu.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_B)
+            if data.startswith(miner_gpu.SELECTOR_STATUS):
+                return self._encode_status_ret(active=False, since=0)
+            return ""
+
+        with patch("script.miner_gpu.eth_call", side_effect=mock_eth_call):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner_gpu.verify_stake(
+                    "http://mock-rpc", self.MINER_PROXY_A, self.MINER_ADDR, cur_epoch=1
+                )
+            self.assertIn("does not have active stake", str(ctx.exception))
+
+        # Test within mine() lifecycle: verify GPU is never reached
+        class DummyArgs:
+            miner = self.MINER_ADDR
+            miner_contract = self.MINER_PROXY_A
+            rpc = "http://mock-rpc"
+            epoch = 1
+            skip_stake_check = False
+            k = 0
+            seed = "0x" + "12" * 32
+            target = hex(1 << 224)
+            difficulty_bits = 32
+            start_nonce = 0
+            out = None
+            batch_size = 1024
+            device_idx = 0
+            threads = 1
+
+        mock_cl = MagicMock()
+        mock_cl.Context.side_effect = MiningStoppedAtGpuBoundary("GPU boundary reached")
+
+        f = io.StringIO()
+        with patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=mock_eth_call), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]) as mock_detect, \
+             patch("script.miner_gpu.cl", mock_cl), \
+             redirect_stdout(f):
+            with self.assertRaises(RuntimeError) as ctx_mine:
+                miner_gpu.mine(DummyArgs())
+            self.assertIn("does not have active stake", str(ctx_mine.exception))
+            mock_detect.assert_called_once()
+            mock_cl.Context.assert_not_called()
+            mock_cl.CommandQueue.assert_not_called()
+            mock_cl.Program.assert_not_called()
+            mock_cl.Kernel.assert_not_called()
+
+    def test_cooldown_warmup_rule(self):
+        """D. Cooldown/warmup: depositEpoch=1, epoch=1 fails before GPU; epoch=2 passes."""
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner_gpu.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_B)
+            if data.startswith(miner_gpu.SELECTOR_STATUS):
+                return self._encode_status_ret(active=True, since=1)
+            return ""
+
+        with patch("script.miner_gpu.eth_call", side_effect=mock_eth_call):
+            # epoch 1: warmup requirement not met -> raises RuntimeError
+            with self.assertRaises(RuntimeError) as ctx:
+                miner_gpu.verify_stake(
+                    "http://mock-rpc", self.MINER_PROXY_A, self.MINER_ADDR, cur_epoch=1
+                )
+            self.assertIn("warmup requires epoch >=", str(ctx.exception))
+
+            # epoch 2: warmup requirement met (2 >= 1 + 1) -> passes
+            vault, active, since = miner_gpu.verify_stake(
+                "http://mock-rpc", self.MINER_PROXY_A, self.MINER_ADDR, cur_epoch=2
+            )
+            self.assertTrue(active)
+            self.assertEqual(since, 1)
+
+        # Test within mine() lifecycle: cooldown insufficient fails before GPU
+        class CooldownArgs:
+            miner = self.MINER_ADDR
+            miner_contract = self.MINER_PROXY_A
+            rpc = "http://mock-rpc"
+            epoch = 1
+            skip_stake_check = False
+            k = 0
+            seed = "0x" + "12" * 32
+            target = hex(1 << 224)
+            difficulty_bits = 32
+            start_nonce = 0
+            out = None
+            batch_size = 1024
+            device_idx = 0
+            threads = 1
+
+        mock_cl = MagicMock()
+        mock_cl.Context.side_effect = MiningStoppedAtGpuBoundary("GPU boundary reached")
+
+        f = io.StringIO()
+        with patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=mock_eth_call), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]) as mock_detect, \
+             patch("script.miner_gpu.cl", mock_cl), \
+             redirect_stdout(f):
+            with self.assertRaises(RuntimeError) as ctx_mine:
+                miner_gpu.mine(CooldownArgs())
+            self.assertIn("warmup requires epoch >=", str(ctx_mine.exception))
+            mock_detect.assert_called_once()
+            mock_cl.Context.assert_not_called()
+            mock_cl.CommandQueue.assert_not_called()
+            mock_cl.Program.assert_not_called()
+            mock_cl.Kernel.assert_not_called()
+
+    def test_vault_abi_errors(self):
+        """E. vault() ABI errors: RPC error, empty, malformed length, non-hex, whitespace, zero address, non-zero high bytes fail without fallback."""
+        # 1. RPC failure
+        with self.subTest("RPC failure"):
+            with patch("script.miner_gpu.eth_call", side_effect=RuntimeError("network error")):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner_gpu.get_miner_vault("http://mock-rpc", self.MINER_PROXY_A)
+                self.assertIn("RPC call failed", str(ctx.exception))
+
+        # 2. Empty return
+        for empty_val in ("", None):
+            with self.subTest(f"Empty return: {empty_val}"):
+                with patch("script.miner_gpu.eth_call", return_value=empty_val):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        miner_gpu.get_miner_vault("http://mock-rpc", self.MINER_PROXY_A)
+                    self.assertIn("empty response", str(ctx.exception))
+
+        # 3. Malformed length
+        for malformed in ("1234", "0" * 63, "0" * 65, "0" * 128):
+            with self.subTest(f"Malformed length: {len(malformed)}"):
+                with patch("script.miner_gpu.eth_call", return_value=malformed):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        miner_gpu.get_miner_vault("http://mock-rpc", self.MINER_PROXY_A)
+                    self.assertIn("malformed ABI data length", str(ctx.exception))
+
+        # 4. Valid address with 0x prefix
+        with self.subTest("Valid address with 0x prefix"):
+            valid_with_0x = "0x" + "0" * 24 + self.VAULT_B[2:].lower()
+            with patch("script.miner_gpu.eth_call", return_value=valid_with_0x):
+                resolved = miner_gpu.get_miner_vault("http://mock-rpc", self.MINER_PROXY_A)
+                self.assertEqual(resolved.lower(), self.VAULT_B.lower())
+
+        # 5. Non-hex characters
+        with self.subTest("Non-hex characters"):
+            with patch("script.miner_gpu.eth_call", return_value="zz" * 32):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner_gpu.get_miner_vault("http://mock-rpc", self.MINER_PROXY_A)
+                self.assertIn("invalid hex encoding", str(ctx.exception))
+
+        # 6. Exact length 64 containing whitespace (space, tab, newline, carriage return)
+        whitespace_cases = {
+            "leading space": " " + "0" * 63,
+            "trailing space": "0" * 63 + " ",
+            "middle space": "0" * 31 + " " + "0" * 32,
+            "tab": "0" * 63 + "\t",
+            "newline": "0" * 63 + "\n",
+            "carriage return": "0" * 63 + "\r",
+        }
+        for desc, bad_val in whitespace_cases.items():
+            with self.subTest(f"Whitespace in vault(): {desc}"):
+                with patch("script.miner_gpu.eth_call", return_value=bad_val):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        miner_gpu.get_miner_vault("http://mock-rpc", self.MINER_PROXY_A)
+                    self.assertIn("invalid hex encoding", str(ctx.exception))
+
+        # 7. Zero address
+        with self.subTest("Zero address"):
+            with patch("script.miner_gpu.eth_call", return_value="0" * 64):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner_gpu.get_miner_vault("http://mock-rpc", self.MINER_PROXY_A)
+                self.assertIn("zero address", str(ctx.exception))
+
+        # 8. Non-zero high bytes
+        with self.subTest("Non-zero high bytes"):
+            bad_high = "0" * 22 + "01" + self.VAULT_B[2:].lower()
+            with patch("script.miner_gpu.eth_call", return_value=bad_high):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner_gpu.get_miner_vault("http://mock-rpc", self.MINER_PROXY_A)
+                self.assertIn("high 12 bytes are non-zero", str(ctx.exception))
+
+    def test_status_abi_errors(self):
+        """F. status() ABI errors: RPC error, empty, malformed length, non-hex, whitespace, invalid bool fail without fallback."""
+        # 1. RPC failure
+        with self.subTest("RPC failure"):
+            with patch("script.miner_gpu.eth_call", side_effect=RuntimeError("network error")):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner_gpu.get_stake_status("http://mock-rpc", self.VAULT_B, self.MINER_ADDR)
+                self.assertIn("RPC call failed", str(ctx.exception))
+
+        # 2. Empty return
+        for empty_val in ("", None):
+            with self.subTest(f"Empty return: {empty_val}"):
+                with patch("script.miner_gpu.eth_call", return_value=empty_val):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        miner_gpu.get_stake_status("http://mock-rpc", self.VAULT_B, self.MINER_ADDR)
+                    self.assertIn("empty response", str(ctx.exception))
+
+        # 3. Malformed length
+        for bad_len in ("0" * 64, "0" * 126, "0" * 130):
+            with self.subTest(f"Malformed length: {len(bad_len)}"):
+                with patch("script.miner_gpu.eth_call", return_value=bad_len):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        miner_gpu.get_stake_status("http://mock-rpc", self.VAULT_B, self.MINER_ADDR)
+                    self.assertIn("malformed ABI data length", str(ctx.exception))
+
+        # 4. Valid status with 0x prefix
+        with self.subTest("Valid status with 0x prefix"):
+            valid_with_0x = "0x" + self._encode_status_ret(active=True, since=0)
+            with patch("script.miner_gpu.eth_call", return_value=valid_with_0x):
+                active, since = miner_gpu.get_stake_status("http://mock-rpc", self.VAULT_B, self.MINER_ADDR)
+                self.assertTrue(active)
+                self.assertEqual(since, 0)
+
+        # 5. Non-hex characters
+        for non_hex in ("zz" * 64, "0" * 116 + "deadbeefbad!"):
+            self.assertEqual(len(non_hex), 128)
+            with self.subTest(f"Non-hex in status()"):
+                with patch("script.miner_gpu.eth_call", return_value=non_hex):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        miner_gpu.get_stake_status("http://mock-rpc", self.VAULT_B, self.MINER_ADDR)
+                    self.assertIn("invalid hex encoding", str(ctx.exception))
+
+        # 6. Exact length 128 containing whitespace (space, tab, newline, carriage return)
+        whitespace_cases = {
+            "leading space": " " + "0" * 127,
+            "trailing space": "0" * 127 + " ",
+            "middle space": "0" * 63 + " " + "0" * 64,
+            "tab": "0" * 127 + "\t",
+            "newline": "0" * 127 + "\n",
+            "carriage return": "0" * 127 + "\r",
+        }
+        for desc, bad_val in whitespace_cases.items():
+            with self.subTest(f"Whitespace in status(): {desc}"):
+                with patch("script.miner_gpu.eth_call", return_value=bad_val):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        miner_gpu.get_stake_status("http://mock-rpc", self.VAULT_B, self.MINER_ADDR)
+                    self.assertIn("invalid hex encoding", str(ctx.exception))
+
+        # 7. Invalid bool: value 2
+        with self.subTest("Invalid bool value 2"):
+            bad_bool_2 = (2).to_bytes(32, "big").hex() + (0).to_bytes(32, "big").hex()
+            with patch("script.miner_gpu.eth_call", return_value=bad_bool_2):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner_gpu.get_stake_status("http://mock-rpc", self.VAULT_B, self.MINER_ADDR)
+                self.assertIn("invalid ABI bool", str(ctx.exception))
+
+        # 8. Invalid bool: high byte non-zero
+        with self.subTest("Invalid bool high byte non-zero"):
+            bad_bool_high = "01" + "00" * 31 + (0).to_bytes(32, "big").hex()
+            with patch("script.miner_gpu.eth_call", return_value=bad_bool_high):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner_gpu.get_stake_status("http://mock-rpc", self.VAULT_B, self.MINER_ADDR)
+                self.assertIn("invalid ABI bool", str(ctx.exception))
+
+    def test_skip_stake_check(self):
+        """G. --skip-stake-check: skips stake queries, prints unverified warning, reaches GPU boundary without calling real OpenCL."""
+        calls = []
+        def mock_eth_call(rpc_url, to, data):
+            calls.append((to, data))
+            return "0x1"
+
+        class DummyArgs:
+            miner = self.MINER_ADDR
+            miner_contract = self.MINER_PROXY_A
+            rpc = "http://mock-rpc"
+            epoch = 1
+            skip_stake_check = True
+            seed = "0x" + "12" * 32
+            target = hex(1 << 224)
+            k = 0
+            difficulty_bits = 32
+            start_nonce = 0
+            out = None
+            batch_size = 1024
+            device_idx = 0
+            threads = 1
+
+        mock_cl = MagicMock()
+        mock_cl.Context.side_effect = MiningStoppedAtGpuBoundary("Stopped at OpenCL Context boundary")
+
+        f = io.StringIO()
+        with patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=mock_eth_call), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.cl", mock_cl), \
+             redirect_stdout(f):
+            with self.assertRaises(MiningStoppedAtGpuBoundary):
+                miner_gpu.mine(DummyArgs())
+
+        # Assert deterministic stopping point reached and real OpenCL never invoked
+        mock_cl.Context.assert_called_once()
+        mock_cl.CommandQueue.assert_not_called()
+        mock_cl.Program.assert_not_called()
+        mock_cl.Kernel.assert_not_called()
+
+        output = f.getvalue()
+        self.assertIn("未验证质押资格", output)
+        self.assertNotIn("Stake Status:     Active=True", output)
+        for to, data in calls:
+            self.assertNotEqual(data, miner_gpu.SELECTOR_VAULT)
+            self.assertFalse(data.startswith(miner_gpu.SELECTOR_STATUS))
+
+    def test_offline_mode_without_rpc(self):
+        """H. Offline mode without RPC: retains existing offline mining capability, reaching GPU boundary with zero network calls."""
+        class OfflineArgs:
+            miner = self.MINER_ADDR
+            miner_contract = self.MINER_PROXY_A
+            rpc = None
+            epoch = 1
+            skip_stake_check = False
+            seed = "0x" + "12" * 32
+            target = hex(1 << 224)
+            k = 0
+            difficulty_bits = 32
+            start_nonce = 0
+            out = None
+            batch_size = 1024
+            device_idx = 0
+            threads = 1
+
+        calls = []
+        def mock_eth_call(rpc_url, to, data):
+            calls.append((to, data))
+            return ""
+
+        mock_cl = MagicMock()
+        mock_cl.Context.side_effect = MiningStoppedAtGpuBoundary("Stopped at OpenCL Context boundary")
+
+        f = io.StringIO()
+        with patch("script.miner_gpu.eth_call", side_effect=mock_eth_call), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.cl", mock_cl), \
+             redirect_stdout(f):
+            with self.assertRaises(MiningStoppedAtGpuBoundary):
+                miner_gpu.mine(OfflineArgs())
+
+        # Assert deterministic stopping point reached and real OpenCL never invoked
+        mock_cl.Context.assert_called_once()
+        mock_cl.CommandQueue.assert_not_called()
+        mock_cl.Program.assert_not_called()
+        mock_cl.Kernel.assert_not_called()
+
+        # Zero network calls
+        self.assertEqual(len(calls), 0)
+
+    def test_error_message_redaction(self):
+        """Error messages redact sensitive RPC URLs and credentials."""
+        sensitive_rpc = "https://user:password_secret@bsc-testnet.rpc:8545"
+        with patch("script.miner_gpu.eth_call", side_effect=Exception(f"failed {sensitive_rpc}")):
+            with self.assertRaises(RuntimeError) as ctx1:
+                miner_gpu.get_miner_vault(sensitive_rpc, self.MINER_PROXY_A)
+            self.assertNotIn("password_secret", str(ctx1.exception))
+            self.assertNotIn(sensitive_rpc, str(ctx1.exception))
+
+            with self.assertRaises(RuntimeError) as ctx2:
+                miner_gpu.get_stake_status(sensitive_rpc, self.VAULT_B, self.MINER_ADDR)
+            self.assertNotIn("password_secret", str(ctx2.exception))
+            self.assertNotIn(sensitive_rpc, str(ctx2.exception))
