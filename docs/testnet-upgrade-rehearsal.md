@@ -28,11 +28,11 @@
 
 - **版本对照标签**：`mainnet-rc1`
 - **MinerV1 部署字节码哈希 (`keccak256(forge inspect MinerV1 bytecode)`)**：
-  `0x6ad3685b67013d79515b6df928cf96cf99d2654e58ab9e23f79991fb28a7f15c`
-  *(旧记录值 `0x984ee72eb6fc6e7d72200ba36fa87fd179314151207c5d574e8305e4a22e1ee0` 已作废，原因是旧构建依赖本机嵌套子模块状态；当前为固定 5 条 remappings 且配置 `auto_detect_remappings = false` 后的确定性记录值)*
+  `0xfb8a0c9c12f909c7050f54d0a62475cb2867765945554f3bf8b24c71d1f9e74f`
+  *(早先记录值 `0x984ee72eb6fc6e7d72200ba36fa87fd179314151207c5d574e8305e4a22e1ee0` 因依赖本机嵌套子模块状态而不可复现、已作废；当前为已验证的实际确定性记录值)*
 - **MinerV1 运行时字节码哈希 (`keccak256(forge inspect MinerV1 deployedBytecode)`)**：
-  `0x7badee20c11424e9bfd9b1b7ef45ddf1642bc3174d782f07df6435becc7c649c`
-  *(旧记录值 `0xc6a177f9165d920b784f0b895ab9b9e8850a874c4ab55fec509376b7c3b9a1c9` 已同步作废，原因同样为旧构建依赖本机嵌套子模块状态)*
+  `0x0011a80092345dcb28c19669aed74cc668f94f19e1ccea8c6c56748a9f65a1bc`
+  *(早先记录值 `0xc6a177f9165d920b784f0b895ab9b9e8850a874c4ab55fec509376b7c3b9a1c9` 因依赖本机嵌套子模块状态而不可复现、已作废；当前为已验证的实际确定性记录值)*
 - **校验依据**：演练部署前应比对本地编译字节码 keccak256（包含部署字节码与运行时字节码）必须与上述固定 5 条 remappings 后的新记录哈希 100% 吻合，确保链上落合约与经过审计测试的代码完全一致。
 
 ```bash
