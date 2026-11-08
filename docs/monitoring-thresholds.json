@@ -1,0 +1,227 @@
+{
+  "version": "2.0.0",
+  "meta": {
+    "project": "PoolCoin Fair Distribution Monitor",
+    "updated_at": "2026-11-08",
+    "description": "链上分级监控阈值配置与应急响应矩阵 (紧急 / 行动 / 观察)，已对齐最小样本保护、出资聚类降级与新增治理规则",
+    "governance": {
+      "timelock_controller": "0x75F344F2c5a79d945D873Edbdccf67e61e56C9de",
+      "guardian_multisig": "0x8E9D51118C70906dE13E2FED7787B056b9268358",
+      "timelock_delay_hours": "待定，按 24 到 48 小时估计",
+      "guardian_response_time": "immediate (seconds to minutes, no delay)"
+    }
+  },
+  "tiers": {
+    "emergency": {
+      "level": "紧急",
+      "severity": "CRITICAL",
+      "description": "威胁代币经济学根本守恒或系统底层卡死故障，需秒级熔断 (Guardian 执行，无需 Timelock)",
+      "rules": [
+        {
+          "id": "EMG-01",
+          "metric": "conservation_break",
+          "name": "代币发行守恒破坏 (Conservation Check Breach)",
+          "condition": "rc2: abs(totalMined + pendingClaimable + remainingEmission - 900_000_000e18) > 1e18 OR rc1: totalMined > 900_000_000e18 OR totalSupply > 1_000_000_000e18",
+          "threshold_delta_tokens": 1.0,
+          "response_action": "Guardian 立即调用 MinerV1.pauseSubmissions() 暂停 PoW 份额提交，并调用 StakeVault.pause() 暂停质押，全面阻断代币非预期铸造与资金流出，组织核心审计团队排查漏洞根因",
+          "executor": "Guardian (应急守护多签 0x8E9D51118C70906dE13E2FED7787B056b9268358)",
+          "requires_timelock": false
+        },
+        {
+          "id": "EMG-02",
+          "metric": "sync_deadlock",
+          "name": "轮次结算严重滞后卡死 (Critical Sync Deadlock)",
+          "condition": "sync_lag >= 24 轮 (超过 24 小时未成功结算)",
+          "threshold_lag_epochs": 24,
+          "response_action": "Guardian 介入核查节点与自动化 Keeper 进程，排查是否存在区块回滚、GasPrice 暴涨或合约死锁；必要时人工手动广播 batch sync 恢复推进，或暂停提交以保护矿工计算收益",
+          "executor": "Guardian / 核心运维应急小组",
+          "requires_timelock": false
+        },
+        {
+          "id": "EMG-03",
+          "metric": "monopoly_top1_weight",
+          "name": "极端单地址垄断算力 (Extreme Single Address Monopoly)",
+          "condition": "active_miners_count >= 20 且 top1_weight_share >= 80% (最小样本保护: 仅在活跃地址 >= 20 时评估)",
+          "threshold_pct": 80.0,
+          "min_active_miners": 20,
+          "response_action": "Guardian 启动紧急研判，确认是否存在 ASIC/特定算力漏洞或私有链离线加速；评估是否紧急暂停挖矿并组织治理委员会通过 Timelock 排期上调难度基准或提高质押门槛",
+          "executor": "Guardian (应急守护多签 0x8E9D51118C70906dE13E2FED7787B056b9268358)",
+          "requires_timelock": false
+        }
+      ]
+    },
+    "action": {
+      "level": "行动",
+      "severity": "WARNING",
+      "description": "网络运行偏离健康基线、出资聚类异常或参数失衡，需在 24~48 小时内处理 (标明执行者与 Timelock 属性)",
+      "rules": [
+        {
+          "id": "ACT-01",
+          "metric": "sync_lag_warning",
+          "name": "轮次同步滞后警示 (Keeper Sync Lag)",
+          "condition": "sync_lag >= 2 轮 (滞后 2 个及以上周期未结算)",
+          "threshold_lag_epochs": 2,
+          "response_action": "触发自动化 Keeper 备用节点广播 sync(48) 进行追赶；若持续 3 轮未恢复，运维人员通过控制台执行补结算",
+          "executor": "Keeper 自动化服务 / 运维运维节点",
+          "requires_timelock": false
+        },
+        {
+          "id": "ACT-02",
+          "metric": "seed_uninitialized_delayed",
+          "name": "当前轮种子超时未就绪 (Seed Initialization Timeout)",
+          "condition": "当前轮次已过去 >= 5 分钟，但 epochSeed == 0 仍未初始化",
+          "threshold_delay_seconds": 300,
+          "response_action": "触发备用 Keeper 立即调用 initEpochSeed(epoch, 24) 进行种子填补，恢复矿工正常计算与提交环境",
+          "executor": "Keeper 自动化服务 / 矿工社区自发初始化",
+          "requires_timelock": false
+        },
+        {
+          "id": "ACT-03",
+          "metric": "top1_weight_cap_overflow",
+          "name": "单地址权重超过硬顶触发截断 (Single Address Weight Exceeds Cap)",
+          "condition": "active_miners_count >= 20 且 top1_weight_share > 20.0% (超过 ADDR_CAP_BPS 2000 阈值；最小样本保护: 仅在活跃地址 >= 20 时评估)",
+          "threshold_pct": 20.0,
+          "min_active_miners": 20,
+          "response_action": "确认合约内 ADDR_CAP_BPS 已对超出部分自动截断；向社区通报算力分布，密切监控是否存在多地址拆分集群",
+          "executor": "治理委员会通报 / 监控自动化记录",
+          "requires_timelock": false
+        },
+        {
+          "id": "ACT-04",
+          "metric": "top10_weight_concentration",
+          "name": "前 10 地址权重高度集中 (Top 10 High Concentration)",
+          "condition": "active_miners_count >= 20 且 top10_weight_share >= 70.0% (最小样本保护: 仅在活跃地址 >= 20 时评估)",
+          "threshold_pct": 70.0,
+          "min_active_miners": 20,
+          "response_action": "进入寡头垄断预警状态；治理委员会向社区通报算力分布，排期 Timelock 提案上调质押额度 setDeposit 增加集群分发成本",
+          "executor": "Timelock 排期执行 (由社区多签发起提案)",
+          "requires_timelock": true
+        },
+        {
+          "id": "ACT-05",
+          "metric": "ema_sstar_severe_imbalance",
+          "name": "EMA 相对 S_STAR 严重失衡 (EMA vs S_STAR Extreme Imbalance)",
+          "condition": "total_shares >= 0.05 * S_STAR 且 (ema_sstar_ratio < 0.2 或 ema_sstar_ratio > 5.0) (最小样本保护: 仅在份额数 >= 5% S_STAR 时评估)",
+          "threshold_low": 0.2,
+          "threshold_high": 5.0,
+          "min_share_ratio_of_sstar": 0.05,
+          "response_action": "若持续 3 轮以上无法通过原生 target 动态平抑恢复，治理委员会通过 Timelock 排期调用 setSStar(newSStar) 校准目标基准值",
+          "executor": "Timelock 排期执行 (由社区多签发起提案)",
+          "requires_timelock": true
+        },
+        {
+          "id": "ACT-06",
+          "metric": "sybil_funding_cluster_alert",
+          "name": "出资聚类与同区块批量质押警示 (Sybil Staking Clustering / Batch Deposits)",
+          "condition": "同一出资来源在 24 小时内资助新质押地址数 >= 10 个，或单区块批量质押数 same_block_batch_stakers >= 10，或每小时新增质押数 hourly_new_stakers >= 20",
+          "threshold_cluster_size": 10,
+          "threshold_same_block_batch": 10,
+          "threshold_hourly_new_stakers": 20,
+          "response_action": "链下风控标记该出资地址与同区块批处理集群，持续跟踪其在后续轮次的提交行为；若该集群集中打满 CAP，排期 Timelock 上调 setDeposit 提升女巫成本",
+          "executor": "风控团队链下标记 / Timelock 排期执行 (若调整质押金)",
+          "requires_timelock": true
+        },
+        {
+          "id": "ACT-07",
+          "metric": "active_miners_daily_surge",
+          "name": "活跃地址日增 3 倍 (Active Miners Daily 3x Surge)",
+          "condition": "24 小时活跃矿工地址数日环比增长 >= 300% (即 active_miners_count 较 24 小时前增长 >= 3.0 倍)",
+          "threshold_surge_ratio": 3.0,
+          "response_action": "风控系统启动矿工来源排查，核实为社区自然裂变还是女巫集群批量涌入；若伴随算力寡头垄断，排期 Timelock 提议阶梯式上调质押金",
+          "executor": "风控团队核查 / 社区通报 / Timelock 排期执行 (若需调参)",
+          "requires_timelock": true
+        },
+        {
+          "id": "ACT-08",
+          "metric": "single_addr_15pct_weight_persistent",
+          "name": "单地址权重占比 15% 连续 6 轮 (Single Address 15% Weight for 6 Consecutive Epochs)",
+          "condition": "active_miners_count >= 20 且任意单地址权重占比 top1_weight_share >= 15.0% 连续持续 6 轮 (最小样本保护: 仅在活跃地址 >= 20 时评估)",
+          "threshold_pct": 15.0,
+          "consecutive_epochs": 6,
+          "min_active_miners": 20,
+          "response_action": "表明存在单一大矿工长期贴近 20% 硬上限垄断；治理委员会发起提案，通过 Timelock 排期调用 setDeposit 或增大 S_STAR 刺激算力充分竞争",
+          "executor": "Timelock 排期执行 (由社区多签发起提案)",
+          "requires_timelock": true
+        },
+        {
+          "id": "ACT-09",
+          "metric": "valuation_break_even_trigger",
+          "name": "估值触发 (Valuation Trigger)",
+          "condition": "代币二级市场全稀释估值 (FDV) 达到或突破女巫保本估值阈值 (FDV >= 35 BNB / $24,300 USD，使女巫攻击在经济学上实现盈利)",
+          "threshold_fdv_bnb": 35.0,
+          "threshold_fdv_usd": 24325.0,
+          "response_action": "触发经济模型防御预案；治理委员会向社区披露女巫保本估值矩阵，排期 Timelock 提案上调质押金 setDeposit (如从 0.01 提高到 0.02 或 0.04 BNB) 以压制女巫收益",
+          "executor": "Timelock 排期执行 (由治理委员会发起提案)",
+          "requires_timelock": true
+        }
+      ]
+    },
+    "observation": {
+      "level": "观察",
+      "severity": "INFO",
+      "description": "常规业务波动、自适应算法边界探测或日常运营状态，记录系统日志与跟踪",
+      "rules": [
+        {
+          "id": "OBS-01",
+          "metric": "shares_reach_30pct_sstar",
+          "name": "份额数达到 0.3 倍 S_STAR (Total Shares Reach 0.3x S_STAR)",
+          "condition": "total_shares >= 0.3 * S_STAR (全网单轮提交份额达到目标值的 30%)",
+          "threshold_ratio": 0.3,
+          "response_action": "记录网络算力健康爬坡里程碑；表明网络正在稳步走出冷启动阶段，自适应调难即将进入活跃区间，无需人工干预",
+          "executor": "监控自动化系统 / 运维团队记录日志",
+          "requires_timelock": false
+        },
+        {
+          "id": "OBS-02",
+          "metric": "full_cap_ratio_high",
+          "name": "满 CAP 地址比例偏高 (High Full CAP Miner Ratio)",
+          "condition": "full_cap_ratio >= 60.0%",
+          "threshold_pct": 60.0,
+          "response_action": "表明当前难度对于主流矿工算力较为宽松，大量矿工轻松达到 6 份额上限；系统自适应调难算法将在下一结算周期自动上调难度，持续观察无需人工介入",
+          "executor": "系统算法自适应调节 / 运维巡检",
+          "requires_timelock": false
+        },
+        {
+          "id": "OBS-03",
+          "metric": "difficulty_boundary_hit",
+          "name": "难度触及 35 位或离开 32 位 (Difficulty Hits 35 Bits or Leaves 32 Bits)",
+          "condition": "difficulty_bits >= 35.0 (到达 35 位硬顶) OR difficulty_bits > 32.01 (离开 32 位基准) (仅在到达 35 位或离开 32 位时触发)",
+          "threshold_min_bits": 32.0,
+          "threshold_max_bits": 35.0,
+          "response_action": "记录难度截断与偏离事件；若长期卡在 35 位最难边界，评估全网总算力是否已超越原有经济学模型预设上限，并在未来升级中扩展 HARDEST 边界；若离开 32 位，记录算力进入爬升周期",
+          "executor": "运维记录日志 / 治理长期规划",
+          "requires_timelock": false
+        },
+        {
+          "id": "OBS-04",
+          "metric": "contract_paused_flag",
+          "name": "合约处于主动暂停状态 (Contract Paused Flag)",
+          "condition": "is_miner_paused == true OR is_vault_paused == true",
+          "response_action": "核实暂停操作是否为预期的维护或事故处置；若维护完毕需由 Timelock 调用 unpause() 进行恢复",
+          "executor": "Timelock 解除暂停 (Guardian 仅可暂停不可解暂停)",
+          "requires_timelock": true
+        },
+        {
+          "id": "OBS-05",
+          "metric": "normal_distribution_healthy",
+          "name": "算力与分配健康常态 (Healthy Decentralized Status)",
+          "condition": "tw_wmin_ratio >= 100.0% 且 top1_weight_share <= 20.0% 且 top10_weight_share <= 50.0%",
+          "response_action": "系统处于理想去中心化高活跃度运行状态，自动归档巡检报告与基尼系数记录",
+          "executor": "监控自动化系统",
+          "requires_timelock": false
+        },
+        {
+          "id": "OBS-06",
+          "metric": "unallocated_ratio_persistent_severe",
+          "name": "tw/wMin 低于 5% 连续 24 轮 (tw/wMin Below 5% for 24 Consecutive Epochs)",
+          "condition": "tw_wmin_ratio < 5.0% 连续持续 24 轮 (连续 24 小时全网总权重不足 wMin 的 5%，未分配配额销毁/滞留比例 > 95%)",
+          "threshold_ratio_pct": 5.0,
+          "consecutive_epochs": 24,
+          "response_action": "判定冷启动矿工参与度极度匮乏或发生休眠；记录系统日志，由社区在公开论坛讨论是否在未来升级中调整 wMin 阶段系数或优化早期激励，无需紧急介入",
+          "executor": "监控自动化系统 / 运维团队记录 / 社区关注",
+          "requires_timelock": false
+        }
+      ]
+    }
+  }
+}
