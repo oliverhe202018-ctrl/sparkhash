@@ -8,7 +8,7 @@ Monitors MinerV1 state:
 Includes gas price floor (>=0.1 gwei), multiplier, and replacement (speed-up) retry with identical nonce.
 """
 
-import os, sys, time, json, argparse, urllib.request, urllib.error, re, random
+import os, sys, time, json, argparse, urllib.request, urllib.error, re, random, subprocess, shutil
 from urllib.parse import urlsplit
 
 # Contract function selectors (verified against MinerV1 compiled ABI)
@@ -27,6 +27,60 @@ DEFAULT_MIN_GAS_PRICE_GWEI = 0.1
 DEFAULT_GAS_MULTIPLIER = 1.5
 DEFAULT_TX_TIMEOUT = 60
 DEFAULT_MAX_RETRIES = 3
+
+# Wallet-related environment variables isolated from cast subprocesses to prevent ambient overrides
+WALLET_ENV_VARS_TO_ISOLATE = (
+    # Raw & Keystore Foundry/Cast variables
+    "ETH_FROM",
+    "ETH_KEYSTORE",
+    "ETH_KEYSTORE_ACCOUNT",
+    "ETH_PASSWORD",
+    "CAST_ASYNC",
+    "CAST_ACCOUNT",
+    "CAST_PASSWORD",
+    "CAST_PASSWORD_FILE",
+    "CAST_PRIVATE_KEY",
+    "CAST_MNEMONIC",
+    "FOUNDRY_KEYSTORE",
+    "FOUNDRY_ACCOUNT",
+    "FOUNDRY_PASSWORD",
+    "FOUNDRY_PASSWORD_FILE",
+    "FOUNDRY_PRIVATE_KEY",
+    "FOUNDRY_MNEMONIC",
+    "FOUNDRY_ETH_FROM",
+    # Private keys & mnemonics
+    "PRIVATE_KEY",
+    "KEEPER_PRIVATE_KEY",
+    "ETH_PRIVATE_KEY",
+    "MNEMONIC",
+    "ETH_MNEMONIC",
+    # Remote signers & hardware wallets
+    "AWS_KMS_KEY_ID",
+    "GCP_PROJECT_ID",
+    "GCP_LOCATION",
+    "GCP_KEY_RING",
+    "GCP_KEY_NAME",
+    "GCP_KEY_VERSION",
+    "TURNKEY_API_PRIVATE_KEY",
+    "TURNKEY_ORGANIZATION_ID",
+    "TURNKEY_ADDRESS",
+    "TEMPO_ACCESS_KEY",
+    "TEMPO_ROOT_ACCOUNT",
+    "TEMPO_SPONSOR_URL",
+    "TREZOR_DERIVATION_PATH",
+    "LEDGER_DERIVATION_PATH",
+)
+
+
+def get_isolated_cast_env(base_env=None):
+    """
+    Builds a clean environment mapping for cast subprocess execution:
+    - Strips all wallet identity, keystore, private key, and signer selection variables.
+    - Preserves system execution paths, proxies, and general runtime configuration.
+    """
+    source = dict(base_env if base_env is not None else os.environ)
+    isolate_set = {v.upper() for v in WALLET_ENV_VARS_TO_ISOLATE}
+    return {k: v for k, v in source.items() if k.upper() not in isolate_set}
 
 # Custom error selectors (from MinerV1 compiled ABI)
 ERROR_SELECTORS = {
@@ -94,7 +148,7 @@ _CONFIGURED_SECRETS = set()
 
 def register_secret(secret: str):
     """
-    Registers a known secret/private key for sanitization in logs and outputs.
+    Registers a known secret/private key/sensitive path for sanitization in logs and outputs.
     """
     if secret and isinstance(secret, str):
         s = secret.strip()
@@ -105,6 +159,9 @@ def register_secret(secret: str):
                     _CONFIGURED_SECRETS.add(s[2:])
             else:
                 _CONFIGURED_SECRETS.add("0x" + s)
+            if "/" in s or "\\" in s:
+                _CONFIGURED_SECRETS.add(s.replace("\\", "/"))
+                _CONFIGURED_SECRETS.add(s.replace("/", "\\"))
 
 def clear_configured_secrets():
     """Clears registered secrets (primarily for test resets)."""
@@ -160,6 +217,34 @@ def sanitize_text(text: str, sensitive_values=None, known_secrets=None) -> str:
 
     sanitized = re.sub(r"""(?:https?|wss?)://[^\s'"<>]+""", _replace_url, text)
 
+    secrets_to_mask = set(_CONFIGURED_SECRETS)
+    if sensitive_values:
+        if isinstance(sensitive_values, (list, tuple, set)):
+            for s in sensitive_values:
+                if isinstance(s, str) and len(s.strip()) >= 4:
+                    clean_s = s.strip()
+                    secrets_to_mask.add(clean_s)
+                    if "/" in clean_s or "\\" in clean_s:
+                        secrets_to_mask.add(clean_s.replace("\\", "/"))
+                        secrets_to_mask.add(clean_s.replace("/", "\\"))
+        elif isinstance(sensitive_values, str) and len(sensitive_values.strip()) >= 4:
+            clean_s = sensitive_values.strip()
+            secrets_to_mask.add(clean_s)
+            if "/" in clean_s or "\\" in clean_s:
+                secrets_to_mask.add(clean_s.replace("\\", "/"))
+                secrets_to_mask.add(clean_s.replace("/", "\\"))
+    if known_secrets:
+        if isinstance(known_secrets, (list, tuple, set)):
+            secrets_to_mask.update(s.strip() for s in known_secrets if isinstance(s, str) and len(s.strip()) >= 4)
+        elif isinstance(known_secrets, str) and len(known_secrets.strip()) >= 4:
+            secrets_to_mask.add(known_secrets.strip())
+
+    for sec in sorted(secrets_to_mask, key=len, reverse=True):
+        if not sec or len(sec) < 4:
+            continue
+        placeholder = "0x[REDACTED_KEY]" if sec.startswith(("0x", "0X")) else "[REDACTED_KEY]"
+        sanitized = re.sub(re.escape(sec), placeholder, sanitized, flags=re.IGNORECASE)
+
     def _replace_kv(m):
         prefix = m.group(1)
         quote = m.group(2) or ""
@@ -172,24 +257,10 @@ def sanitize_text(text: str, sensitive_values=None, known_secrets=None) -> str:
         r"""(?:(["'])((?:\\.|(?!\2).)*)\2|()([^'"\s,;}\]]+))"""
     )
     sanitized = re.sub(kv_pattern, _replace_kv, sanitized)
-
-    secrets_to_mask = set(_CONFIGURED_SECRETS)
-    if sensitive_values:
-        if isinstance(sensitive_values, (list, tuple, set)):
-            secrets_to_mask.update(s.strip() for s in sensitive_values if isinstance(s, str) and len(s.strip()) >= 4)
-        elif isinstance(sensitive_values, str) and len(sensitive_values.strip()) >= 4:
-            secrets_to_mask.add(sensitive_values.strip())
-    if known_secrets:
-        if isinstance(known_secrets, (list, tuple, set)):
-            secrets_to_mask.update(s.strip() for s in known_secrets if isinstance(s, str) and len(s.strip()) >= 4)
-        elif isinstance(known_secrets, str) and len(known_secrets.strip()) >= 4:
-            secrets_to_mask.add(known_secrets.strip())
-
-    for sec in sorted(secrets_to_mask, key=len, reverse=True):
-        if not sec or len(sec) < 4:
-            continue
-        placeholder = "0x[REDACTED_KEY]" if sec.startswith(("0x", "0X")) else "[REDACTED_KEY]"
-        sanitized = re.sub(re.escape(sec), placeholder, sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"""(?i)(--password-file\s+)(?:(["'])((?:\\.|(?!\2).)*)\2|[^\s]+)""", r"\1[REDACTED_PATH]", sanitized)
+    sanitized = re.sub(r"""(?i)(--password\s+)(?:(["'])((?:\\.|(?!\2).)*)\2|[^\s]+)""", r"\1[REDACTED]", sanitized)
+    sanitized = re.sub(r"""(?i)(--private-key\s+)(?:(["'])((?:\\.|(?!\2).)*)\2|[^\s]+)""", r"\1[REDACTED_KEY]", sanitized)
+    sanitized = re.sub(r"""(?i)(?:[a-zA-Z]:)?[\\/][^\s'"]*[\\/]\.foundry[\\/]keystores(?:[\\/][^\s'"]*)?""", "[REDACTED_KEYSTORE_PATH]", sanitized)
 
     return sanitized
 
@@ -204,6 +275,12 @@ def format_exception_safe(e: Exception) -> str:
     if not isinstance(e, Exception):
         return sanitize_text(str(e))
     exc_type = type(e).__name__
+    if isinstance(e, (subprocess.SubprocessError, FileNotFoundError)):
+        cmd_name = "cast"
+        if hasattr(e, "cmd") and e.cmd:
+            cmd_name = e.cmd[0] if isinstance(e.cmd, (list, tuple)) else str(e.cmd).split()[0]
+        ret = getattr(e, "returncode", None)
+        return f"{exc_type}({cmd_name}{', returncode=' + str(ret) if ret is not None else ''})"
     if hasattr(e, "method") and hasattr(e, "error_obj"):
         method = getattr(e, "method", "rpc")
         err_obj = getattr(e, "error_obj", None)
@@ -404,20 +481,66 @@ def get_bumped_gas_price(prev_gas_price, min_bump_ratio=1.15, network_gas_price_
 
 class KeeperBot:
     def __init__(self, rpc_url, miner_address, private_key=None, keeper_address=None,
+                 account=None, password_file=None,
                  dry_run=True, poll_interval=15, min_gas_price_gwei=DEFAULT_MIN_GAS_PRICE_GWEI,
                  gas_multiplier=DEFAULT_GAS_MULTIPLIER, tx_timeout=DEFAULT_TX_TIMEOUT,
                  max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=24):
         self.rpc_url = rpc_url
         self.miner = miner_address.strip().lower() if miner_address and isinstance(miner_address, str) else (miner_address or "")
         self.dry_run = dry_run
-        # In dry-run mode, keeper does not actively retrieve, register, or retain private keys or signing material.
-        # (Keeper does not claim to wipe caller-owned strings in caller memory, but guarantees dry-run will not store or register it).
-        self.private_key = None if self.dry_run else private_key
+
+        self.account = account.strip() if account and isinstance(account, str) else None
+        if password_file is not None:
+            if not isinstance(password_file, str) or not password_file.strip():
+                self.alert("Startup check failed: Password file path cannot be empty.")
+                sys.exit(1)
+            if password_file != password_file.strip():
+                self.alert("Startup check failed: Password file path cannot contain leading or trailing whitespace.")
+                sys.exit(1)
+            self.password_file = password_file
+        else:
+            self.password_file = None
+
+        if self.account:
+            self.validate_account_name(self.account)
+
+        if self.password_file and not self.account:
+            self.alert("Startup check failed: --password-file cannot be used without --account.")
+            sys.exit(1)
+
+        if self.account and private_key and str(private_key).strip():
+            self.alert("Startup check failed: Conflicting signer configurations: both Foundry keystore --account and private key are configured. Specify only one.")
+            sys.exit(1)
+
+        if not self.dry_run and self.account and not self.password_file:
+            self.alert("Startup check failed: In live mode, --account requires --password-file to avoid interactive prompt delays.")
+            sys.exit(1)
+
+        # In dry-run mode or keystore mode, keeper does not store or register raw private keys.
+        self.private_key = None if (self.dry_run or self.account) else private_key
         self._known_secrets = set()
-        if not self.dry_run and private_key and isinstance(private_key, str) and len(private_key.strip()) >= 4:
-            clean_k = private_key.strip()
+        if not self.dry_run and self.private_key and isinstance(self.private_key, str) and len(self.private_key.strip()) >= 4:
+            clean_k = self.private_key.strip()
             self._known_secrets.add(clean_k)
             register_secret(clean_k)
+
+        if self.password_file:
+            register_secret(self.password_file)
+            try:
+                abs_pf = os.path.abspath(self.password_file)
+                if len(abs_pf) >= 4:
+                    register_secret(abs_pf)
+            except Exception:
+                pass
+            clean_pf = self.password_file.strip("\'\"")
+            if clean_pf and clean_pf != self.password_file:
+                register_secret(clean_pf)
+                try:
+                    abs_clean = os.path.abspath(clean_pf)
+                    if len(abs_clean) >= 4:
+                        register_secret(abs_clean)
+                except Exception:
+                    pass
 
         # Validate numeric parameters without leaking raw configuration values
         try:
@@ -464,6 +587,7 @@ class KeeperBot:
         self.current_nonce = None
         self._chain_id = None
         self.current_epoch = None
+        self._derived_address = None
 
         # Validate miner contract address immediately at startup
         self.validate_miner()
@@ -471,15 +595,75 @@ class KeeperBot:
         # Derive or assign keeper public address for nonce queries and validate identity
         self.validate_identity(keeper_address)
 
+    def validate_account_name(self, name: str):
+        if not name or not name.strip():
+            self.alert("Startup check failed: Account name cannot be empty.")
+            sys.exit(1)
+        cleaned = name.strip()
+        if (
+            "/" in cleaned
+            or "\\" in cleaned
+            or ".." in cleaned
+            or ":" in cleaned
+            or cleaned in (".", "..")
+            or os.path.basename(cleaned) != cleaned
+            or os.path.splitdrive(cleaned)[0]
+        ):
+            self.alert("Startup check failed: Invalid account name. Directory paths and path traversal are not allowed.")
+            sys.exit(1)
+
+    def derive_keystore_address(self) -> str:
+        """
+        Derives signer address using:
+        cast wallet address --account <name> --password-file <path>
+        Strictly parses stdout into a single legal Ethereum address.
+        Fails and aborts on empty output, multiple lines, format anomalies, or process errors.
+        """
+        cast_bin = shutil.which("cast") or "cast"
+        cmd = [cast_bin, "wallet", "address", "--account", self.account, "--password-file", self.password_file]
+        isolated_env = get_isolated_cast_env()
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                timeout=30,
+                env=isolated_env
+            )
+        except Exception as e:
+            safe_msg = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file])
+            self.alert(f"Startup check failed: Failed to execute cast wallet address: {safe_msg}")
+            sys.exit(1)
+
+        if proc.returncode != 0:
+            err_msg = sanitize_text((proc.stderr or proc.stdout or "unknown error").strip(), sensitive_values=[self.password_file])
+            self.alert(f"Startup check failed: cast wallet address failed (code {proc.returncode}): {err_msg}")
+            sys.exit(1)
+
+        lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        if len(lines) != 1:
+            self.alert("Startup check failed: cast wallet address returned empty or multiple lines.")
+            sys.exit(1)
+
+        candidate = lines[0]
+        if not re.match(r"^0x[0-9a-fA-F]{40}$", candidate):
+            self.alert("Startup check failed: cast wallet address output is not a valid Ethereum address format.")
+            sys.exit(1)
+
+        return to_checksum_address(candidate)
+
     def validate_identity(self, explicit_keeper_address=None):
         """
         Validates signer identity:
         - In dry-run mode: uses explicit keeper_address if provided (for simulated nonce queries),
-          does not derive or require private key.
-        - In live mode: requires a private key, derives signing address from private key.
-          If private key is invalid, fails cleanly without leaking raw secret.
-          If explicit keeper_address was provided and mismatches derived address, rejects cleanly
-          before any nonce query or broadcast.
+          does not derive or require private key or password file.
+        - In live keystore mode: calls `cast wallet address` to derive identity, strictly parsing output.
+        - In live private key mode: requires private key, derives signing address.
+        - In all live modes: if explicit keeper_address was provided and mismatches derived address,
+          rejects cleanly before any nonce query or broadcast.
         """
         if self.dry_run:
             if explicit_keeper_address and str(explicit_keeper_address).strip():
@@ -488,17 +672,22 @@ class KeeperBot:
                 self.keeper_address = None
             return
 
-        if not self.private_key:
-            reason = "Private key is required for live execution mode (or run with --dry-run)."
-            self.alert(f"Startup check failed: {reason}")
-            sys.exit(1)
-
-        try:
-            from eth_account import Account
-            signer_account = Account.from_key(self.private_key)
-            derived_address = signer_account.address
-        except Exception as e:
-            reason = f"Invalid private key provided for live mode: {type(e).__name__}"
+        if self.account:
+            derived_address = getattr(self, "_derived_address", None)
+            if not derived_address:
+                derived_address = self.derive_keystore_address()
+                self._derived_address = derived_address
+        elif self.private_key:
+            try:
+                from eth_account import Account
+                signer_account = Account.from_key(self.private_key)
+                derived_address = signer_account.address
+            except Exception as e:
+                reason = f"Invalid private key provided for live mode: {type(e).__name__}"
+                self.alert(f"Startup check failed: {reason}")
+                sys.exit(1)
+        else:
+            reason = "Private key or keystore account is required for live execution mode (or run with --dry-run)."
             self.alert(f"Startup check failed: {reason}")
             sys.exit(1)
 
@@ -703,12 +892,105 @@ class KeeperBot:
             self.log("DRY-RUN", f"  Function:        {func_name}")
             self.log("DRY-RUN", f"  Gas Price:       {gas_price / 1e9:.4f} gwei ({gas_price} wei) [Multiplier: {self.gas_multiplier}x, Floor: {self.min_gas_price_gwei} gwei]")
             self.log("DRY-RUN", f"  Nonce:           {nonce}{' (simulated)' if not self.keeper_address else ''}")
+            if self.account:
+                if self.keeper_address:
+                    self.log("DRY-RUN", f"  Signer Mode:     Foundry Keystore (account: {self.account}) [simulated address: {self.keeper_address}]")
+                else:
+                    self.log("DRY-RUN", f"  Signer Mode:     Foundry Keystore (account: {self.account}) [unverified in dry-run; no simulated address provided]")
             self.log("DRY-RUN", f"  Calldata:        {calldata}")
             self.current_nonce = nonce + 1
             return {"status": 1, "dry_run": True}
 
         if not self.dry_run:
             self.validate_identity(self.keeper_address)
+
+        gas_limit = self.estimate_gas_limit(calldata, default_gas=300000)
+        target_addr = to_checksum_address(self.miner)
+        current_gas_price = gas_price
+
+        if self.account:
+            cast_bin = shutil.which("cast") or "cast"
+            isolated_env = get_isolated_cast_env()
+
+            for attempt in range(self.max_retries + 1):
+                if attempt > 0:
+                    net_price = self.get_network_gas_price()
+                    current_gas_price = get_bumped_gas_price(
+                        current_gas_price,
+                        min_bump_ratio=1.15,
+                        network_gas_price_wei=net_price,
+                        min_gas_price_gwei=self.min_gas_price_gwei,
+                        multiplier=self.gas_multiplier
+                    )
+                    self.log("RETRY", f"Speed-up replacement attempt #{attempt} for {func_name} with IDENTICAL nonce {nonce}, bumped gasPrice: {current_gas_price / 1e9:.4f} gwei ({current_gas_price} wei)")
+
+                cmd = [
+                    cast_bin, "send", target_addr,
+                    "--data", calldata,
+                    "--account", self.account,
+                    "--password-file", self.password_file,
+                    "--rpc-url", self.rpc_url,
+                    "--gas-price", str(current_gas_price),
+                    "--gas-limit", str(gas_limit),
+                    "--nonce", str(nonce),
+                    "--async"
+                ]
+
+                tx_hash = None
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        shell=False,
+                        timeout=self.tx_timeout,
+                        env=isolated_env
+                    )
+                    out = proc.stdout or ""
+                    err = proc.stderr or ""
+                    if proc.returncode != 0:
+                        err_str = sanitize_text(f"{err}\n{out}".strip(), sensitive_values=[self.password_file])
+                        if "nonce too low" in err_str.lower() or "already known" in err_str.lower():
+                            self.log("WARN", f"RPC response: {err_str}; checking if already mined...")
+                        else:
+                            self.alert(f"cast send failed on attempt {attempt}: {err_str}")
+                    else:
+                        m = re.search(r"0x[0-9a-fA-F]{64}", out)
+                        if m:
+                            tx_hash = m.group(0)
+                            self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
+                        else:
+                            err_str = sanitize_text(out, sensitive_values=[self.password_file])
+                            self.alert(f"cast send succeeded but no txHash found in output: {err_str}")
+                except Exception as e:
+                    err_str = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file])
+                    self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
+
+                if not tx_hash:
+                    self.current_nonce = None
+                    return None
+
+                if tx_hash:
+                    receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
+                    if receipt:
+                        status = receipt.get("status")
+                        blk = int(receipt.get("blockNumber", "0x0"), 16)
+                        used = int(receipt.get("gasUsed", "0x0"), 16)
+                        if status == "0x1" or status == 1:
+                            self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
+                            self.current_nonce = nonce + 1
+                            return receipt
+                        else:
+                            self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
+                            self.current_nonce = nonce + 1
+                            return receipt
+
+                    self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s. Retrying with identical nonce {nonce}...")
+
+            self.alert(f"All {self.max_retries} speed-up attempts exhausted for {func_name} with nonce {nonce}!")
+            self.current_nonce = None
+            return None
 
         if not self.private_key:
             self.alert("Cannot broadcast " + desc + ": No private key provided in environment!")
@@ -727,10 +1009,7 @@ class KeeperBot:
         except Exception:
             chain_id = 97
 
-        gas_limit = self.estimate_gas_limit(calldata, default_gas=300000)
-        target_addr = to_checksum_address(self.miner)
 
-        current_gas_price = gas_price
         for attempt in range(self.max_retries + 1):
             if attempt > 0:
                 net_price = self.get_network_gas_price()
@@ -879,6 +1158,8 @@ def main():
     parser.add_argument("--env-file", default=".env", help="Path to .env configuration file")
     parser.add_argument("--miner-address", default=None, help="Miner proxy contract address (overrides .env)")
     parser.add_argument("--keeper-address", default=None, help="Keeper public address for nonce queries (dry-run)")
+    parser.add_argument("--account", default=None, help="Foundry keystore account name in ~/.foundry/keystores")
+    parser.add_argument("--password-file", default=None, help="Path to password file for keystore decryption")
     parser.add_argument("--min-gas-price-gwei", type=float, default=None, help="Gas price floor in gwei (default: 0.1)")
     parser.add_argument("--gas-multiplier", type=float, default=None, help="Gas price multiplier (default: 1.5)")
     parser.add_argument("--tx-timeout", type=int, default=None, help="Tx confirmation timeout in seconds before speedup (default: 60)")
@@ -912,15 +1193,69 @@ def main():
         or get_cfg("MINER_ADDRESS")
         or get_cfg("MINER_PROXY_ADDRESS")
     )
-    priv_key = None
-    if not args.dry_run:
-        priv_key = get_cfg("KEEPER_PRIVATE_KEY") or get_cfg("PRIVATE_KEY")
-        if priv_key:
-            register_secret(priv_key)
 
-    is_dry_run = args.dry_run or not priv_key
-    if not priv_key and not args.dry_run:
-        print("[WARN] No private key detected in environment; defaulting to --dry-run for safety.")
+    account_arg = args.account.strip() if args.account and isinstance(args.account, str) else None
+    if args.account is not None:
+        if not account_arg:
+            sys.stderr.write("[ERROR] Startup check failed: Account name cannot be empty.\n")
+            sys.exit(1)
+        if (
+            "/" in account_arg
+            or "\\" in account_arg
+            or ".." in account_arg
+            or ":" in account_arg
+            or account_arg in (".", "..")
+            or os.path.basename(account_arg) != account_arg
+            or os.path.splitdrive(account_arg)[0]
+        ):
+            sys.stderr.write("[ERROR] Startup check failed: Invalid account name. Directory paths and path traversal are not allowed.\n")
+            sys.exit(1)
+
+    if args.password_file is not None:
+        if not isinstance(args.password_file, str) or not args.password_file.strip():
+            sys.stderr.write("[ERROR] Startup check failed: Password file path cannot be empty.\n")
+            sys.exit(1)
+        if args.password_file != args.password_file.strip():
+            sys.stderr.write("[ERROR] Startup check failed: Password file path cannot contain leading or trailing whitespace.\n")
+            sys.exit(1)
+        password_file_arg = args.password_file
+        register_secret(password_file_arg)
+        try:
+            abs_arg = os.path.abspath(password_file_arg)
+            if len(abs_arg) >= 4:
+                register_secret(abs_arg)
+        except Exception:
+            pass
+    else:
+        password_file_arg = None
+
+    if password_file_arg and not account_arg:
+        sys.stderr.write("[ERROR] Startup check failed: --password-file cannot be used without --account.\n")
+        sys.exit(1)
+
+    if account_arg:
+        configured_priv_key = get_cfg("KEEPER_PRIVATE_KEY") or get_cfg("PRIVATE_KEY")
+        if configured_priv_key and str(configured_priv_key).strip():
+            sys.stderr.write(
+                "[ERROR] Conflicting signer configurations: both Foundry keystore --account and "
+                "private key (KEEPER_PRIVATE_KEY / PRIVATE_KEY) are configured. Specify only one.\n"
+            )
+            sys.exit(1)
+
+        if not args.dry_run and not password_file_arg:
+            sys.stderr.write("[ERROR] Startup check failed: In live mode, --account requires --password-file to avoid interactive prompt delays.\n")
+            sys.exit(1)
+        priv_key = None
+        is_dry_run = args.dry_run
+    else:
+        priv_key = None
+        if not args.dry_run:
+            priv_key = get_cfg("KEEPER_PRIVATE_KEY") or get_cfg("PRIVATE_KEY")
+            if priv_key:
+                register_secret(priv_key)
+        if not priv_key and not args.dry_run:
+            print("[WARN] No private key detected in environment; defaulting to --dry-run for safety.")
+        is_dry_run = args.dry_run or not priv_key
 
     keeper_addr = args.keeper_address or get_cfg("KEEPER_ADDRESS")
 
@@ -954,6 +1289,8 @@ def main():
         miner_address=miner_addr,
         private_key=priv_key,
         keeper_address=keeper_addr,
+        account=account_arg,
+        password_file=password_file_arg,
         dry_run=is_dry_run,
         poll_interval=interval,
         min_gas_price_gwei=min_floor,

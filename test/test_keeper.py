@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 import os
 import sys
+import io
 import rlp
 
 # Ensure repo root is on sys.path
@@ -28,6 +29,9 @@ from script.keeper import (
     parse_numeric,
     format_exception_safe,
     KeeperBot,
+    WALLET_ENV_VARS_TO_ISOLATE,
+    get_isolated_cast_env,
+    main,
     SELECTOR_EPOCH,
     SELECTOR_LAST_SYNCED,
     SELECTOR_EPOCH_SEED,
@@ -1171,6 +1175,675 @@ class TestKeeperBoundaryCorrections(unittest.TestCase):
         self.assertNotIn("sk-live secret key with spaces 12345", s5)
         self.assertIn('api_key="[REDACTED_KEY]"', s5)
 
+
+
+class TestFoundryKeystoreIntegration(unittest.TestCase):
+    def setUp(self):
+        clear_configured_secrets()
+
+    def tearDown(self):
+        clear_configured_secrets()
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_keystore_correct_arg_construction(self, mock_subproc, mock_rpc):
+        """Keystore mode constructs correct args for cast wallet address and cast send with --async."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else {"status": "0x1", "blockNumber": "0x100", "gasUsed": "0x5208"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        fake_tx_hash = "0x" + "a" * 64
+
+        # wallet address returns fake_addr, send returns fake_tx_hash
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"txHash: {fake_tx_hash}\n", stderr="")
+        ]
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False
+        )
+
+        receipt = bot.send_transaction("0x12345678", "test_call", preflight=False)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt.get("status"), "0x1")
+
+        self.assertEqual(mock_subproc.call_count, 2)
+
+        # Call 1: cast wallet address
+        call1_args, call1_kwargs = mock_subproc.call_args_list[0]
+        cmd1 = call1_args[0]
+        self.assertIn("wallet", cmd1)
+        self.assertIn("address", cmd1)
+        self.assertIn("--account", cmd1)
+        self.assertEqual(cmd1[cmd1.index("--account") + 1], "test-keystore-account")
+        self.assertIn("--password-file", cmd1)
+        self.assertEqual(cmd1[cmd1.index("--password-file") + 1], "fake-passwords/dev.pwd")
+        self.assertFalse(call1_kwargs.get("shell", True))
+
+        # Call 2: cast send
+        call2_args, call2_kwargs = mock_subproc.call_args_list[1]
+        cmd2 = call2_args[0]
+        self.assertIn("send", cmd2)
+        self.assertIn(to_checksum_address("0x420382a0f874c1F120621f847d81581e8737504e"), cmd2)
+        self.assertIn("--data", cmd2)
+        self.assertEqual(cmd2[cmd2.index("--data") + 1], "0x12345678")
+        self.assertIn("--account", cmd2)
+        self.assertEqual(cmd2[cmd2.index("--account") + 1], "test-keystore-account")
+        self.assertIn("--password-file", cmd2)
+        self.assertEqual(cmd2[cmd2.index("--password-file") + 1], "fake-passwords/dev.pwd")
+        self.assertIn("--rpc-url", cmd2)
+        self.assertEqual(cmd2[cmd2.index("--rpc-url") + 1], "http://mock-rpc")
+        self.assertIn("--async", cmd2)
+        self.assertFalse(call2_kwargs.get("shell", True))
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_wallet_address_and_send_use_same_account_and_password_file(self, mock_subproc, mock_rpc):
+        """cast wallet address and cast send strictly use the identical account and password-file."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else {"status": "0x1", "blockNumber": "0x100"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout="0x" + "b" * 64 + "\n", stderr="")
+        ]
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="keeper-prod-key",
+            password_file="safe-secrets/keeper.pass",
+            dry_run=False
+        )
+        bot.send_transaction("0xabcdef", "test_sync", preflight=False)
+
+        cmd_addr = mock_subproc.call_args_list[0][0][0]
+        cmd_send = mock_subproc.call_args_list[1][0][0]
+
+        acct_addr = cmd_addr[cmd_addr.index("--account") + 1]
+        pw_addr = cmd_addr[cmd_addr.index("--password-file") + 1]
+
+        acct_send = cmd_send[cmd_send.index("--account") + 1]
+        pw_send = cmd_send[cmd_send.index("--password-file") + 1]
+
+        self.assertEqual(acct_addr, acct_send)
+        self.assertEqual(pw_addr, pw_send)
+        self.assertEqual(acct_addr, "keeper-prod-key")
+        self.assertEqual(pw_addr, "safe-secrets/keeper.pass")
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_no_private_key_passed_to_send(self, mock_subproc, mock_rpc):
+        """--private-key must NEVER be passed to cast in keystore mode."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else {"status": "0x1", "blockNumber": "0x100"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout="0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A\n", stderr=""),
+            MagicMock(returncode=0, stdout="0x" + "c" * 64 + "\n", stderr="")
+        ]
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="my-account",
+            password_file="pw.txt",
+            dry_run=False
+        )
+        bot.send_transaction("0x9999", "test", preflight=False)
+
+        for call_item in mock_subproc.call_args_list:
+            cmd = call_item[0][0]
+            self.assertNotIn("--private-key", cmd)
+
+    def test_conflict_active_private_key_and_account(self):
+        """Active private key in env/config and --account are strictly mutually exclusive."""
+        # 1. In KeeperBot direct instantiation
+        with self.assertRaises(SystemExit) as ctx:
+            KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                private_key="0x" + "1" * 64,
+                account="my-account",
+                password_file="pw.txt",
+                dry_run=False
+            )
+        self.assertEqual(ctx.exception.code, 1)
+
+        # 2. In CLI main with KEEPER_PRIVATE_KEY
+        err_captured = io.StringIO()
+        test_args = ["keeper.py", "--rpc-url", "http://mock-rpc", "--account", "my-account", "--password-file", "pw.txt"]
+        with patch.object(sys, "argv", test_args):
+            with patch.dict(os.environ, {"KEEPER_PRIVATE_KEY": "0x" + "2" * 64, "MINER_ADDRESS": "0x420382a0f874c1F120621f847d81581e8737504e"}):
+                with patch("sys.stderr", err_captured):
+                    with self.assertRaises(SystemExit) as ctx:
+                        main()
+                    self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("Conflicting signer configurations", err_captured.getvalue())
+
+        # 3. Conflict also checked in --dry-run
+        err_captured = io.StringIO()
+        test_args_dry = ["keeper.py", "--rpc-url", "http://mock-rpc", "--dry-run", "--account", "my-account"]
+        with patch.object(sys, "argv", test_args_dry):
+            with patch.dict(os.environ, {"PRIVATE_KEY": "0x" + "3" * 64, "MINER_ADDRESS": "0x420382a0f874c1F120621f847d81581e8737504e"}):
+                with patch("sys.stderr", err_captured):
+                    with self.assertRaises(SystemExit) as ctx:
+                        main()
+                    self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("Conflicting signer configurations", err_captured.getvalue())
+
+    def test_password_file_without_account_rejected(self):
+        """--password-file cannot be used without --account."""
+        # Direct class instantiation
+        with self.assertRaises(SystemExit) as ctx:
+            KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account=None,
+                password_file="pw.txt",
+                dry_run=True
+            )
+        self.assertEqual(ctx.exception.code, 1)
+
+        # CLI main
+        err_captured = io.StringIO()
+        test_args = ["keeper.py", "--rpc-url", "http://mock-rpc", "--password-file", "pw.txt", "--dry-run"]
+        with patch.object(sys, "argv", test_args):
+            with patch("sys.stderr", err_captured):
+                with self.assertRaises(SystemExit) as ctx:
+                    main()
+                self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("--password-file cannot be used without --account", err_captured.getvalue())
+
+    def test_live_account_without_password_file_rejected(self):
+        """Live keystore execution without --password-file is rejected to prevent interactive prompt hangs."""
+        # Direct class instantiation
+        with self.assertRaises(SystemExit) as ctx:
+            KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="my-account",
+                password_file=None,
+                dry_run=False
+            )
+        self.assertEqual(ctx.exception.code, 1)
+
+        # CLI main
+        err_captured = io.StringIO()
+        test_args = ["keeper.py", "--rpc-url", "http://mock-rpc", "--account", "my-account"]
+        with patch.object(sys, "argv", test_args):
+            with patch.dict(os.environ, {"MINER_ADDRESS": "0x420382a0f874c1F120621f847d81581e8737504e"}):
+                with patch("sys.stderr", err_captured):
+                    with self.assertRaises(SystemExit) as ctx:
+                        main()
+                    self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("--account requires --password-file", err_captured.getvalue())
+
+    def test_invalid_account_names(self):
+        """Account names cannot be empty or contain directory paths, separators, or traversal."""
+        invalid_names = ["", "   ", "../escape", "dir/acct", "dir\\acct", "/absolute", "C:\\acct", ":colon", "."]
+        for name in invalid_names:
+            with self.subTest(name=name):
+                with self.assertRaises(SystemExit) as ctx:
+                    KeeperBot(
+                        rpc_url="http://mock-rpc",
+                        miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                        account=name,
+                        password_file="pw.txt",
+                        dry_run=True
+                    )
+                self.assertEqual(ctx.exception.code, 1)
+
+                err_captured = io.StringIO()
+                test_args = ["keeper.py", "--rpc-url", "http://mock-rpc", "--account", name, "--dry-run"]
+                with patch.object(sys, "argv", test_args):
+                    with patch("sys.stderr", err_captured):
+                        with self.assertRaises(SystemExit) as ctx2:
+                            main()
+                        self.assertEqual(ctx2.exception.code, 1)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_address_derivation_failure_format_anomaly_mismatch_zero_send(self, mock_subproc, mock_rpc):
+        """Subprocess failure, empty output, multiple lines, format anomaly, or address mismatch yield zero sends."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0"
+        )
+
+        cases = [
+            ("failure", MagicMock(returncode=1, stdout="", stderr="password incorrect")),
+            ("empty", MagicMock(returncode=0, stdout="", stderr="")),
+            ("multiple_lines", MagicMock(returncode=0, stdout="0x1111111111111111111111111111111111111111\n0x2222222222222222222222222222222222222222\n", stderr="")),
+            ("format_anomaly", MagicMock(returncode=0, stdout="not_an_address\n", stderr="")),
+            ("format_bad_hex", MagicMock(returncode=0, stdout="0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n", stderr="")),
+        ]
+
+        for desc, mock_ret in cases:
+            with self.subTest(case=desc):
+                mock_subproc.reset_mock()
+                mock_subproc.return_value = mock_ret
+
+                with self.assertRaises(SystemExit) as ctx:
+                    KeeperBot(
+                        rpc_url="http://mock-rpc",
+                        miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                        account="dev-account",
+                        password_file="pw.txt",
+                        dry_run=False
+                    )
+                self.assertEqual(ctx.exception.code, 1)
+                # Ensure cast send was NEVER called (at most 1 call to wallet address, 0 calls to send)
+                for call_item in mock_subproc.call_args_list:
+                    self.assertNotIn("send", call_item[0][0])
+
+        # Address mismatch against explicit --keeper-address
+        mock_subproc.reset_mock()
+        mock_subproc.return_value = MagicMock(returncode=0, stdout="0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A\n", stderr="")
+        with self.assertRaises(SystemExit) as ctx:
+            KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                keeper_address="0x0000000000000000000000000000000000000001",
+                account="dev-account",
+                password_file="pw.txt",
+                dry_run=False
+            )
+        self.assertEqual(ctx.exception.code, 1)
+        for call_item in mock_subproc.call_args_list:
+            self.assertNotIn("send", call_item[0][0])
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_dry_run_zero_wallet_or_signing_calls_no_password_file_access(self, mock_subproc, mock_rpc):
+        """dry-run mode makes zero subprocess calls to cast, does not open or check password file, accepts missing password file."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x0"
+        )
+
+        nonexistent_pw_file = "nonexistent_secret_pw_file_987654321.txt"
+        self.assertFalse(os.path.exists(nonexistent_pw_file))
+
+        # Dry run with account and no password file
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="dev-account",
+            password_file=None,
+            dry_run=True
+        )
+
+        res = bot.send_transaction("0x1234", "dry_test")
+        self.assertTrue(res.get("dry_run"))
+        mock_subproc.assert_not_called()
+
+        # Dry run with nonexistent password file: must NOT check os.path.exists or open it
+        bot2 = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="dev-account",
+            password_file=nonexistent_pw_file,
+            dry_run=True
+        )
+        res2 = bot2.send_transaction("0x1234", "dry_test_2")
+        self.assertTrue(res2.get("dry_run"))
+        mock_subproc.assert_not_called()
+
+    @patch("script.keeper.load_env")
+    @patch("script.keeper.KeeperBot")
+    def test_no_env_does_not_load_env_file(self, mock_bot_cls, mock_load_env):
+        """--no-env strictly prevents calling load_env and reading .env."""
+        mock_load_env.side_effect = AssertionError("load_env must NEVER be called when --no-env is specified!")
+
+        test_args = [
+            "keeper.py",
+            "--no-env",
+            "--rpc-url", "http://explicit-rpc:8545",
+            "--miner-address", "0x420382a0f874c1F120621f847d81581e8737504e",
+            "--account", "offline-account",
+            "--dry-run",
+            "--once"
+        ]
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        mock_load_env.assert_not_called()
+        mock_bot_cls.assert_called_once()
+        self.assertEqual(mock_bot_cls.call_args[1]["account"], "offline-account")
+
+    def test_subprocess_env_isolates_conflicting_signer_vars(self):
+        """get_isolated_cast_env scrubs all conflicting wallet/signer environment variables."""
+        tainted_env = {
+            "PATH": "/usr/bin:/bin",
+            "SYSTEMROOT": "C:\\Windows",
+            "HTTP_PROXY": "http://127.0.0.1:8080",
+            # Ambient conflicting vars that must be isolated
+            "ETH_FROM": "0xattacker",
+            "ETH_KEYSTORE": "/path/to/other/keystore",
+            "ETH_KEYSTORE_ACCOUNT": "other-acct",
+            "ETH_PASSWORD": "secret_password",
+            "PRIVATE_KEY": "0x" + "9" * 64,
+            "KEEPER_PRIVATE_KEY": "0x" + "8" * 64,
+            "ETH_PRIVATE_KEY": "0x" + "7" * 64,
+            "MNEMONIC": "twelve secret words not to be used here",
+            "AWS_KMS_KEY_ID": "arn:aws:kms:123",
+            "TEMPO_ACCESS_KEY": "0x" + "6" * 64,
+            "TEMPO_ROOT_ACCOUNT": "0xroot",
+            # Case variations
+            "eth_from": "0xattacker_lower",
+            "private_key": "0xlower"
+        }
+
+        clean = get_isolated_cast_env(tainted_env)
+
+        # Critical non-signing vars preserved
+        self.assertIn("PATH", clean)
+        self.assertIn("SYSTEMROOT", clean)
+        self.assertIn("HTTP_PROXY", clean)
+
+        # All conflicting signer vars stripped
+        for var in WALLET_ENV_VARS_TO_ISOLATE:
+            self.assertNotIn(var, clean)
+            self.assertNotIn(var.lower(), clean)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_subprocess_error_sensitive_sentinels_not_leaked(self, mock_subproc, mock_rpc):
+        """Subprocess errors and exceptions do not leak password file paths, keystore paths, or sensitive sentinels."""
+        mock_rpc.side_effect = lambda url, method, params: "0x6080604052" if method == "eth_getCode" else "0x0"
+
+        sentinel_pw_path = "C:/secret/credentials/super_secret_keeper_pw_file.txt"
+        sentinel_secret = "SUPER_SECRET_PLAINTEXT_PASSWORD_987654321"
+        sentinel_keystore = "C:/Users/alice/.foundry/keystores/my_vault_account"
+
+        # Register sentinel to simulate registered confidential trading materials
+        register_secret(sentinel_secret)
+
+        mock_subproc.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr=f"Error decrypting {sentinel_keystore} with --password-file {sentinel_pw_path}: password='{sentinel_secret}'"
+        )
+
+        out_captured = io.StringIO()
+        with patch("sys.stdout", out_captured):
+            with self.assertRaises(SystemExit) as ctx:
+                KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                    account="my_vault_account",
+                    password_file=sentinel_pw_path,
+                    dry_run=False
+                )
+            self.assertEqual(ctx.exception.code, 1)
+
+        logged = out_captured.getvalue()
+        self.assertNotIn(sentinel_pw_path, logged)
+        self.assertNotIn(sentinel_secret, logged)
+        self.assertNotIn(sentinel_keystore, logged)
+        self.assertIn("[REDACTED", logged)
+
+    @patch("script.keeper.rpc_call")
+    def test_existing_private_key_mode_regression(self, mock_rpc):
+        """Existing private key mode continues to function normally with Account.sign_transaction without invoking cast."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0xtxhash_pk_123" if method == "eth_sendRawTransaction"
+            else {"status": "0x1", "blockNumber": "0x100", "gasUsed": "0x5208"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+
+        test_pk = "0x" + "4" * 64
+        with patch("subprocess.run") as mock_subproc:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                private_key=test_pk,
+                dry_run=False
+            )
+            receipt = bot.send_transaction("0x5555", "pk_mode_test", preflight=False)
+            self.assertIsNotNone(receipt)
+            mock_subproc.assert_not_called()
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_cast_send_failure_stops_immediately_no_retry(self, mock_subproc, mock_rpc):
+        """When cast send fails (non-zero exit code or execution error), keeper halts immediately without retrying."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+
+        # 1. Non-zero exit code on cast send
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error: execution reverted: out of gas")
+        ]
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=3
+        )
+
+        receipt = bot.send_transaction("0x12345678", "test_call", preflight=False)
+        self.assertIsNone(receipt)
+        self.assertIsNone(bot.current_nonce)
+        self.assertEqual(mock_subproc.call_count, 2)
+
+        # 2. Exception on cast send (e.g. TimeoutExpired)
+        import subprocess
+        mock_subproc.reset_mock()
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            subprocess.TimeoutExpired(cmd=["cast", "send"], timeout=60)
+        ]
+        bot2 = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=3
+        )
+        receipt2 = bot2.send_transaction("0x12345678", "test_call", preflight=False)
+        self.assertIsNone(receipt2)
+        self.assertIsNone(bot2.current_nonce)
+        self.assertEqual(mock_subproc.call_count, 2)
+
+        # 3. Success code but no txHash in stdout
+        mock_subproc.reset_mock()
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout="No hash returned here", stderr="")
+        ]
+        bot3 = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=3
+        )
+        receipt3 = bot3.send_transaction("0x12345678", "test_call", preflight=False)
+        self.assertIsNone(receipt3)
+        self.assertIsNone(bot3.current_nonce)
+        self.assertEqual(mock_subproc.call_count, 2)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_address_case_insensitive_matching_and_rejection(self, mock_subproc, mock_rpc):
+        """Address comparison is case-insensitive on address values; matching casing passes, different address rejects."""
+        mock_rpc.side_effect = lambda url, method, params: "0x6080604052" if method == "eth_getCode" else "0x0"
+        derived_checksum = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_subproc.return_value = MagicMock(returncode=0, stdout=derived_checksum + "\n", stderr="")
+
+        # 1. All lowercase version of the same address -> PASSES
+        lower_addr = derived_checksum.lower()
+        bot_lower = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="dev-account",
+            password_file="fake-passwords/dev.pwd",
+            keeper_address=lower_addr,
+            dry_run=False
+        )
+        self.assertEqual(bot_lower.keeper_address, derived_checksum)
+
+        # 2. All uppercase hex version of the same address -> PASSES
+        upper_addr = "0x" + derived_checksum[2:].upper()
+        bot_upper = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="dev-account",
+            password_file="fake-passwords/dev.pwd",
+            keeper_address=upper_addr,
+            dry_run=False
+        )
+        self.assertEqual(bot_upper.keeper_address, derived_checksum)
+
+        # 3. Different address -> REJECTED with SystemExit(1)
+        different_addr = "0x0000000000000000000000000000000000000001"
+        with self.assertRaises(SystemExit) as ctx:
+            KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="dev-account",
+                password_file="fake-passwords/dev.pwd",
+                keeper_address=different_addr,
+                dry_run=False
+            )
+        self.assertEqual(ctx.exception.code, 1)
+
+    @patch("script.keeper.rpc_call")
+    def test_password_file_whitespace_handling_cli_and_direct(self, mock_rpc):
+        mock_rpc.side_effect = lambda url, method, params: "0x6080604052" if method == "eth_getCode" else "0x0"
+
+        """Leading/trailing whitespace in password file path is strictly rejected in both CLI and KeeperBot."""
+        # 1. KeeperBot direct instantiation
+        whitespace_cases = ["  dev.pwd", "dev.pwd  ", "  dev.pwd  "]
+        for p in whitespace_cases:
+            with self.subTest(direct_path=p):
+                with self.assertRaises(SystemExit) as ctx:
+                    KeeperBot(
+                        rpc_url="http://mock-rpc",
+                        miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                        account="dev-account",
+                        password_file=p,
+                        dry_run=True
+                    )
+                self.assertEqual(ctx.exception.code, 1)
+
+        # Empty password_file
+        with self.assertRaises(SystemExit) as ctx:
+            KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="dev-account",
+                password_file="   ",
+                dry_run=True
+            )
+        self.assertEqual(ctx.exception.code, 1)
+
+        # 2. CLI main execution
+        for p in ["  dev.pwd", "dev.pwd  "]:
+            with self.subTest(cli_path=p):
+                err_captured = io.StringIO()
+                test_args = ["keeper.py", "--rpc-url", "http://mock-rpc", "--account", "dev-account", "--password-file", p, "--dry-run"]
+                with patch.object(sys, "argv", test_args):
+                    with patch("sys.stderr", err_captured):
+                        with self.assertRaises(SystemExit) as ctx:
+                            main()
+                        self.assertEqual(ctx.exception.code, 1)
+                self.assertIn("Password file path cannot contain leading or trailing whitespace", err_captured.getvalue())
+
+        # 3. Path with spaces inside must NOT be stripped or altered
+        raw_path_with_spaces = "path with spaces/dev key.pwd"
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="dev-account",
+            password_file=raw_path_with_spaces,
+            dry_run=True
+        )
+        self.assertEqual(bot.password_file, raw_path_with_spaces)
+
+    def test_redaction_complex_paths_rpc_creds_and_exceptions(self):
+        """Redaction correctly masks paths with spaces, quotes, backslashes, RPC creds, and exception types."""
+        # 1. Paths with spaces, quotes, backslashes
+        fake_path = r'C:\secret dir\my "vault" pass.txt'
+        register_secret(fake_path)
+
+        text1 = f'--password-file "{fake_path}"'
+        clean1 = sanitize_text(text1)
+        self.assertNotIn("secret dir", clean1)
+        self.assertNotIn("pass.txt", clean1)
+        self.assertIn("[REDACTED_PATH]", clean1)
+
+        text2 = f"--password-file '{fake_path}'"
+        clean2 = sanitize_text(text2)
+        self.assertNotIn("secret dir", clean2)
+        self.assertIn("[REDACTED_PATH]", clean2)
+
+        # 2. Subprocess error with embedded RPC credentials
+        rpc_error = "Failed to connect to https://user_sentinel:super_secret_rpc_password_999@bsc-testnet.rpc.poolcoin.org:8545/v1: refused"
+        clean_rpc = sanitize_text(rpc_error)
+        self.assertNotIn("user_sentinel", clean_rpc)
+        self.assertNotIn("super_secret_rpc_password_999", clean_rpc)
+        self.assertIn("https://bsc-testnet.rpc.poolcoin.org:8545/***", clean_rpc)
+
+        # 3. format_exception_safe with TimeoutExpired, FileNotFoundError, CalledProcessError
+        import subprocess
+        exc_timeout = subprocess.TimeoutExpired(cmd=["cast", "send", "--password-file", "C:/secret/pass.txt"], timeout=60)
+        formatted_timeout = format_exception_safe(exc_timeout)
+        self.assertEqual(formatted_timeout, "TimeoutExpired(cast)")
+        self.assertNotIn("secret", formatted_timeout)
+        self.assertNotIn("pass.txt", formatted_timeout)
+
+        exc_fnf = FileNotFoundError(2, "No such file or directory: 'cast'")
+        formatted_fnf = format_exception_safe(exc_fnf)
+        self.assertEqual(formatted_fnf, "FileNotFoundError(cast)")
+
+        exc_cpe = subprocess.CalledProcessError(returncode=2, cmd=["cast", "wallet", "address", "--password-file", "C:/secret/pass.txt"])
+        formatted_cpe = format_exception_safe(exc_cpe)
+        self.assertEqual(formatted_cpe, "CalledProcessError(cast, returncode=2)")
+        self.assertNotIn("secret", formatted_cpe)
 
 if __name__ == "__main__":
     unittest.main()
