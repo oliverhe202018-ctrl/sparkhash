@@ -9,6 +9,7 @@ Includes gas price floor (>=0.1 gwei), multiplier, and replacement (speed-up) re
 """
 
 import os, sys, time, json, argparse, urllib.request, urllib.error, re, random
+from urllib.parse import urlsplit
 
 # Contract function selectors (verified against MinerV1 compiled ABI)
 SELECTOR_EPOCH = "900cf0cf"          # epoch() -> uint256
@@ -56,11 +57,183 @@ ERROR_SELECTORS = {
     "3ee5aeb5": "ReentrancyGuardReentrantCall",
 }
 
+
+def sanitize_url(url: str) -> str:
+    """
+    Sanitizes RPC URL for display and logging:
+    - Conservatively hides userinfo, path, query, and fragment.
+    - Preserves scheme and host:port if present.
+    - If URL parsing fails or URL is malformed/empty, returns fixed placeholder '<redacted-url>'.
+    - Never falls back to printing the original raw URL string.
+    """
+    if not url or not isinstance(url, str):
+        return "<redacted-url>"
+    try:
+        parts = urlsplit(url)
+        scheme = parts.scheme
+        hostname = parts.hostname
+        if not scheme or not hostname:
+            return "<redacted-url>"
+        netloc = hostname
+        if parts.port:
+            netloc = f"{hostname}:{parts.port}"
+        has_sensitive_parts = bool(
+            parts.username
+            or parts.password
+            or (parts.path and parts.path not in ("", "/"))
+            or parts.query
+            or parts.fragment
+        )
+        if has_sensitive_parts:
+            return f"{scheme}://{netloc}/***"
+        return f"{scheme}://{netloc}"
+    except Exception:
+        return "<redacted-url>"
+
+_CONFIGURED_SECRETS = set()
+
+def register_secret(secret: str):
+    """
+    Registers a known secret/private key for sanitization in logs and outputs.
+    """
+    if secret and isinstance(secret, str):
+        s = secret.strip()
+        if len(s) >= 4:
+            _CONFIGURED_SECRETS.add(s)
+            if s.startswith(("0x", "0X")):
+                if len(s[2:]) >= 4:
+                    _CONFIGURED_SECRETS.add(s[2:])
+            else:
+                _CONFIGURED_SECRETS.add("0x" + s)
+
+def clear_configured_secrets():
+    """Clears registered secrets (primarily for test resets)."""
+    _CONFIGURED_SECRETS.clear()
+
+
+def parse_numeric(val, val_type, name, allow_zero=True):
+    """
+    Parses numeric configuration values safely:
+    - Enforces type conversion (float or int).
+    - Enforces non-negative values.
+    - Rejects invalid inputs with a clean error that never leaks the raw value.
+    """
+    if val is None:
+        return None
+    try:
+        parsed = val_type(val)
+        if allow_zero:
+            if parsed < 0:
+                raise ValueError("negative")
+        else:
+            if parsed <= 0:
+                raise ValueError("non-positive")
+        return parsed
+    except Exception:
+        sys.stderr.write(
+            f"[ERROR] Invalid value for {name}: must be a non-negative {'number' if val_type is float else 'integer'}.\n"
+        )
+        sys.exit(1)
+
+def sanitize_text(text: str, sensitive_values=None, known_secrets=None) -> str:
+    """
+    Sanitizes arbitrary text by:
+    - Masking embedded full URLs and URL credentials using sanitize_url.
+    - Masking sensitive key-value pairs (e.g. private_key=..., password=...), including
+      quoted values password="alpha beta", JSON {"password": "alpha beta"}, and single quotes.
+    - Masking known configured secret keys registered by live trading configuration.
+    Does NOT blindly mask arbitrary 64-hex strings: transaction hashes,
+    block hashes, and seeds remain visible.
+    Does NOT actively scan os.environ for keys.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+
+    def _replace_url(match):
+        raw_url = match.group(0)
+        trail = ""
+        punctuation = ('.', ',', ';', ':', '!', '?', ')', "'", '"')
+        while raw_url and raw_url[-1] in punctuation:
+            trail = raw_url[-1] + trail
+            raw_url = raw_url[:-1]
+        return sanitize_url(raw_url) + trail
+
+    sanitized = re.sub(r"""(?:https?|wss?)://[^\s'"<>]+""", _replace_url, text)
+
+    def _replace_kv(m):
+        prefix = m.group(1)
+        quote = m.group(2) or ""
+        key_lower = prefix.lower()
+        placeholder = "[REDACTED_KEY]" if "key" in key_lower else "[REDACTED]"
+        return f"{prefix}{quote}{placeholder}{quote}"
+
+    kv_pattern = (
+        r"""(?i)(["']?\b(?:keeper[_-]?)?(?:private[_-]?key|priv[_-]?key|privatekey|privkey|password|passwd|secret[_-]?key|secretkey|api[_-]?key|apikey|secret)\b["']?\s*[:=]\s*)"""
+        r"""(?:(["'])((?:\\.|(?!\2).)*)\2|()([^'"\s,;}\]]+))"""
+    )
+    sanitized = re.sub(kv_pattern, _replace_kv, sanitized)
+
+    secrets_to_mask = set(_CONFIGURED_SECRETS)
+    if sensitive_values:
+        if isinstance(sensitive_values, (list, tuple, set)):
+            secrets_to_mask.update(s.strip() for s in sensitive_values if isinstance(s, str) and len(s.strip()) >= 4)
+        elif isinstance(sensitive_values, str) and len(sensitive_values.strip()) >= 4:
+            secrets_to_mask.add(sensitive_values.strip())
+    if known_secrets:
+        if isinstance(known_secrets, (list, tuple, set)):
+            secrets_to_mask.update(s.strip() for s in known_secrets if isinstance(s, str) and len(s.strip()) >= 4)
+        elif isinstance(known_secrets, str) and len(known_secrets.strip()) >= 4:
+            secrets_to_mask.add(known_secrets.strip())
+
+    for sec in sorted(secrets_to_mask, key=len, reverse=True):
+        if not sec or len(sec) < 4:
+            continue
+        placeholder = "0x[REDACTED_KEY]" if sec.startswith(("0x", "0X")) else "[REDACTED_KEY]"
+        sanitized = re.sub(re.escape(sec), placeholder, sanitized, flags=re.IGNORECASE)
+
+    return sanitized
+
+def format_exception_safe(e: Exception) -> str:
+    """
+    Formats exceptions safely for logging:
+    - Never prints raw str(e) from requests or urllib that could contain full URLs or credentials.
+    - Preserves exception type, safe status/code, and sanitized message.
+    """
+    if e is None:
+        return ""
+    if not isinstance(e, Exception):
+        return sanitize_text(str(e))
+    exc_type = type(e).__name__
+    if hasattr(e, "method") and hasattr(e, "error_obj"):
+        method = getattr(e, "method", "rpc")
+        err_obj = getattr(e, "error_obj", None)
+        if isinstance(err_obj, dict):
+            code = err_obj.get("code")
+            msg = err_obj.get("message", "")
+            return f"RpcError({method}): code={code} message={sanitize_text(str(msg))}"
+        return f"RpcError({method}): {sanitize_text(str(err_obj))}"
+    if hasattr(e, "code") and hasattr(e, "reason"):
+        return f"HTTPError({e.code}): {sanitize_text(str(e.reason))}"
+    if hasattr(e, "reason"):
+        reason = getattr(e, "reason")
+        reason_str = type(reason).__name__ if isinstance(reason, Exception) else str(reason)
+        return f"URLError: {sanitize_text(reason_str)}"
+    is_requests_exc = any("requests" in getattr(cls, "__module__", "") for cls in type(e).__mro__) or hasattr(e, "request")
+    if is_requests_exc:
+        resp = getattr(e, "response", None)
+        status_code = getattr(resp, "status_code", None) if resp is not None else None
+        if status_code:
+            return f"{exc_type}: HTTP status {status_code}"
+        return f"{exc_type}: [network request failed]"
+    msg = sanitize_text(str(e))
+    return f"{exc_type}: {msg}"
+
 class RpcError(RuntimeError):
     def __init__(self, method, error_obj):
         self.method = method
         self.error_obj = error_obj
-        super().__init__("RPC Error (" + method + "): " + str(error_obj))
+        super().__init__("RPC Error (" + method + "): " + sanitize_text(str(error_obj)))
+
 
 def decode_revert_error(err):
     """
@@ -120,7 +293,9 @@ def decode_revert_error(err):
             return "Panic(uint256)"
         return f"CustomError(0x{selector})"
 
-    return raw_str
+    if isinstance(err, Exception):
+        return format_exception_safe(err)
+    return sanitize_text(raw_str)
 
 def load_env(env_path=".env"):
     config = {}
@@ -148,7 +323,12 @@ def rpc_call(rpc_url, method, params):
             err_body = e.read().decode("utf-8")
             res = json.loads(err_body)
         except Exception:
-            raise RuntimeError(f"HTTP Error {e.code}: {e.reason}")
+            raise RuntimeError(f"HTTP Error {e.code}: {e.reason}") from None
+    except urllib.error.URLError as e:
+        reason = type(e.reason).__name__ if isinstance(e.reason, Exception) else str(e.reason)
+        raise RuntimeError(f"URLError: {sanitize_text(str(reason))}") from None
+    except Exception as e:
+        raise RuntimeError(format_exception_safe(e)) from None
     if "error" in res:
         raise RpcError(method, res.get("error"))
     return res.get("result")
@@ -229,14 +409,58 @@ class KeeperBot:
                  max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=24):
         self.rpc_url = rpc_url
         self.miner = miner_address.strip().lower() if miner_address and isinstance(miner_address, str) else (miner_address or "")
-        self.private_key = private_key
         self.dry_run = dry_run
-        self.poll_interval = poll_interval
+        # In dry-run mode, keeper does not actively retrieve, register, or retain private keys or signing material.
+        # (Keeper does not claim to wipe caller-owned strings in caller memory, but guarantees dry-run will not store or register it).
+        self.private_key = None if self.dry_run else private_key
+        self._known_secrets = set()
+        if not self.dry_run and private_key and isinstance(private_key, str) and len(private_key.strip()) >= 4:
+            clean_k = private_key.strip()
+            self._known_secrets.add(clean_k)
+            register_secret(clean_k)
+
+        # Validate numeric parameters without leaking raw configuration values
+        try:
+            self.min_gas_price_gwei = float(min_gas_price_gwei)
+            if self.min_gas_price_gwei < 0:
+                raise ValueError("negative")
+        except Exception:
+            self.alert("Startup check failed: min_gas_price_gwei must be a non-negative number.")
+            sys.exit(1)
+
+        try:
+            self.gas_multiplier = float(gas_multiplier)
+            if self.gas_multiplier < 0:
+                raise ValueError("negative")
+        except Exception:
+            self.alert("Startup check failed: gas_multiplier must be a non-negative number.")
+            sys.exit(1)
+
+        try:
+            self.tx_timeout = int(tx_timeout)
+            if self.tx_timeout < 0:
+                raise ValueError("negative")
+        except Exception:
+            self.alert("Startup check failed: tx_timeout must be a non-negative integer.")
+            sys.exit(1)
+
+        try:
+            self.max_retries = int(max_retries)
+            if self.max_retries < 0:
+                raise ValueError("negative")
+        except Exception:
+            self.alert("Startup check failed: max_retries must be a non-negative integer.")
+            sys.exit(1)
+
+        try:
+            self.poll_interval = int(poll_interval)
+            if self.poll_interval < 0:
+                raise ValueError("negative")
+        except Exception:
+            self.alert("Startup check failed: poll_interval must be a non-negative integer.")
+            sys.exit(1)
+
         self.max_seed_steps = max_seed_steps
-        self.min_gas_price_gwei = float(min_gas_price_gwei)
-        self.gas_multiplier = float(gas_multiplier)
-        self.tx_timeout = int(tx_timeout)
-        self.max_retries = int(max_retries)
         self.current_nonce = None
         self._chain_id = None
         self.current_epoch = None
@@ -244,16 +468,52 @@ class KeeperBot:
         # Validate miner contract address immediately at startup
         self.validate_miner()
 
-        # Derive or assign keeper public address for nonce queries
-        self.keeper_address = None
-        if self.private_key:
-            try:
-                from eth_account import Account
-                self.keeper_address = Account.from_key(self.private_key).address
-            except Exception:
-                pass
-        if not self.keeper_address and keeper_address:
-            self.keeper_address = keeper_address
+        # Derive or assign keeper public address for nonce queries and validate identity
+        self.validate_identity(keeper_address)
+
+    def validate_identity(self, explicit_keeper_address=None):
+        """
+        Validates signer identity:
+        - In dry-run mode: uses explicit keeper_address if provided (for simulated nonce queries),
+          does not derive or require private key.
+        - In live mode: requires a private key, derives signing address from private key.
+          If private key is invalid, fails cleanly without leaking raw secret.
+          If explicit keeper_address was provided and mismatches derived address, rejects cleanly
+          before any nonce query or broadcast.
+        """
+        if self.dry_run:
+            if explicit_keeper_address and str(explicit_keeper_address).strip():
+                self.keeper_address = to_checksum_address(str(explicit_keeper_address).strip())
+            else:
+                self.keeper_address = None
+            return
+
+        if not self.private_key:
+            reason = "Private key is required for live execution mode (or run with --dry-run)."
+            self.alert(f"Startup check failed: {reason}")
+            sys.exit(1)
+
+        try:
+            from eth_account import Account
+            signer_account = Account.from_key(self.private_key)
+            derived_address = signer_account.address
+        except Exception as e:
+            reason = f"Invalid private key provided for live mode: {type(e).__name__}"
+            self.alert(f"Startup check failed: {reason}")
+            sys.exit(1)
+
+        if explicit_keeper_address and str(explicit_keeper_address).strip():
+            clean_explicit = str(explicit_keeper_address).strip().lower()
+            clean_derived = derived_address.strip().lower()
+            if clean_explicit != clean_derived:
+                reason = (
+                    f"Explicit keeper address ({str(explicit_keeper_address).strip()}) does not match "
+                    f"derived signer address ({derived_address})"
+                )
+                self.alert(f"Startup check failed: {reason}")
+                sys.exit(1)
+
+        self.keeper_address = to_checksum_address(derived_address)
 
     def validate_miner(self):
         """
@@ -283,7 +543,7 @@ class KeeperBot:
         except SystemExit:
             raise
         except Exception as e:
-            reason = f"Failed to verify contract code at miner address {self.miner}: {e}"
+            reason = f"Failed to verify contract code at miner address {self.miner}: {format_exception_safe(e)}"
             self.alert(f"Startup check failed: {reason}")
             sys.exit(1)
 
@@ -299,7 +559,8 @@ class KeeperBot:
 
     def log(self, level, msg):
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print("[" + ts + "] [" + level + "] " + msg, flush=True)
+        safe_msg = sanitize_text(msg, known_secrets=getattr(self, "_known_secrets", None))
+        print("[" + ts + "] [" + level + "] " + safe_msg, flush=True)
 
     def alert(self, msg):
         self.log("ALERT", "CRITICAL: " + msg)
@@ -325,7 +586,7 @@ class KeeperBot:
             if res:
                 return int(res, 16) if isinstance(res, str) and res.startswith("0x") else int(res)
         except Exception as e:
-            self.log("WARN", f"Failed to fetch eth_gasPrice from RPC ({e}); using floor {self.min_gas_price_gwei} gwei")
+            self.log("WARN", f"Failed to fetch eth_gasPrice from RPC ({format_exception_safe(e)}); using floor {self.min_gas_price_gwei} gwei")
         return int(self.min_gas_price_gwei * 1e9)
 
     def get_gas_price(self, bump_ratio=1.0):
@@ -341,13 +602,15 @@ class KeeperBot:
     def get_nonce(self):
         """Fetches pending nonce for keeper account, or returns 0 if address unavailable."""
         remote_nonce = 0
+        if not self.dry_run:
+            self.validate_identity(self.keeper_address)
         if self.keeper_address:
             try:
                 res = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
                 if res:
                     remote_nonce = int(res, 16) if isinstance(res, str) and res.startswith("0x") else int(res)
             except Exception as e:
-                self.log("WARN", f"Failed to query eth_getTransactionCount ({e}); defaulting to 0")
+                self.log("WARN", f"Failed to query eth_getTransactionCount ({format_exception_safe(e)}); defaulting to 0")
         if self.current_nonce is not None:
             nonce = max(self.current_nonce, remote_nonce)
         else:
@@ -433,7 +696,7 @@ class KeeperBot:
                 cur_epoch = int(res_ep, 16) if res_ep else 0
                 self.current_epoch = cur_epoch
 
-            self.log("DRY-RUN", f"[Simulated] Would call {func_name} on Miner {self.miner}")
+            self.log("DRY-RUN", f"[Simulated] Would call {func_name} on Miner {self.miner} (simulation only, does not guarantee on-chain confirmation)")
             self.log("DRY-RUN", f"  Target Contract: {self.miner}")
             self.log("DRY-RUN", f"  On-Chain Epoch:  {cur_epoch}")
             self.log("DRY-RUN", f"  Chain ID:        {chain_id}")
@@ -443,6 +706,9 @@ class KeeperBot:
             self.log("DRY-RUN", f"  Calldata:        {calldata}")
             self.current_nonce = nonce + 1
             return {"status": 1, "dry_run": True}
+
+        if not self.dry_run:
+            self.validate_identity(self.keeper_address)
 
         if not self.private_key:
             self.alert("Cannot broadcast " + desc + ": No private key provided in environment!")
@@ -495,7 +761,7 @@ class KeeperBot:
                 tx_hash = rpc_call(self.rpc_url, "eth_sendRawTransaction", [raw_hex])
                 self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
             except Exception as e:
-                err_str = str(e)
+                err_str = format_exception_safe(e)
                 if "nonce too low" in err_str.lower() or "already known" in err_str.lower():
                     self.log("WARN", f"RPC response: {err_str}; checking if already mined...")
                 else:
@@ -580,21 +846,36 @@ class KeeperBot:
             self.handle_epoch_seed(cur_epoch, seed)
             self.handle_sync_lag(cur_epoch, last_synced)
         except Exception as e:
-            self.alert("Failed during keeper inspection: " + str(e))
+            self.alert("Failed during keeper inspection: " + format_exception_safe(e))
 
     def run_forever(self):
         mode = "DRY-RUN (Simulated actions only)" if self.dry_run else "LIVE (Broadcasting transactions)"
         self.log("START", "Starting PoolCoin Keeper Bot [" + mode + "] targeting Miner " + self.miner)
-        self.log("CONFIG", f"RPC URL: {self.rpc_url} | Poll: {self.poll_interval}s | Floor: {self.min_gas_price_gwei} gwei | Mult: {self.gas_multiplier}x | Timeout: {self.tx_timeout}s")
+        self.log("CONFIG", f"RPC URL: {sanitize_url(self.rpc_url)} | Poll: {self.poll_interval}s | Floor: {self.min_gas_price_gwei} gwei | Mult: {self.gas_multiplier}x | Timeout: {self.tx_timeout}s")
         while True:
             self.step()
             time.sleep(self.poll_interval)
 
 def main():
-    parser = argparse.ArgumentParser(description="PoolCoin Keeper Bot for MinerV1")
+    parser = argparse.ArgumentParser(
+        description="PoolCoin Keeper Bot for MinerV1 on BSC Testnet (chainId 97)\n"
+                    "Note: --no-env disables reading from file-based .env configuration files\n"
+                    "(neither default .env nor custom --env-file will be loaded). It does not clear\n"
+                    "existing process environment variables (os.environ). When --no-env is specified,\n"
+                    "an explicit --rpc-url is required."
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print transactions without broadcasting")
     parser.add_argument("--once", action="store_true", help="Run a single inspection pass and exit")
-    parser.add_argument("--interval", type=int, default=15, help="Polling interval in seconds (default 15)")
+    parser.add_argument("--interval", type=int, default=None, help="Polling interval in seconds (default 15)")
+    parser.add_argument("--rpc-url", default=None, help="Explicit RPC URL endpoint (takes precedence over RPC_URL in .env or os.environ)")
+    parser.add_argument(
+        "--no-env",
+        action="store_true",
+        help="Do not load any .env file (including default .env and --env-file). "
+             "Note: --no-env only disables loading from file-based .env configurations; "
+             "it does NOT clear existing process environment variables (os.environ). "
+             "When --no-env is specified, --rpc-url must be explicitly provided."
+    )
     parser.add_argument("--env-file", default=".env", help="Path to .env configuration file")
     parser.add_argument("--miner-address", default=None, help="Miner proxy contract address (overrides .env)")
     parser.add_argument("--keeper-address", default=None, help="Keeper public address for nonce queries (dry-run)")
@@ -604,23 +885,69 @@ def main():
     parser.add_argument("--max-retries", type=int, default=None, help="Max replacement retries with identical nonce (default: 3)")
     args = parser.parse_args()
 
-    env = load_env(args.env_file)
-    rpc_url = env.get("RPC_URL", "https://data-seed-prebsc-1-s1.binance.org:8545")
+    if args.no_env:
+        # Strictly forbid opening, parsing, or loading any .env file
+        env = {}
+        if not args.rpc_url:
+            sys.stderr.write(
+                "[ERROR] --no-env is specified but no explicit --rpc-url was provided. "
+                "Refusing to fall back to ambient or default RPC configurations.\n"
+            )
+            sys.exit(1)
+        rpc_url = args.rpc_url
+    else:
+        env = load_env(args.env_file)
+        rpc_url = (
+            args.rpc_url
+            or env.get("RPC_URL")
+            or os.environ.get("RPC_URL")
+            or "https://data-seed-prebsc-1-s1.binance.org:8545"
+        )
+
+    def get_cfg(key):
+        return env.get(key) or os.environ.get(key)
+
     miner_addr = (
         args.miner_address
-        or env.get("MINER_ADDRESS")
-        or env.get("MINER_PROXY_ADDRESS")
+        or get_cfg("MINER_ADDRESS")
+        or get_cfg("MINER_PROXY_ADDRESS")
     )
-    priv_key = env.get("KEEPER_PRIVATE_KEY") or env.get("PRIVATE_KEY")
+    priv_key = None
+    if not args.dry_run:
+        priv_key = get_cfg("KEEPER_PRIVATE_KEY") or get_cfg("PRIVATE_KEY")
+        if priv_key:
+            register_secret(priv_key)
+
     is_dry_run = args.dry_run or not priv_key
     if not priv_key and not args.dry_run:
         print("[WARN] No private key detected in environment; defaulting to --dry-run for safety.")
 
-    keeper_addr = args.keeper_address or env.get("KEEPER_ADDRESS")
-    min_floor = args.min_gas_price_gwei or float(env.get("KEEPER_MIN_GAS_PRICE_GWEI", DEFAULT_MIN_GAS_PRICE_GWEI))
-    multiplier = args.gas_multiplier or float(env.get("KEEPER_GAS_PRICE_MULTIPLIER", DEFAULT_GAS_MULTIPLIER))
-    timeout = args.tx_timeout or int(env.get("KEEPER_TX_TIMEOUT", DEFAULT_TX_TIMEOUT))
-    retries = args.max_retries or int(env.get("KEEPER_MAX_RETRIES", DEFAULT_MAX_RETRIES))
+    keeper_addr = args.keeper_address or get_cfg("KEEPER_ADDRESS")
+
+    raw_min_floor = args.min_gas_price_gwei if args.min_gas_price_gwei is not None else get_cfg("KEEPER_MIN_GAS_PRICE_GWEI")
+    min_floor = parse_numeric(raw_min_floor, float, "--min-gas-price-gwei / KEEPER_MIN_GAS_PRICE_GWEI")
+    if min_floor is None:
+        min_floor = DEFAULT_MIN_GAS_PRICE_GWEI
+
+    raw_multiplier = args.gas_multiplier if args.gas_multiplier is not None else get_cfg("KEEPER_GAS_PRICE_MULTIPLIER")
+    multiplier = parse_numeric(raw_multiplier, float, "--gas-multiplier / KEEPER_GAS_PRICE_MULTIPLIER")
+    if multiplier is None:
+        multiplier = DEFAULT_GAS_MULTIPLIER
+
+    raw_timeout = args.tx_timeout if args.tx_timeout is not None else get_cfg("KEEPER_TX_TIMEOUT")
+    timeout = parse_numeric(raw_timeout, int, "--tx-timeout / KEEPER_TX_TIMEOUT")
+    if timeout is None:
+        timeout = DEFAULT_TX_TIMEOUT
+
+    raw_retries = args.max_retries if args.max_retries is not None else get_cfg("KEEPER_MAX_RETRIES")
+    retries = parse_numeric(raw_retries, int, "--max-retries / KEEPER_MAX_RETRIES")
+    if retries is None:
+        retries = DEFAULT_MAX_RETRIES
+
+    raw_interval = args.interval if args.interval is not None else get_cfg("KEEPER_POLL_INTERVAL")
+    interval = parse_numeric(raw_interval, int, "--interval / KEEPER_POLL_INTERVAL")
+    if interval is None:
+        interval = 15
 
     bot = KeeperBot(
         rpc_url=rpc_url,
@@ -628,7 +955,7 @@ def main():
         private_key=priv_key,
         keeper_address=keeper_addr,
         dry_run=is_dry_run,
-        poll_interval=args.interval,
+        poll_interval=interval,
         min_gas_price_gwei=min_floor,
         gas_multiplier=multiplier,
         tx_timeout=timeout,
