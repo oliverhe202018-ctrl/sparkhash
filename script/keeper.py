@@ -10,6 +10,8 @@ Includes gas price floor (>=0.1 gwei), multiplier, and replacement (speed-up) re
 
 import os, sys, time, json, argparse, urllib.request, urllib.error, re, random, subprocess, shutil
 from urllib.parse import urlsplit
+from enum import Enum
+from typing import Optional, Dict, Any
 
 # Contract function selectors (verified against MinerV1 compiled ABI)
 SELECTOR_EPOCH = "900cf0cf"          # epoch() -> uint256
@@ -70,6 +72,82 @@ WALLET_ENV_VARS_TO_ISOLATE = (
     "TREZOR_DERIVATION_PATH",
     "LEDGER_DERIVATION_PATH",
 )
+
+
+class TxExecutionStatus(str, Enum):
+    CONFIRMED_SUCCESS = "CONFIRMED_SUCCESS"
+    CONFIRMED_REVERT = "CONFIRMED_REVERT"
+    PENDING_UNCONFIRMED = "PENDING_UNCONFIRMED"
+    UNCERTAIN = "UNCERTAIN"
+    PREFLIGHT_FAILURE = "PREFLIGHT_FAILURE"
+    DRY_RUN = "DRY_RUN"
+
+
+class TxResult(dict):
+    """
+    Structured outcome of transaction execution.
+    Subclasses dict so existing callers and assertions (e.g. res.get('status'),
+    res.get('dry_run'), receipt.get('logs')) remain backward-compatible,
+    while explicitly exposing status, tx_hash, nonce, error, and helper properties.
+    """
+    def __init__(
+        self,
+        status: TxExecutionStatus,
+        tx_hash: Optional[str] = None,
+        receipt: Optional[Dict[str, Any]] = None,
+        nonce: Optional[int] = None,
+        error: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        dry_run: bool = False
+    ):
+        super().__init__()
+        self.status = status
+        self.tx_hash = tx_hash
+        self.receipt = receipt
+        self.nonce = nonce
+        self.error = error
+        self.context = context or {}
+        self.dry_run = dry_run or (status == TxExecutionStatus.DRY_RUN)
+
+        if receipt and isinstance(receipt, dict):
+            self.update(receipt)
+        if self.dry_run:
+            self["dry_run"] = True
+            self["status"] = 1
+        elif receipt:
+            pass
+        else:
+            self["status"] = None
+
+    @property
+    def is_confirmed_success(self) -> bool:
+        return self.status == TxExecutionStatus.CONFIRMED_SUCCESS
+
+    @property
+    def is_confirmed_revert(self) -> bool:
+        return self.status == TxExecutionStatus.CONFIRMED_REVERT
+
+    @property
+    def is_pending_unconfirmed(self) -> bool:
+        return self.status == TxExecutionStatus.PENDING_UNCONFIRMED
+
+    @property
+    def is_uncertain(self) -> bool:
+        return self.status == TxExecutionStatus.UNCERTAIN
+
+    @property
+    def is_preflight_failure(self) -> bool:
+        return self.status == TxExecutionStatus.PREFLIGHT_FAILURE
+
+    @property
+    def is_dry_run(self) -> bool:
+        return self.dry_run or (self.status == TxExecutionStatus.DRY_RUN)
+
+    def __bool__(self) -> bool:
+        return self.status == TxExecutionStatus.CONFIRMED_SUCCESS
+
+    def __repr__(self) -> str:
+        return f"<TxResult status={self.status.value} tx_hash={self.tx_hash} nonce={self.nonce}>"
 
 
 def get_isolated_cast_env(base_env=None):
@@ -589,6 +667,24 @@ class KeeperBot:
         self.current_epoch = None
         self._derived_address = None
 
+        self.locked_for_manual_review = False
+        self.manual_review_context = None
+
+        if self.rpc_url and isinstance(self.rpc_url, str):
+            try:
+                parsed_rpc = urlsplit(self.rpc_url)
+                if parsed_rpc.username:
+                    register_secret(parsed_rpc.username)
+                    self._known_secrets.add(parsed_rpc.username)
+                if parsed_rpc.password:
+                    register_secret(parsed_rpc.password)
+                    self._known_secrets.add(parsed_rpc.password)
+                if parsed_rpc.query:
+                    register_secret(parsed_rpc.query)
+                    self._known_secrets.add(parsed_rpc.query)
+            except Exception:
+                pass
+
         # Validate miner contract address immediately at startup
         self.validate_miner()
 
@@ -856,23 +952,120 @@ class KeeperBot:
             self.alert(f"Preflight check failed for {func_desc}: {err_name}")
             return False, err_name
 
+    def lock_for_manual_review(self, reason: str, nonce: Optional[int], func_name: str, tx_hash: Optional[str] = None):
+        self.locked_for_manual_review = True
+
+        sensitive = [self.password_file] if getattr(self, "password_file", None) else None
+
+        chain_id = "Unknown"
+        try:
+            cid = self.get_chain_id()
+            chain_id = cid if cid is not None else "Unknown"
+        except (Exception, SystemExit) as e:
+            err_msg = sanitize_text(format_exception_safe(e), sensitive_values=sensitive)
+            self.log("WARN", f"Failed to retrieve chain_id for manual review: {err_msg}")
+            chain_id = "Unknown"
+        except BaseException as e:
+            err_msg = sanitize_text(format_exception_safe(e), sensitive_values=sensitive)
+            self.log("WARN", f"Failed to retrieve chain_id for manual review: {err_msg}")
+            chain_id = "Unknown"
+
+        signer = "Unknown"
+        try:
+            signer = self.keeper_address or "Unknown"
+        except (Exception, SystemExit):
+            signer = "Unknown"
+        except BaseException:
+            signer = "Unknown"
+
+        target = "Unknown"
+        try:
+            target = to_checksum_address(self.miner) if self.miner else "Unknown"
+        except (Exception, SystemExit):
+            target = "Unknown"
+        except BaseException:
+            target = "Unknown"
+
+        clean_hash = None
+        try:
+            if tx_hash and isinstance(tx_hash, str) and re.match(r"^0x[0-9a-fA-F]{64}$", tx_hash):
+                clean_hash = tx_hash
+        except (Exception, SystemExit):
+            clean_hash = None
+        except BaseException:
+            clean_hash = None
+
+        self.manual_review_context = {
+            "chain_id": chain_id,
+            "signer_address": signer,
+            "target_contract": target,
+            "nonce": nonce,
+            "function_name": func_name,
+            "tx_hash": clean_hash
+        }
+
+        try:
+            clean_reason = sanitize_text(reason, sensitive_values=sensitive)
+        except (Exception, SystemExit):
+            clean_reason = "Transaction outcome uncertain"
+        except BaseException:
+            clean_reason = "Transaction outcome uncertain"
+
+        try:
+            self.alert("=================================================================")
+            self.alert("CRITICAL: TRANSACTION OUTCOME UNCERTAIN - KEEPER AUTOMATION HALTED")
+            self.alert(f"Reason: {clean_reason}")
+            self.alert("Manual verification is REQUIRED before resuming keeper operations.")
+            self.alert(f"  Chain ID:        {chain_id}")
+            self.alert(f"  Signer Address:  {signer}")
+            self.alert(f"  Target Contract: {target}")
+            self.alert(f"  Nonce:           {nonce}")
+            self.alert(f"  Function:        {func_name}")
+            self.alert(f"  Tx Hash:         {clean_hash or 'None (Broadcast unconfirmed / No valid hash returned)'}")
+            self.alert("=================================================================")
+        except (Exception, SystemExit):
+            pass
+        except BaseException:
+            pass
+
     def is_receipt_successful(self, receipt):
         if not receipt:
             return False
+        if isinstance(receipt, TxResult):
+            return receipt.status == TxExecutionStatus.CONFIRMED_SUCCESS
         if isinstance(receipt, dict):
             status = receipt.get("status")
             return status in (1, "0x1", "1", True)
-        return bool(receipt)
+        return False
 
     def send_transaction(self, calldata, desc, func_name=None, preflight=True):
         if func_name is None:
             func_name = desc
 
+        if getattr(self, "locked_for_manual_review", False):
+            self.alert(f"Transaction broadcast BLOCKED: Keeper is locked pending manual review. Broadcast refused for {func_name}.")
+            return TxResult(
+                status=TxExecutionStatus.UNCERTAIN,
+                nonce=getattr(self, "current_nonce", None),
+                error="Keeper locked pending manual review",
+                context=getattr(self, "manual_review_context", None)
+            )
+
         if preflight:
             ok, err_name = self.preflight_check(calldata, func_name)
             if not ok:
                 self.log("ACTION", f"Skipping {func_name}: preflight simulation failed ({err_name})")
-                return None
+                return TxResult(
+                    status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                    error=f"preflight simulation failed: {err_name}",
+                    context={
+                        "chain_id": self.get_chain_id(),
+                        "target_contract": to_checksum_address(self.miner),
+                        "function_name": func_name,
+                        "calldata": calldata,
+                        "revert_error": err_name
+                    }
+                )
 
         gas_price = self.get_gas_price()
         nonce = self.get_nonce()
@@ -899,7 +1092,12 @@ class KeeperBot:
                     self.log("DRY-RUN", f"  Signer Mode:     Foundry Keystore (account: {self.account}) [unverified in dry-run; no simulated address provided]")
             self.log("DRY-RUN", f"  Calldata:        {calldata}")
             self.current_nonce = nonce + 1
-            return {"status": 1, "dry_run": True}
+            return TxResult(
+                status=TxExecutionStatus.DRY_RUN,
+                receipt={"status": 1, "dry_run": True},
+                nonce=nonce,
+                dry_run=True
+            )
 
         if not self.dry_run:
             self.validate_identity(self.keeper_address)
@@ -907,6 +1105,7 @@ class KeeperBot:
         gas_limit = self.estimate_gas_limit(calldata, default_gas=300000)
         target_addr = to_checksum_address(self.miner)
         current_gas_price = gas_price
+        active_tx_hash = None
 
         if self.account:
             cast_bin = shutil.which("cast") or "cast"
@@ -947,68 +1146,181 @@ class KeeperBot:
                         timeout=self.tx_timeout,
                         env=isolated_env
                     )
-                    out = proc.stdout or ""
-                    err = proc.stderr or ""
-                    if proc.returncode != 0:
-                        err_str = sanitize_text(f"{err}\n{out}".strip(), sensitive_values=[self.password_file])
-                        if "nonce too low" in err_str.lower() or "already known" in err_str.lower():
-                            self.log("WARN", f"RPC response: {err_str}; checking if already mined...")
-                        else:
-                            self.alert(f"cast send failed on attempt {attempt}: {err_str}")
-                    else:
-                        m = re.search(r"0x[0-9a-fA-F]{64}", out)
-                        if m:
-                            tx_hash = m.group(0)
-                            self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
-                        else:
-                            err_str = sanitize_text(out, sensitive_values=[self.password_file])
-                            self.alert(f"cast send succeeded but no txHash found in output: {err_str}")
+                except subprocess.TimeoutExpired:
+                    err_str = f"cast send subprocess timed out after {self.tx_timeout}s"
+                    self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
+                    self.lock_for_manual_review(
+                        reason=f"cast send timed out during execution ({err_str})",
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=active_tx_hash
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=active_tx_hash,
+                        nonce=nonce,
+                        error=err_str,
+                        context=self.manual_review_context
+                    )
                 except Exception as e:
                     err_str = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file])
                     self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
+                    self.lock_for_manual_review(
+                        reason=f"cast send execution exception ({err_str})",
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=active_tx_hash
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=active_tx_hash,
+                        nonce=nonce,
+                        error=err_str,
+                        context=self.manual_review_context
+                    )
 
-                if not tx_hash:
-                    self.current_nonce = None
-                    return None
+                out = proc.stdout or ""
+                err = proc.stderr or ""
+                if proc.returncode != 0:
+                    err_str = sanitize_text(f"{err}\n{out}".strip(), sensitive_values=[self.password_file])
+                    is_nonce_err = "nonce too low" in err_str.lower() or "already known" in err_str.lower()
+                    if is_nonce_err:
+                        diag_latest = None
+                        diag_pending = None
+                        try:
+                            res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
+                            diag_latest = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
+                            res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
+                            diag_pending = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
+                        except Exception as diag_e:
+                            self.log("WARN", f"Failed to fetch diagnostic nonces: {format_exception_safe(diag_e)}")
+                        self.log("WARN", f"RPC response: {err_str} (Diagnostic nonces: latest={diag_latest}, pending={diag_pending}, attempted_nonce={nonce})")
+                    else:
+                        self.alert(f"cast send failed on attempt {attempt} (code {proc.returncode}): {err_str}")
 
-                if tx_hash:
-                    receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
-                    if receipt:
-                        status = receipt.get("status")
-                        blk = int(receipt.get("blockNumber", "0x0"), 16)
-                        used = int(receipt.get("gasUsed", "0x0"), 16)
-                        if status == "0x1" or status == 1:
-                            self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
-                            self.current_nonce = nonce + 1
-                            return receipt
-                        else:
-                            self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
-                            self.current_nonce = nonce + 1
-                            return receipt
+                    if active_tx_hash:
+                        self.log("INFO", f"Checking receipt for previously broadcasted txHash {active_tx_hash}...")
+                        receipt = self.wait_for_receipt(active_tx_hash, min(self.tx_timeout, 15))
+                        if receipt:
+                            status = receipt.get("status")
+                            blk = int(receipt.get("blockNumber", "0x0"), 16)
+                            used = int(receipt.get("gasUsed", "0x0"), 16)
+                            if status in ("0x1", 1, True):
+                                self.log("SUCCESS", f"Transaction {active_tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
+                                self.current_nonce = nonce + 1
+                                return TxResult(
+                                    status=TxExecutionStatus.CONFIRMED_SUCCESS,
+                                    tx_hash=active_tx_hash,
+                                    receipt=receipt,
+                                    nonce=nonce
+                                )
+                            else:
+                                self.alert(f"Transaction {active_tx_hash} REVERTED in block {blk}!")
+                                self.current_nonce = nonce + 1
+                                return TxResult(
+                                    status=TxExecutionStatus.CONFIRMED_REVERT,
+                                    tx_hash=active_tx_hash,
+                                    receipt=receipt,
+                                    nonce=nonce
+                                )
 
-                    self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s. Retrying with identical nonce {nonce}...")
+                    self.lock_for_manual_review(
+                        reason=f"cast send failed on attempt {attempt} (code {proc.returncode}): {err_str}",
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=active_tx_hash
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=active_tx_hash,
+                        nonce=nonce,
+                        error=err_str,
+                        context=self.manual_review_context
+                    )
+
+                m = re.search(r"0x[0-9a-fA-F]{64}", out)
+                if not m:
+                    err_str = sanitize_text(out, sensitive_values=[self.password_file])
+                    self.alert(f"cast send succeeded (code 0) but no valid txHash found in output: {err_str}")
+                    self.lock_for_manual_review(
+                        reason=f"cast send succeeded on attempt {attempt} but output missing valid txHash",
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=active_tx_hash
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=active_tx_hash,
+                        nonce=nonce,
+                        error="Missing txHash in cast send output",
+                        context=self.manual_review_context
+                    )
+
+                tx_hash = m.group(0)
+                active_tx_hash = tx_hash
+                self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
+
+                receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
+                if receipt:
+                    status = receipt.get("status")
+                    blk = int(receipt.get("blockNumber", "0x0"), 16)
+                    used = int(receipt.get("gasUsed", "0x0"), 16)
+                    if status in ("0x1", 1, True):
+                        self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
+                        self.current_nonce = nonce + 1
+                        return TxResult(
+                            status=TxExecutionStatus.CONFIRMED_SUCCESS,
+                            tx_hash=tx_hash,
+                            receipt=receipt,
+                            nonce=nonce
+                        )
+                    else:
+                        self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
+                        self.current_nonce = nonce + 1
+                        return TxResult(
+                            status=TxExecutionStatus.CONFIRMED_REVERT,
+                            tx_hash=tx_hash,
+                            receipt=receipt,
+                            nonce=nonce
+                        )
+
+                self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
+                if attempt < self.max_retries:
+                    self.log("RETRY", f"Retrying with identical nonce {nonce}...")
 
             self.alert(f"All {self.max_retries} speed-up attempts exhausted for {func_name} with nonce {nonce}!")
-            self.current_nonce = None
-            return None
+            self.lock_for_manual_review(
+                reason=f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted",
+                nonce=nonce,
+                func_name=func_name,
+                tx_hash=active_tx_hash
+            )
+            return TxResult(
+                status=TxExecutionStatus.PENDING_UNCONFIRMED,
+                tx_hash=active_tx_hash,
+                nonce=nonce,
+                context=self.manual_review_context
+            )
 
         if not self.private_key:
             self.alert("Cannot broadcast " + desc + ": No private key provided in environment!")
-            return None
+            return TxResult(
+                status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                error="No private key configured",
+                context={"function_name": func_name}
+            )
 
         try:
             from eth_account import Account
         except ImportError:
             self.alert("Cannot broadcast " + desc + ": eth_account package not installed!")
-            return None
+            return TxResult(
+                status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                error="eth_account not installed",
+                context={"function_name": func_name}
+            )
 
-        # Fetch chainId
-        try:
-            cid_res = rpc_call(self.rpc_url, "eth_chainId", [])
-            chain_id = int(cid_res, 16) if isinstance(cid_res, str) and cid_res.startswith("0x") else int(cid_res)
-        except Exception:
-            chain_id = 97
-
+        chain_id = self.get_chain_id()
 
         for attempt in range(self.max_retries + 1):
             if attempt > 0:
@@ -1032,19 +1344,108 @@ class KeeperBot:
                 "data": calldata
             }
 
-            signed = Account.sign_transaction(tx_dict, self.private_key)
-            raw_bytes = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
-            raw_hex = "0x" + raw_bytes.hex()
-
             try:
-                tx_hash = rpc_call(self.rpc_url, "eth_sendRawTransaction", [raw_hex])
-                self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
+                signed = Account.sign_transaction(tx_dict, self.private_key)
+                raw_bytes = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
+                raw_hex = "0x" + raw_bytes.hex()
             except Exception as e:
                 err_str = format_exception_safe(e)
-                if "nonce too low" in err_str.lower() or "already known" in err_str.lower():
-                    self.log("WARN", f"RPC response: {err_str}; checking if already mined...")
+                self.alert(f"Failed to sign transaction on attempt {attempt}: {err_str}")
+                self.lock_for_manual_review(
+                    reason=f"Failed to sign transaction ({err_str})",
+                    nonce=nonce,
+                    func_name=func_name,
+                    tx_hash=active_tx_hash
+                )
+                return TxResult(
+                    status=TxExecutionStatus.UNCERTAIN,
+                    tx_hash=active_tx_hash,
+                    nonce=nonce,
+                    error=err_str,
+                    context=self.manual_review_context
+                )
+
+            tx_hash = None
+            try:
+                res = rpc_call(self.rpc_url, "eth_sendRawTransaction", [raw_hex])
+                if isinstance(res, str) and re.match(r"^0x[0-9a-fA-F]{64}$", res):
+                    tx_hash = res
+                else:
+                    self.alert(f"eth_sendRawTransaction returned non-hash response: {res}")
+            except Exception as e:
+                err_str = format_exception_safe(e)
+                is_nonce_err = "nonce too low" in err_str.lower() or "already known" in err_str.lower()
+                if is_nonce_err:
+                    diag_latest = None
+                    diag_pending = None
+                    try:
+                        res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
+                        diag_latest = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
+                        res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
+                        diag_pending = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
+                    except Exception as diag_e:
+                        self.log("WARN", f"Failed to fetch diagnostic nonces: {format_exception_safe(diag_e)}")
+                    self.log("WARN", f"RPC response: {err_str} (Diagnostic nonces: latest={diag_latest}, pending={diag_pending}, attempted_nonce={nonce})")
                 else:
                     self.alert(f"eth_sendRawTransaction failed on attempt {attempt}: {err_str}")
+
+                if active_tx_hash:
+                    self.log("INFO", f"Checking receipt for previously broadcasted txHash {active_tx_hash}...")
+                    receipt = self.wait_for_receipt(active_tx_hash, min(self.tx_timeout, 15))
+                    if receipt:
+                        status = receipt.get("status")
+                        blk = int(receipt.get("blockNumber", "0x0"), 16)
+                        used = int(receipt.get("gasUsed", "0x0"), 16)
+                        if status in ("0x1", 1, True):
+                            self.log("SUCCESS", f"Transaction {active_tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
+                            self.current_nonce = nonce + 1
+                            return TxResult(
+                                status=TxExecutionStatus.CONFIRMED_SUCCESS,
+                                tx_hash=active_tx_hash,
+                                receipt=receipt,
+                                nonce=nonce
+                            )
+                        else:
+                            self.alert(f"Transaction {active_tx_hash} REVERTED in block {blk}!")
+                            self.current_nonce = nonce + 1
+                            return TxResult(
+                                status=TxExecutionStatus.CONFIRMED_REVERT,
+                                tx_hash=active_tx_hash,
+                                receipt=receipt,
+                                nonce=nonce
+                            )
+
+                self.lock_for_manual_review(
+                    reason=f"eth_sendRawTransaction failed on attempt {attempt}: {err_str}",
+                    nonce=nonce,
+                    func_name=func_name,
+                    tx_hash=active_tx_hash
+                )
+                return TxResult(
+                    status=TxExecutionStatus.UNCERTAIN,
+                    tx_hash=active_tx_hash,
+                    nonce=nonce,
+                    error=err_str,
+                    context=self.manual_review_context
+                )
+
+            if not tx_hash:
+                self.lock_for_manual_review(
+                    reason="eth_sendRawTransaction did not return a valid txHash",
+                    nonce=nonce,
+                    func_name=func_name,
+                    tx_hash=active_tx_hash
+                )
+                return TxResult(
+                    status=TxExecutionStatus.UNCERTAIN,
+                    tx_hash=active_tx_hash,
+                    nonce=nonce,
+                    error="Missing valid txHash from eth_sendRawTransaction",
+                    context=self.manual_review_context
+                )
+
+            active_tx_hash = tx_hash
+            self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
 
             # Wait for receipt
             receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
@@ -1052,20 +1453,42 @@ class KeeperBot:
                 status = receipt.get("status")
                 blk = int(receipt.get("blockNumber", "0x0"), 16)
                 used = int(receipt.get("gasUsed", "0x0"), 16)
-                if status == "0x1" or status == 1:
+                if status in ("0x1", 1, True):
                     self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
                     self.current_nonce = nonce + 1
-                    return receipt
+                    return TxResult(
+                        status=TxExecutionStatus.CONFIRMED_SUCCESS,
+                        tx_hash=tx_hash,
+                        receipt=receipt,
+                        nonce=nonce
+                    )
                 else:
                     self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
                     self.current_nonce = nonce + 1
-                    return receipt
+                    return TxResult(
+                        status=TxExecutionStatus.CONFIRMED_REVERT,
+                        tx_hash=tx_hash,
+                        receipt=receipt,
+                        nonce=nonce
+                    )
 
-            self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s. Retrying with identical nonce {nonce}...")
+            self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
+            if attempt < self.max_retries:
+                self.log("RETRY", f"Retrying with identical nonce {nonce}...")
 
         self.alert(f"All {self.max_retries} speed-up attempts exhausted for {func_name} with nonce {nonce}!")
-        self.current_nonce = None
-        return None
+        self.lock_for_manual_review(
+            reason=f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted",
+            nonce=nonce,
+            func_name=func_name,
+            tx_hash=active_tx_hash
+        )
+        return TxResult(
+            status=TxExecutionStatus.PENDING_UNCONFIRMED,
+            tx_hash=active_tx_hash,
+            nonce=nonce,
+            context=self.manual_review_context
+        )
 
     def handle_epoch_seed(self, cur_epoch, seed):
         if seed != 0:
@@ -1094,10 +1517,10 @@ class KeeperBot:
             calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(e) + encode_uint256(self.max_seed_steps)
             func_desc = f"initEpochSeed({e}, {self.max_seed_steps})"
             receipt = self.send_transaction(calldata, func_desc, func_desc)
-            if not self.is_receipt_successful(receipt):
+            if receipt is None or not (receipt.get("dry_run") or self.is_receipt_successful(receipt)):
                 self.alert(f"Failed to confirm {func_desc}. Stopping seed initialization sequence.")
                 break
-            if receipt and isinstance(receipt, dict):
+            if receipt is not None and isinstance(receipt, dict):
                 for log in receipt.get("logs", []):
                     topics = log.get("topics", [])
                     if topics and topics[0].lower() == EVENT_EPOCH_SETTLED_TOPIC.lower():
@@ -1110,11 +1533,16 @@ class KeeperBot:
             steps = min(lag, 48)
             calldata = "0x" + SELECTOR_SYNC + encode_uint256(steps)
             func_desc = f"sync({steps})"
-            self.send_transaction(calldata, func_desc, func_desc)
+            receipt = self.send_transaction(calldata, func_desc, func_desc)
+            if receipt is None or not (receipt.get("dry_run") or self.is_receipt_successful(receipt)):
+                self.alert(f"Failed to confirm {func_desc}.")
         else:
             self.log("OK", "Sync state up-to-date (lastSynced=" + str(last_synced) + ", currentEpoch=" + str(cur_epoch) + ").")
 
     def step(self):
+        if getattr(self, "locked_for_manual_review", False):
+            self.alert("Keeper is locked pending manual review. Broadcast refused.")
+            return
         try:
             chain_id = self.get_chain_id()
             cur_epoch, last_synced, seed = self.get_epoch_state()
@@ -1123,6 +1551,8 @@ class KeeperBot:
                 self.log("DRY-RUN", f"[Context] Target Contract: {self.miner} | On-Chain Epoch: {cur_epoch} | Chain ID: {chain_id}")
             self.log("STATUS", "Current Epoch: " + str(cur_epoch) + " | LastSynced: " + str(last_synced) + " | Seed: " + seed_status)
             self.handle_epoch_seed(cur_epoch, seed)
+            if getattr(self, "locked_for_manual_review", False):
+                return
             self.handle_sync_lag(cur_epoch, last_synced)
         except Exception as e:
             self.alert("Failed during keeper inspection: " + format_exception_safe(e))
@@ -1132,7 +1562,13 @@ class KeeperBot:
         self.log("START", "Starting PoolCoin Keeper Bot [" + mode + "] targeting Miner " + self.miner)
         self.log("CONFIG", f"RPC URL: {sanitize_url(self.rpc_url)} | Poll: {self.poll_interval}s | Floor: {self.min_gas_price_gwei} gwei | Mult: {self.gas_multiplier}x | Timeout: {self.tx_timeout}s")
         while True:
+            if getattr(self, "locked_for_manual_review", False):
+                self.alert("Keeper is locked pending manual review. Halting automatic execution.")
+                break
             self.step()
+            if getattr(self, "locked_for_manual_review", False):
+                self.alert("Keeper entered locked state during step. Halting automatic execution.")
+                break
             time.sleep(self.poll_interval)
 
 def main():

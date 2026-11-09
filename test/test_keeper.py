@@ -13,11 +13,14 @@ import os
 import sys
 import io
 import rlp
+import subprocess
 
 # Ensure repo root is on sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from script.keeper import (
+    TxExecutionStatus,
+    TxResult,
     calculate_gas_price,
     get_bumped_gas_price,
     to_checksum_address,
@@ -178,15 +181,15 @@ class TestKeeperBotSpeedupRetry(unittest.TestCase):
             elif method == "eth_estimateGas":
                 return "0x186a0" # 100,000
             elif method == "eth_sendRawTransaction":
-                tx_hash = f"0xhash_{len(broadcasted_txs)}"
+                tx_hash = f"0x{'a' * 60}{len(broadcasted_txs):04x}"
                 broadcasted_txs.append({"raw": params[0], "hash": tx_hash})
                 return tx_hash
             elif method == "eth_getTransactionReceipt":
                 # Timeout on first tx (0), confirm on second tx (1)
                 tx_hash = params[0]
-                if tx_hash == "0xhash_0":
+                if tx_hash == f"0x{'a' * 60}0000":
                     return None  # Pending/unconfirmed
-                elif tx_hash == "0xhash_1":
+                elif tx_hash == f"0x{'a' * 60}0001":
                     return {"blockNumber": "0x100", "gasUsed": "0x12000", "status": "0x1"}
             return None
 
@@ -311,7 +314,7 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                     return "0x" # Preflight succeeds
                 return "0x"
             elif method == "eth_sendRawTransaction":
-                tx_hash = f"0xhash_{len(broadcasted_txs)}"
+                tx_hash = f"0x{'b' * 60}{len(broadcasted_txs):04x}"
                 broadcasted_txs.append({"raw": params[0], "hash": tx_hash})
                 return tx_hash
             elif method == "eth_getTransactionReceipt":
@@ -406,7 +409,7 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                     return "0x"
                 return "0x"
             elif method == "eth_sendRawTransaction":
-                tx_hash = f"0xhash_{len(broadcasted_txs)}"
+                tx_hash = f"0x{'c' * 60}{len(broadcasted_txs):04x}"
                 broadcasted_txs.append({"raw": params[0], "hash": tx_hash})
                 return tx_hash
             elif method == "eth_getTransactionReceipt":
@@ -477,14 +480,14 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                     return "0x"
                 return "0x"
             elif method == "eth_sendRawTransaction":
-                tx_hash = f"0xhash_{len(broadcasted_txs)}"
+                tx_hash = f"0x{'d' * 60}{len(broadcasted_txs):04x}"
                 broadcasted_txs.append({"raw": params[0], "hash": tx_hash})
                 return tx_hash
             elif method == "eth_getTransactionReceipt":
                 tx_hash = params[0]
-                if tx_hash == "0xhash_0":
+                if tx_hash == f"0x{'d' * 60}0000":
                     return {"blockNumber": "0x100", "gasUsed": "0x12000", "status": "0x1"}
-                elif tx_hash == "0xhash_1":
+                elif tx_hash == f"0x{'d' * 60}0001":
                     # Revert on chain
                     return {"blockNumber": "0x101", "gasUsed": "0x5000", "status": "0x0"}
             return None
@@ -1663,8 +1666,11 @@ class TestFoundryKeystoreIntegration(unittest.TestCase):
         )
 
         receipt = bot.send_transaction("0x12345678", "test_call", preflight=False)
-        self.assertIsNone(receipt)
-        self.assertIsNone(bot.current_nonce)
+        self.assertEqual(receipt.status, TxExecutionStatus.UNCERTAIN)
+        self.assertTrue(receipt.is_uncertain)
+        self.assertFalse(bool(receipt))
+        self.assertTrue(bot.locked_for_manual_review)
+        self.assertEqual(bot.current_nonce, 5)
         self.assertEqual(mock_subproc.call_count, 2)
 
         # 2. Exception on cast send (e.g. TimeoutExpired)
@@ -1683,8 +1689,11 @@ class TestFoundryKeystoreIntegration(unittest.TestCase):
             max_retries=3
         )
         receipt2 = bot2.send_transaction("0x12345678", "test_call", preflight=False)
-        self.assertIsNone(receipt2)
-        self.assertIsNone(bot2.current_nonce)
+        self.assertEqual(receipt2.status, TxExecutionStatus.UNCERTAIN)
+        self.assertTrue(receipt2.is_uncertain)
+        self.assertFalse(bool(receipt2))
+        self.assertTrue(bot2.locked_for_manual_review)
+        self.assertEqual(bot2.current_nonce, 5)
         self.assertEqual(mock_subproc.call_count, 2)
 
         # 3. Success code but no txHash in stdout
@@ -1702,8 +1711,11 @@ class TestFoundryKeystoreIntegration(unittest.TestCase):
             max_retries=3
         )
         receipt3 = bot3.send_transaction("0x12345678", "test_call", preflight=False)
-        self.assertIsNone(receipt3)
-        self.assertIsNone(bot3.current_nonce)
+        self.assertEqual(receipt3.status, TxExecutionStatus.UNCERTAIN)
+        self.assertTrue(receipt3.is_uncertain)
+        self.assertFalse(bool(receipt3))
+        self.assertTrue(bot3.locked_for_manual_review)
+        self.assertEqual(bot3.current_nonce, 5)
         self.assertEqual(mock_subproc.call_count, 2)
 
     @patch("script.keeper.rpc_call")
@@ -1844,6 +1856,809 @@ class TestFoundryKeystoreIntegration(unittest.TestCase):
         formatted_cpe = format_exception_safe(exc_cpe)
         self.assertEqual(formatted_cpe, "CalledProcessError(cast, returncode=2)")
         self.assertNotIn("secret", formatted_cpe)
+
+
+
+class TestKeeperUncertainTransactionRecovery(unittest.TestCase):
+    """
+    Offline mock unit tests verifying tightened recovery and retry behavior:
+    1. TimeoutExpired on cast send only executes once and enters UNCERTAIN state.
+    2. Non-zero return code and missing hash enter UNCERTAIN state and lock keeper.
+    3. nonce too low / already known does not count as success.
+    4. Diagnostic nonce advances do not count as action success.
+    5. UNCERTAIN locked state produces zero additional broadcasts.
+    6. Known hash with receipt status=1 / 0 / None are handled distinctly.
+    7. Speed-up retry preserves identical nonce, target, calldata, and value.
+    8. Sensitive sentinels never leak in alerts or manual review context.
+    9. Arbitrary 32-byte hex in error text is not treated as tx hash.
+    10. Preflight failure returns PREFLIGHT_FAILURE without locking bot.
+    """
+    def setUp(self):
+        clear_configured_secrets()
+
+    def tearDown(self):
+        clear_configured_secrets()
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_cast_timeout_expired_executes_only_once_and_locks(self, mock_subproc, mock_rpc):
+        """cast TimeoutExpired leads to exactly 1 send attempt, enters UNCERTAIN state, and locks."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            subprocess.TimeoutExpired(cmd=["cast", "send"], timeout=60)
+        ]
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=3
+        )
+
+        res = bot.send_transaction("0x12345678", "test_action", preflight=False)
+        self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+        self.assertTrue(res.is_uncertain)
+        self.assertFalse(bool(res))
+        self.assertTrue(bot.locked_for_manual_review)
+        self.assertEqual(bot.current_nonce, 5)
+        self.assertEqual(mock_subproc.call_count, 2)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_nonzero_returncode_and_missing_hash_enter_uncertain_state(self, mock_subproc, mock_rpc):
+        """Non-zero return code and return code 0 with missing hash both enter UNCERTAIN state and lock."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+
+        # Case 1: Non-zero exit code
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error: network disconnect")
+        ]
+        bot1 = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=2
+        )
+        res1 = bot1.send_transaction("0x12345678", "test_nonzero", preflight=False)
+        self.assertEqual(res1.status, TxExecutionStatus.UNCERTAIN)
+        self.assertTrue(bot1.locked_for_manual_review)
+        self.assertEqual(bot1.current_nonce, 5)
+        self.assertEqual(mock_subproc.call_count, 2)
+
+        # Case 2: Zero exit code but missing 32-byte hash in stdout
+        mock_subproc.reset_mock()
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout="Transaction submitted but no hash printed\n", stderr="")
+        ]
+        bot2 = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=2
+        )
+        res2 = bot2.send_transaction("0x12345678", "test_missing_hash", preflight=False)
+        self.assertEqual(res2.status, TxExecutionStatus.UNCERTAIN)
+        self.assertTrue(bot2.locked_for_manual_review)
+        self.assertEqual(bot2.current_nonce, 5)
+        self.assertEqual(mock_subproc.call_count, 2)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_nonce_too_low_already_known_not_marked_success(self, mock_subproc, mock_rpc):
+        """nonce too low / already known does not count as success, enters UNCERTAIN and locks."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+
+        # 1. Keystore mode
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error: nonce too low: address 0x..., tx: 5, state: 6")
+        ]
+        bot_ks = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=2
+        )
+        res_ks = bot_ks.send_transaction("0x12345678", "test_nonce_err", preflight=False)
+        self.assertEqual(res_ks.status, TxExecutionStatus.UNCERTAIN)
+        self.assertFalse(res_ks.is_confirmed_success)
+        self.assertFalse(bool(res_ks))
+        self.assertTrue(bot_ks.locked_for_manual_review)
+        self.assertEqual(bot_ks.current_nonce, 5)
+
+        # 2. Private key mode
+        test_key = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f3608a8"
+        def rpc_pk(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_getTransactionCount":
+                return "0x5"
+            elif method == "eth_sendRawTransaction":
+                raise Exception("transaction already known")
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_pk
+        bot_pk = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key=test_key,
+            dry_run=False,
+            max_retries=2
+        )
+        res_pk = bot_pk.send_transaction("0x12345678", "test_pk_already_known", preflight=False)
+        self.assertEqual(res_pk.status, TxExecutionStatus.UNCERTAIN)
+        self.assertFalse(res_pk.is_confirmed_success)
+        self.assertFalse(bool(res_pk))
+        self.assertTrue(bot_pk.locked_for_manual_review)
+        self.assertEqual(bot_pk.current_nonce, 5)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_nonce_advance_diagnostics_does_not_count_as_action_success(self, mock_subproc, mock_rpc):
+        """Even if latest/pending nonce advances, it does NOT prove this action succeeded without a mined receipt."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        call_counts = {"pending": 0}
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_getTransactionCount":
+                tag = params[1]
+                if tag == "latest":
+                    return "0x0a"
+                elif tag == "pending":
+                    call_counts["pending"] += 1
+                    if call_counts["pending"] == 1:
+                        return "0x5"
+                    return "0x0c"
+                return "0x5"
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_side
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error: nonce too low")
+        ]
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=2
+        )
+
+        res = bot.send_transaction("0x12345678", "test_action", preflight=False)
+        self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+        self.assertFalse(res.is_confirmed_success)
+        self.assertTrue(bot.locked_for_manual_review)
+        self.assertEqual(bot.current_nonce, 5)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_locked_state_produces_zero_additional_broadcasts(self, mock_subproc, mock_rpc):
+        """Once locked for manual review, all subsequent send_transaction, step, and run_forever produce 0 broadcasts."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_subproc.return_value = MagicMock(returncode=0, stdout=fake_addr + "\n", stderr="")
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=1
+        )
+
+        bot.locked_for_manual_review = True
+        bot.manual_review_context = {"reason": "Prior failure"}
+
+        subproc_count_before = mock_subproc.call_count
+
+        # 1. Direct send_transaction call
+        res = bot.send_transaction("0x1234", "should_not_send", preflight=False)
+        self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+        self.assertEqual(mock_subproc.call_count, subproc_count_before)
+
+        # 2. bot.step()
+        bot.step()
+        self.assertEqual(mock_subproc.call_count, subproc_count_before)
+
+        # 3. bot.run_forever() breaks immediately
+        bot.poll_interval = 0.01
+        bot.run_forever()
+        self.assertEqual(mock_subproc.call_count, subproc_count_before)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_known_hash_receipt_status_handling_success_revert_timeout(self, mock_subproc, mock_rpc):
+        """With a valid hash, receipt status=1 is CONFIRMED_SUCCESS, status=0 is CONFIRMED_REVERT, and timeout is PENDING_UNCONFIRMED."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        valid_hash = "0x" + "a" * 64
+
+        # 1. status = 1 (Success)
+        def rpc_success(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_getTransactionCount":
+                return "0x5"
+            elif method == "eth_getTransactionReceipt":
+                return {"status": "0x1", "blockNumber": "0x10", "gasUsed": "0x5000"}
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_success
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"{valid_hash}\n", stderr="")
+        ]
+        bot1 = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            tx_timeout=1
+        )
+        res1 = bot1.send_transaction("0x1234", "test_success", preflight=False)
+        self.assertEqual(res1.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+        self.assertTrue(bool(res1))
+        self.assertEqual(bot1.current_nonce, 6)
+        self.assertFalse(bot1.locked_for_manual_review)
+
+        # 2. status = 0 (Revert)
+        def rpc_revert(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_getTransactionCount":
+                return "0x5"
+            elif method == "eth_getTransactionReceipt":
+                return {"status": "0x0", "blockNumber": "0x10", "gasUsed": "0x5000"}
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_revert
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"{valid_hash}\n", stderr="")
+        ]
+        bot2 = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            tx_timeout=1
+        )
+        res2 = bot2.send_transaction("0x1234", "test_revert", preflight=False)
+        self.assertEqual(res2.status, TxExecutionStatus.CONFIRMED_REVERT)
+        self.assertFalse(bool(res2))
+        self.assertEqual(bot2.current_nonce, 6)
+        self.assertFalse(bot2.locked_for_manual_review)
+
+        # 3. No receipt (Timeout on all attempts)
+        def rpc_timeout(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_getTransactionCount":
+                return "0x5"
+            elif method == "eth_getTransactionReceipt":
+                return None
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_timeout
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"{valid_hash}\n", stderr="")
+        ]
+        bot3 = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            tx_timeout=0.01,
+            max_retries=0
+        )
+        res3 = bot3.send_transaction("0x1234", "test_pending", preflight=False)
+        self.assertEqual(res3.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+        self.assertFalse(bool(res3))
+        self.assertTrue(bot3.locked_for_manual_review)
+        self.assertEqual(bot3.manual_review_context["tx_hash"], valid_hash)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_speedup_replacement_strictly_reuses_nonce_target_calldata_value(self, mock_subproc, mock_rpc):
+        """Speed-up retry strictly keeps identical nonce, target, calldata, value and bumps gasPrice."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        hash0 = "0x" + "1" * 64
+        hash1 = "0x" + "2" * 64
+
+        receipt_calls = []
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_getTransactionCount":
+                return "0x5"
+            elif method == "eth_getTransactionReceipt":
+                receipt_calls.append(params[0])
+                if params[0] == hash1:
+                    return {"status": "0x1", "blockNumber": "0x11", "gasUsed": "0x5000"}
+                return None
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_side
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"{hash0}\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"{hash1}\n", stderr="")
+        ]
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            tx_timeout=1,
+            max_retries=1
+        )
+
+        calldata = "0xdeadbeef"
+        res = bot.send_transaction(calldata, "test_speedup", preflight=False)
+        self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+        self.assertEqual(mock_subproc.call_count, 3)
+
+        cmd_attempt0 = mock_subproc.call_args_list[1][0][0]
+        cmd_attempt1 = mock_subproc.call_args_list[2][0][0]
+
+        target_checksum = to_checksum_address("0x420382a0f874c1F120621f847d81581e8737504e")
+        self.assertEqual(cmd_attempt0[2], target_checksum)
+        self.assertEqual(cmd_attempt1[2], target_checksum)
+
+        self.assertEqual(cmd_attempt0[cmd_attempt0.index("--data") + 1], calldata)
+        self.assertEqual(cmd_attempt1[cmd_attempt1.index("--data") + 1], calldata)
+
+        self.assertEqual(cmd_attempt0[cmd_attempt0.index("--nonce") + 1], "5")
+        self.assertEqual(cmd_attempt1[cmd_attempt1.index("--nonce") + 1], "5")
+
+        gp0 = int(cmd_attempt0[cmd_attempt0.index("--gas-price") + 1])
+        gp1 = int(cmd_attempt1[cmd_attempt1.index("--gas-price") + 1])
+        self.assertGreater(gp1, gp0)
+        self.assertGreaterEqual(gp1, int(gp0 * 1.15))
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_sensitive_sentinels_not_leaked_in_alerts_or_manual_review_context(self, mock_subproc, mock_rpc):
+        """Sensitive password file path and RPC URL credentials never leak in alerts or manual review context."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+
+        secret_pass_path = "C:/secret/vault/my_production.pwd"
+        secret_rpc_url = "https://sensitive_user:secret_rpc_token_98765@bsc-testnet.rpc.poolcoin.org:8545/v1"
+
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr=f"Fatal error reading {secret_pass_path} with token secret_rpc_token_98765")
+        ]
+
+        captured_alerts = []
+        bot = KeeperBot(
+            rpc_url=secret_rpc_url,
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file=secret_pass_path,
+            dry_run=False,
+            max_retries=1
+        )
+        bot.alert = lambda msg: captured_alerts.append(msg)
+
+        res = bot.send_transaction("0x1234", "test_leak", preflight=False)
+        self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+
+        ctx = bot.manual_review_context
+        self.assertEqual(set(ctx.keys()), {"chain_id", "signer_address", "target_contract", "nonce", "function_name", "tx_hash"})
+        for k, v in ctx.items():
+            val_str = str(v)
+            self.assertNotIn("secret_rpc_token_98765", val_str)
+            self.assertNotIn("my_production.pwd", val_str)
+            self.assertNotIn("secret/vault", val_str)
+
+        all_alerts_text = " \n ".join(captured_alerts)
+        self.assertNotIn("secret_rpc_token_98765", all_alerts_text)
+        self.assertNotIn("my_production.pwd", all_alerts_text)
+        self.assertNotIn("secret/vault", all_alerts_text)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_arbitrary_32_byte_in_error_text_not_treated_as_tx_hash(self, mock_subproc, mock_rpc):
+        """Error text containing arbitrary 32-byte hex strings is NOT treated as transaction hash."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+
+        arbitrary_32_byte = "0x" + "f" * 64
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr=f"Execution reverted: failed at internal hash {arbitrary_32_byte} in subcall")
+        ]
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=1
+        )
+
+        res = bot.send_transaction("0x1234", "test_arbitrary_hash", preflight=False)
+        self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+        self.assertIsNone(res.tx_hash)
+        self.assertIsNone(bot.manual_review_context["tx_hash"])
+
+    @patch("script.keeper.rpc_call")
+    def test_preflight_failure_does_not_lock_bot(self, mock_rpc):
+        """Preflight simulation failure returns PREFLIGHT_FAILURE and does not lock the bot."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        test_key = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f3608a8"
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key=test_key,
+            dry_run=False
+        )
+
+        bot.preflight_check = MagicMock(return_value=(False, "PrevSeedNotInitialized"))
+        res = bot.send_transaction("0x1234", "initEpochSeed(1, 24)", preflight=True)
+        self.assertEqual(res.status, TxExecutionStatus.PREFLIGHT_FAILURE)
+        self.assertTrue(res.is_preflight_failure)
+        self.assertFalse(bot.locked_for_manual_review)
+
+
+
+
+class TestManualReviewLockAndDryRunFixes(unittest.TestCase):
+    """Tests verifying fixes for lock_for_manual_review resilience, strict hash validation, and dry-run semantics."""
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_get_chain_id_exception_retains_lock_writes_context_and_returns_uncertain(self, mock_subproc, mock_rpc):
+        """When get_chain_id throws an exception during review locking, lock remains active, context is written, alerts are emitted, and send_transaction returns UNCERTAIN without raising."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="cast send error: gas price too low")
+        ]
+
+        captured_alerts = []
+        captured_warnings = []
+        bot = KeeperBot(
+            rpc_url="https://sensitive_user:secret_token_12345@rpc.poolcoin.org:8545",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="C:/secret/vault/pass.pwd",
+            dry_run=False,
+            max_retries=1
+        )
+        bot.alert = lambda msg: captured_alerts.append(msg)
+        bot.log = lambda level, msg: captured_warnings.append((level, msg)) if level == "WARN" else None
+
+        # Force get_chain_id to throw an exception embedding sensitive data
+        bot.get_chain_id = MagicMock(side_effect=RuntimeError("eth_chainId failed with token secret_token_12345"))
+
+        res = bot.send_transaction("0x1234", "test_chain_id_failure", preflight=False)
+
+        # 1. Returned UNCERTAIN without raising
+        self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+        # 2. Lock is strictly active
+        self.assertTrue(bot.locked_for_manual_review)
+        # 3. Context is populated with fallback chain_id 'Unknown'
+        self.assertIsNotNone(bot.manual_review_context)
+        self.assertEqual(bot.manual_review_context["chain_id"], "Unknown")
+        self.assertEqual(bot.manual_review_context["signer_address"], fake_addr)
+        self.assertEqual(bot.manual_review_context["target_contract"], "0x420382a0f874c1F120621f847d81581e8737504e")
+        self.assertEqual(bot.manual_review_context["nonce"], 5)
+        self.assertEqual(bot.manual_review_context["function_name"], "test_chain_id_failure")
+        self.assertIsNone(bot.manual_review_context["tx_hash"])
+        # 4. Critical manual review alert was outputted
+        all_alerts = " \n ".join(captured_alerts)
+        self.assertIn("CRITICAL: TRANSACTION OUTCOME UNCERTAIN - KEEPER AUTOMATION HALTED", all_alerts)
+        self.assertIn("Chain ID:        Unknown", all_alerts)
+        # 5. Sensitive data must be sanitized
+        self.assertNotIn("secret_token_12345", all_alerts)
+        self.assertNotIn("secret/vault", all_alerts)
+        all_warnings = " \n ".join(m for _, m in captured_warnings)
+        self.assertNotIn("secret_token_12345", all_warnings)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_get_chain_id_system_exit_does_not_abort_manual_review_lock(self, mock_subproc, mock_rpc):
+        """If get_chain_id triggers a SystemExit, lock_for_manual_review intercepts it, preserves the lock, writes context, and outputs the review prompt."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="cast send fatal error")
+        ]
+
+        captured_alerts = []
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=1
+        )
+        bot.alert = lambda msg: captured_alerts.append(msg)
+
+        # Mock get_chain_id to simulate SystemExit(1)
+        bot.get_chain_id = MagicMock(side_effect=SystemExit(1))
+
+        res = bot.send_transaction("0x1234", "test_sysexit_handling", preflight=False)
+        self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+        self.assertTrue(bot.locked_for_manual_review)
+        self.assertEqual(bot.manual_review_context["chain_id"], "Unknown")
+        all_alerts = " \n ".join(captured_alerts)
+        self.assertIn("CRITICAL: TRANSACTION OUTCOME UNCERTAIN - KEEPER AUTOMATION HALTED", all_alerts)
+        self.assertIn("Chain ID:        Unknown", all_alerts)
+
+    @patch("script.keeper.rpc_call")
+    def test_invalid_hashes_rejected_from_manual_review_context(self, mock_rpc):
+        """Invalid hashes (short strings, non-hex characters, oversized hashes) must NOT enter manual review context and display as unprovided."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0"
+        )
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            keeper_address="0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+            dry_run=True
+        )
+
+        invalid_hashes = [
+            "0x1234",
+            "0x",
+            "0x" + "1" * 63,
+            "0x" + "g" * 64,
+            "0x" + "Z" * 64,
+            "0x" + "a" * 65,
+            "0x" + "f" * 128,
+            "not_a_hash_at_all",
+            None,
+            12345678
+        ]
+
+        for bad_hash in invalid_hashes:
+            captured_alerts = []
+            bot.alert = lambda msg: captured_alerts.append(msg)
+            bot.lock_for_manual_review(reason="test invalid hash", nonce=10, func_name="test_func", tx_hash=bad_hash)
+            self.assertIsNone(bot.manual_review_context["tx_hash"], f"Expected None for invalid hash {bad_hash}")
+            all_alerts = " \n ".join(captured_alerts)
+            self.assertIn("None (Broadcast unconfirmed / No valid hash returned)", all_alerts)
+
+    @patch("script.keeper.rpc_call")
+    def test_valid_64_hex_hash_enters_manual_review_context(self, mock_rpc):
+        """Valid 64-hex transaction hashes strictly match ^0x[0-9a-fA-F]{64}$ and enter manual review context."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0"
+        )
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            keeper_address="0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+            dry_run=True
+        )
+
+        valid_hashes = [
+            "0x" + "0" * 64,
+            "0x" + "f" * 64,
+            "0x" + "F" * 64,
+            "0x" + "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "0x" + "AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789"
+        ]
+
+        for good_hash in valid_hashes:
+            captured_alerts = []
+            bot.alert = lambda msg: captured_alerts.append(msg)
+            bot.lock_for_manual_review(reason="test valid hash", nonce=10, func_name="test_func", tx_hash=good_hash)
+            self.assertEqual(bot.manual_review_context["tx_hash"], good_hash)
+            all_alerts = " \n ".join(captured_alerts)
+            self.assertIn(f"Tx Hash:         {good_hash}", all_alerts)
+
+    @patch("script.keeper.rpc_call")
+    def test_dry_run_multi_epoch_seed_sequence_completes_without_real_broadcast(self, mock_rpc):
+        """In dry-run mode, sequential initialization of multiple epoch seeds executes completely without being misjudged as failure, returning status DRY_RUN and zero real broadcasts."""
+        calls_made = []
+        def rpc_side(url, method, params):
+            calls_made.append(method)
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_getTransactionCount":
+                return "0x1"
+            elif method == "eth_call":
+                tx_data = params[0].get("data", "")
+                if tx_data.startswith("0x"):
+                    tx_data = tx_data[2:]
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH:
+                    return hex(3)
+                elif sel == SELECTOR_LAST_SYNCED:
+                    return hex(3)
+                elif sel == SELECTOR_EPOCH_SEED:
+                    return "0x0"
+                return "0x"
+            return None
+
+        mock_rpc.side_effect = rpc_side
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            keeper_address="0x1111111111111111111111111111111111111111",
+            dry_run=True
+        )
+
+        captured_alerts = []
+        captured_simulations = []
+        bot.alert = lambda msg: captured_alerts.append(msg)
+        orig_send = bot.send_transaction
+
+        def record_send(calldata, desc, func_name=None, preflight=True):
+            res = orig_send(calldata, desc, func_name, preflight)
+            captured_simulations.append((func_name, res))
+            return res
+
+        bot.send_transaction = record_send
+
+        bot.handle_epoch_seed(cur_epoch=3, seed=0)
+
+        # 1. Must simulate all 4 steps: 0, 1, 2, 3 without early interruption
+        self.assertEqual(len(captured_simulations), 4)
+        expected_funcs = [
+            f"initEpochSeed(0, {bot.max_seed_steps})",
+            f"initEpochSeed(1, {bot.max_seed_steps})",
+            f"initEpochSeed(2, {bot.max_seed_steps})",
+            f"initEpochSeed(3, {bot.max_seed_steps})"
+        ]
+        simulated_funcs = [s[0] for s in captured_simulations]
+        self.assertEqual(simulated_funcs, expected_funcs)
+
+        # 2. None of the steps should trigger stopping alerts
+        stop_alerts = [a for a in captured_alerts if "Stopping seed initialization sequence" in a]
+        self.assertEqual(len(stop_alerts), 0)
+
+        # 3. Dry-run TxResult properties must be explicit:
+        for _, res in captured_simulations:
+            self.assertEqual(res.status, TxExecutionStatus.DRY_RUN)
+            self.assertTrue(res.is_dry_run)
+            self.assertFalse(res.is_confirmed_success)
+            self.assertFalse(bool(res))
+            self.assertTrue(res.get("dry_run"))
+
+        # 4. Zero real broadcasts
+        self.assertNotIn("eth_sendRawTransaction", calls_made)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_locked_bot_subsequent_send_transaction_zero_new_broadcasts(self, mock_subproc, mock_rpc):
+        """Once locked for manual review, any subsequent call to send_transaction immediately refuses with UNCERTAIN and zero new broadcasts."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.return_value = MagicMock(returncode=0, stdout=fake_addr + "\n", stderr="")
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            max_retries=1
+        )
+
+        bot.locked_for_manual_review = True
+        bot.manual_review_context = {
+            "chain_id": 97,
+            "signer_address": fake_addr,
+            "target_contract": "0x420382a0f874c1F120621f847d81581e8737504e",
+            "nonce": 5,
+            "function_name": "previous_failed_action",
+            "tx_hash": None
+        }
+
+        mock_subproc.reset_mock()
+        mock_rpc.reset_mock()
+
+        res = bot.send_transaction("0xabcdef", "attempt_while_locked", preflight=False)
+
+        self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+        self.assertEqual(res.error, "Keeper locked pending manual review")
+        mock_subproc.assert_not_called()
+        for call_args in mock_rpc.call_args_list:
+            self.assertNotEqual(call_args[0][1], "eth_sendRawTransaction")
+
 
 if __name__ == "__main__":
     unittest.main()
