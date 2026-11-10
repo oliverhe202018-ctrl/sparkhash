@@ -5,7 +5,7 @@
     "updated_at": "2026-11-08",
     "description": "链上分级监控阈值配置与应急响应矩阵 (紧急 / 行动 / 观察)，已对齐最小样本保护、出资聚类降级与新增治理规则",
     "governance": {
-      "timelock_controller": "0x75F344F2c5a79d945D873Edbdccf67e61e56C9de",
+      "timelock_controller": "0x038f2377A32581Dc3aa8d9f18386619cf72C832e",
       "guardian_multisig": "0x8E9D51118C70906dE13E2FED7787B056b9268358",
       "timelock_delay_hours": "待定，按 24 到 48 小时估计",
       "guardian_response_time": "immediate (seconds to minutes, no delay)"

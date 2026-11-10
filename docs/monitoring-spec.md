@@ -20,10 +20,10 @@
 
 | 合约实体 | 标准角色 | 测试网部署代理地址 | 源码路径 | 核心职责 |
 | :--- | :--- | :--- | :--- | :--- |
-| **Miner (Proxy)** | 业务代理入口 | `0x420382a0f874c1F120621f847d81581e8737504e` | `src/MinerV1.sol` | PoW 份额验证、权重累加、轮次结算、难度自适应与奖励 Claim |
-| **StakeVault** | 矿工质押金库 | `0x04aDD681D11F4af72D44BD8cCc6Ee5d12801A1a7` | `src/StakeVault.sol` | 矿工 0.01 BNB 质押管理、资格判定与 48 轮冷却退出 |
-| **Token (TTK)** | ERC20 代币 | `0x2Ec162EF329F3C7b202B14F9DAb2877cFC922c29` | `src/Token.sol` | 10 亿总量硬顶、9 亿挖矿上限铸币，仅限 Miner 代理铸造 |
-| **TimelockController** | 治理时间锁 | `0x75F344F2c5a79d945D873Edbdccf67e61e56C9de` | OpenZeppelin | 系统最高权限实体，所有参数调整均需排期延迟生效 |
+| **Miner (Proxy)** | 业务代理入口 | `0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf` | `src/MinerV1.sol` | PoW 份额验证、权重累加、轮次结算、难度自适应与奖励 Claim |
+| **StakeVault** | 矿工质押金库 | `0x40b92431de886Ea46117407c8f7123a31FB3F744` | `src/StakeVault.sol` | 矿工 0.01 BNB 质押管理、资格判定与 48 轮冷却退出 |
+| **Token (TTK)** | ERC20 代币 | `0x4ca603774D8D3750481007683ce44C7d4c9b2C8d` | `src/Token.sol` | 10 亿总量硬顶、9 亿挖矿上限铸币，仅限 Miner 代理铸造 |
+| **TimelockController** | 治理时间锁 | `0x038f2377A32581Dc3aa8d9f18386619cf72C832e` | OpenZeppelin | 系统最高权限实体，所有参数调整均需排期延迟生效 |
 | **Guardian Safe** | 应急守护多签 | `0x8E9D51118C70906dE13E2FED7787B056b9268358` | Gnosis Safe | 突发事故秒级熔断暂停权 |
 
 ---
@@ -176,7 +176,7 @@
 
 ### 3.10 新增质押地址数及出资来源聚类 (New Stakers & Funding Source Clustering)
 - **链上来源**:
-  - 合约: `StakeVault` (`0x04aDD681D11F4af72D44BD8cCc6Ee5d12801A1a7`)
+  - 合约: `StakeVault` (`0x40b92431de886Ea46117407c8f7123a31FB3F744`)
   - 事件: `StakeVault.Deposited(address indexed u, uint256 epoch, uint256 amount)`
     - Topic0: `0x73a19dd210f1a7f902193214c0ee91dd35ee5b4d920cba8d519eca65a7b488ca`
   - 交易调用源: `eth_getTransactionByHash` 获取交易 `from` 字段或资金前序转账源。

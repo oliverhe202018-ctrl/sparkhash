@@ -1,3 +1,5 @@
+> **说明**：本文件是 RC1 的历史记录，地址与 START 已被 RC2 取代，当前有效部署见 docs/deployment-bsc-testnet-rc2.md。
+
 # PoolCoin BSC 测试网 (chainId: 97) 首次部署记录
 
 ## 1. 部署基本信息与合约地址
