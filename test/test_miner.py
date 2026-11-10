@@ -108,5 +108,178 @@ class TestMinerSeedBackfillAndJitter(unittest.TestCase):
         self.assertEqual(miner_gpu.DEFAULT_EASIEST_TARGET, 1 << 224)
         self.assertEqual(miner_gpu.DEFAULT_HARDEST_TARGET, 1 << 221)
 
+class TestMinerDynamicVaultAndStakeEligibility(unittest.TestCase):
+    """
+    Offline regression tests for dynamic StakeVault resolution and eligibility checks in miner.py.
+    Fully mocked: no real network, no private keys, no real transactions.
+    """
+    MINER_PROXY_DEFAULT = miner.DEFAULT_MINER_CONTRACT
+    MINER_PROXY_CUSTOM = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
+    VAULT_NON_DEFAULT = "0xBaDC0de000000000000000000000000000000002"
+    MINER_ADDR = "0x2e9e19f7F1D3a2b01ba5BbA7c37E58398568d82c"
+
+    def _encode_address_ret(self, addr_hex: str) -> str:
+        clean = addr_hex.lower().replace("0x", "")
+        return "0" * 24 + clean
+
+    def _encode_status_ret(self, active: bool, since: int) -> str:
+        w0 = (1 if active else 0).to_bytes(32, "big").hex()
+        w1 = since.to_bytes(32, "big").hex()
+        return w0 + w1
+
+    def test_dynamic_vault_resolution_non_default_address(self):
+        """1. When vault() returns non-default address, status query is sent to that address, never to DEFAULT_VAULT_CONTRACT."""
+        calls = []
+
+        def mock_eth_call(rpc_url, to, data):
+            calls.append((to.lower(), data))
+            if to.lower() == self.MINER_PROXY_CUSTOM.lower() and data == miner.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_NON_DEFAULT)
+            if to.lower() == self.VAULT_NON_DEFAULT.lower() and data.startswith(miner.SELECTOR_STATUS):
+                return self._encode_status_ret(active=True, since=0)
+            return ""
+
+        with patch("script.miner.eth_call", side_effect=mock_eth_call):
+            vault_res, active, since = miner.verify_stake(
+                "http://mock-rpc", self.MINER_PROXY_CUSTOM, self.MINER_ADDR, cur_epoch=1
+            )
+            self.assertEqual(vault_res.lower(), self.VAULT_NON_DEFAULT.lower())
+            self.assertTrue(active)
+            self.assertEqual(since, 0)
+
+            queried_addresses = [c[0] for c in calls]
+            self.assertIn(self.MINER_PROXY_CUSTOM.lower(), queried_addresses)
+            self.assertIn(self.VAULT_NON_DEFAULT.lower(), queried_addresses)
+            self.assertNotIn(miner.DEFAULT_VAULT_CONTRACT.lower(), queried_addresses)
+
+    def test_vault_call_failure_aborts_without_fallback(self):
+        """2. When vault() call fails, returns empty, or returns zero address, it raises RuntimeError and never falls back."""
+        # 2a. RPC call error / exception
+        with patch("script.miner.eth_call", side_effect=Exception("RPC timeout")):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.get_miner_vault("http://mock-rpc", self.MINER_PROXY_CUSTOM)
+            self.assertIn("RPC call failed while querying vault()", str(ctx.exception))
+
+        # 2b. Returns empty / None
+        for empty_val in ["", None, "0x"]:
+            with patch("script.miner.eth_call", return_value=empty_val):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner.get_miner_vault("http://mock-rpc", self.MINER_PROXY_CUSTOM)
+                self.assertTrue("empty response" in str(ctx.exception) or "malformed ABI" in str(ctx.exception))
+
+        # 2c. Returns zero address
+        zero_addr_abi = "0x" + "0" * 64
+        with patch("script.miner.eth_call", return_value=zero_addr_abi):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.get_miner_vault("http://mock-rpc", self.MINER_PROXY_CUSTOM)
+            self.assertIn("zero address", str(ctx.exception))
+
+        # 2d. Malformed length
+        with patch("script.miner.eth_call", return_value="0x1234"):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.get_miner_vault("http://mock-rpc", self.MINER_PROXY_CUSTOM)
+            self.assertIn("malformed ABI data length", str(ctx.exception))
+
+        # 2e. Non-hex characters
+        bad_hex = "0" * 24 + "zz" + self.VAULT_NON_DEFAULT[4:].lower()
+        with patch("script.miner.eth_call", return_value=bad_hex):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.get_miner_vault("http://mock-rpc", self.MINER_PROXY_CUSTOM)
+            self.assertIn("invalid hex encoding", str(ctx.exception))
+
+        # 2f. Non-zero high 12 bytes
+        bad_high = "0" * 22 + "01" + self.VAULT_NON_DEFAULT[2:].lower()
+        with patch("script.miner.eth_call", return_value=bad_high):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.get_miner_vault("http://mock-rpc", self.MINER_PROXY_CUSTOM)
+            self.assertIn("high 12 bytes are non-zero", str(ctx.exception))
+
+    def test_default_path_normal_behavior(self):
+        """3. Default path behaves normally when miner contract and vault return valid responses."""
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner.SELECTOR_VAULT:
+                return self._encode_address_ret(miner.DEFAULT_VAULT_CONTRACT)
+            if data.startswith(miner.SELECTOR_STATUS):
+                return self._encode_status_ret(active=True, since=0)
+            return ""
+
+        with patch("script.miner.eth_call", side_effect=mock_eth_call):
+            vault, active, since = miner.verify_stake(
+                "http://mock-rpc", miner.DEFAULT_MINER_CONTRACT, self.MINER_ADDR, cur_epoch=1
+            )
+            self.assertTrue(active)
+            self.assertEqual(since, 0)
+            self.assertEqual(vault.lower(), miner.DEFAULT_VAULT_CONTRACT.lower())
+
+    def test_not_staked_and_warmup_errors(self):
+        """4. Inactive stake or insufficient warmup raises RuntimeError."""
+        # Inactive stake
+        def mock_inactive(rpc_url, to, data):
+            if data == miner.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_NON_DEFAULT)
+            if data.startswith(miner.SELECTOR_STATUS):
+                return self._encode_status_ret(active=False, since=0)
+            return ""
+
+        with patch("script.miner.eth_call", side_effect=mock_inactive):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.verify_stake("http://mock-rpc", self.MINER_PROXY_CUSTOM, self.MINER_ADDR, cur_epoch=1)
+            self.assertIn("does not have active stake", str(ctx.exception))
+
+        # Warmup insufficient (deposited in epoch 2, current epoch is 2; needs epoch >= 3)
+        def mock_warmup(rpc_url, to, data):
+            if data == miner.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_NON_DEFAULT)
+            if data.startswith(miner.SELECTOR_STATUS):
+                return self._encode_status_ret(active=True, since=2)
+            return ""
+
+        with patch("script.miner.eth_call", side_effect=mock_warmup):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.verify_stake("http://mock-rpc", self.MINER_PROXY_CUSTOM, self.MINER_ADDR, cur_epoch=2)
+            self.assertIn("warmup requires epoch >= 3", str(ctx.exception))
+
+    def test_mine_lifecycle_aborts_on_failed_stake_check(self):
+        """5. mine() lifecycle invokes verify_stake using passed args.miner_contract and terminates on failure."""
+        args = MagicMock()
+        args.miner = self.MINER_ADDR
+        args.miner_contract = self.MINER_PROXY_CUSTOM
+        args.epoch = 1
+        args.rpc = "http://mock-rpc"
+        args.skip_stake_check = False
+
+        with patch("script.miner.verify_chain_id", return_value=97), \
+             patch("script.miner.verify_stake", side_effect=RuntimeError("Stake check failed: no stake")) as mock_vs:
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.mine(args)
+            self.assertIn("Stake check failed: no stake", str(ctx.exception))
+            mock_vs.assert_called_once_with("http://mock-rpc", self.MINER_PROXY_CUSTOM, miner.to_checksum_address(self.MINER_ADDR), 1)
+
+    def test_mine_lifecycle_skips_stake_check_when_flag_set(self):
+        """6. mine() lifecycle skips verify_stake when skip_stake_check is True."""
+        class DummyArgs:
+            miner = self.MINER_ADDR
+            miner_contract = self.MINER_PROXY_CUSTOM
+            rpc = "http://mock-rpc"
+            epoch = 1
+            skip_stake_check = True
+            k = 0
+            seed = "0x" + "12" * 32
+            target = hex(1 << 224)
+            difficulty_bits = 32
+            start_nonce = 0
+            out = None
+            batch_size = 1024
+            threads = 1
+
+        with patch("script.miner.verify_chain_id", return_value=97), \
+             patch("script.miner.verify_stake") as mock_vs, \
+             patch("script.miner.mp.Process", side_effect=KeyboardInterrupt):
+            try:
+                miner.mine(DummyArgs())
+            except KeyboardInterrupt:
+                pass
+            mock_vs.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()
