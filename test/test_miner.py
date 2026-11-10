@@ -51,9 +51,12 @@ class TestMinerSeedBackfillAndJitter(unittest.TestCase):
         self.assertEqual(status.SELECTOR_INIT_EPOCH_SEED, "0xd9d9c33c")
         self.assertEqual(status.SEL_UNALLOCATED_GAP, "0xca6875f7")
 
-    def test_monitor_script_reward_claimed_parsing(self):
+    def test_monitor_script_reward_claimed_topic(self):
         self.assertEqual(monitor.TOPIC_REWARD_CLAIMED, "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a")
         self.assertFalse(hasattr(monitor, "TOPIC_CLAIMED"))
+
+    def test_status_script_reward_claimed_parsing(self):
+        self.assertEqual(status.EVENT_REWARD_CLAIMED_TOPIC, "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a")
 
         # Test 4-parameter RewardClaimed log parsing
         miner_addr = "0x1111111111111111111111111111111111111111"
@@ -64,10 +67,10 @@ class TestMinerSeedBackfillAndJitter(unittest.TestCase):
         topic2 = hex(epoch)
         data = "0x" + hex(claimed_amt)[2:].zfill(64) + hex(overflow)[2:].zfill(64)
         mock_log = {
-            "topics": [monitor.TOPIC_REWARD_CLAIMED, topic1, topic2],
+            "topics": [status.EVENT_REWARD_CLAIMED_TOPIC, topic1, topic2],
             "data": data
         }
-        miner_out, epoch_out, amt_out, overflow_out = monitor.parse_reward_claimed(mock_log)
+        miner_out, epoch_out, amt_out, overflow_out = status.parse_reward_claimed(mock_log)
         self.assertEqual(miner_out, miner_addr.lower())
         self.assertEqual(epoch_out, epoch)
         self.assertEqual(amt_out, claimed_amt)
