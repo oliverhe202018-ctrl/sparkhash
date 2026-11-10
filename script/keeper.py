@@ -965,17 +965,11 @@ class KeeperBot:
             err_msg = sanitize_text(format_exception_safe(e), sensitive_values=sensitive)
             self.log("WARN", f"Failed to retrieve chain_id for manual review: {err_msg}")
             chain_id = "Unknown"
-        except BaseException as e:
-            err_msg = sanitize_text(format_exception_safe(e), sensitive_values=sensitive)
-            self.log("WARN", f"Failed to retrieve chain_id for manual review: {err_msg}")
-            chain_id = "Unknown"
 
         signer = "Unknown"
         try:
             signer = self.keeper_address or "Unknown"
         except (Exception, SystemExit):
-            signer = "Unknown"
-        except BaseException:
             signer = "Unknown"
 
         target = "Unknown"
@@ -983,16 +977,12 @@ class KeeperBot:
             target = to_checksum_address(self.miner) if self.miner else "Unknown"
         except (Exception, SystemExit):
             target = "Unknown"
-        except BaseException:
-            target = "Unknown"
 
         clean_hash = None
         try:
             if tx_hash and isinstance(tx_hash, str) and re.match(r"^0x[0-9a-fA-F]{64}$", tx_hash):
                 clean_hash = tx_hash
         except (Exception, SystemExit):
-            clean_hash = None
-        except BaseException:
             clean_hash = None
 
         self.manual_review_context = {
@@ -1008,8 +998,6 @@ class KeeperBot:
             clean_reason = sanitize_text(reason, sensitive_values=sensitive)
         except (Exception, SystemExit):
             clean_reason = "Transaction outcome uncertain"
-        except BaseException:
-            clean_reason = "Transaction outcome uncertain"
 
         try:
             self.alert("=================================================================")
@@ -1024,8 +1012,6 @@ class KeeperBot:
             self.alert(f"  Tx Hash:         {clean_hash or 'None (Broadcast unconfirmed / No valid hash returned)'}")
             self.alert("=================================================================")
         except (Exception, SystemExit):
-            pass
-        except BaseException:
             pass
 
     def is_receipt_successful(self, receipt):

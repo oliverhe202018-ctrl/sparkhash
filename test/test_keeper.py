@@ -2473,6 +2473,28 @@ class TestManualReviewLockAndDryRunFixes(unittest.TestCase):
         self.assertIn("Chain ID:        Unknown", all_alerts)
 
     @patch("script.keeper.rpc_call")
+    def test_keyboard_interrupt_during_manual_review_lock_is_not_swallowed(self, mock_rpc):
+        """KeyboardInterrupt occurring during manual review locking must NOT be swallowed, while the lock flag is retained on the first line."""
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0"
+        )
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            keeper_address="0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+            dry_run=True
+        )
+        self.assertFalse(bot.locked_for_manual_review)
+
+        bot.get_chain_id = MagicMock(side_effect=KeyboardInterrupt("user interrupt"))
+        with self.assertRaises(KeyboardInterrupt):
+            bot.lock_for_manual_review(reason="test interrupt", nonce=5, func_name="test_func")
+
+        self.assertTrue(bot.locked_for_manual_review)
+
+    @patch("script.keeper.rpc_call")
     def test_invalid_hashes_rejected_from_manual_review_context(self, mock_rpc):
         """Invalid hashes (short strings, non-hex characters, oversized hashes) must NOT enter manual review context and display as unprovided."""
         mock_rpc.side_effect = lambda url, method, params: (
