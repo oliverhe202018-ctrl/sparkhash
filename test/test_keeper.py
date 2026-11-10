@@ -41,7 +41,8 @@ from script.keeper import (
     SELECTOR_INIT_EPOCH_SEED,
     SELECTOR_SYNC,
     DEFAULT_MIN_GAS_PRICE_GWEI,
-    DEFAULT_GAS_MULTIPLIER
+    DEFAULT_GAS_MULTIPLIER,
+    MAX_SEED_STEPS
 )
 
 
@@ -305,7 +306,9 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                 elif sel == SELECTOR_LAST_SYNCED:
                     return "0x3" # lastSynced = 3 (no lag)
                 elif sel == SELECTOR_EPOCH_SEED:
-                    # All seeds 0..3 uninitialized (return 0)
+                    e = int(tx_data[8:72], 16) if len(tx_data) >= 72 else 0
+                    if confirmed_receipts.get(str(e)):
+                        return confirmed_receipts[str(e)]
                     return "0x0000000000000000000000000000000000000000000000000000000000000000"
                 elif sel == SELECTOR_INIT_EPOCH_SEED:
                     # Preflight check simulation
@@ -316,6 +319,7 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
             elif method == "eth_sendRawTransaction":
                 tx_hash = f"0x{'b' * 60}{len(broadcasted_txs):04x}"
                 broadcasted_txs.append({"raw": params[0], "hash": tx_hash})
+                confirmed_receipts["3"] = "0x123456"
                 return tx_hash
             elif method == "eth_getTransactionReceipt":
                 tx_hash = params[0]
@@ -335,13 +339,12 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
 
         bot.step()
 
-        # Exactly 4 transactions must have been sent
-        self.assertEqual(len(broadcasted_txs), 4)
+        # Exactly 1 batch transaction sent
+        self.assertEqual(len(broadcasted_txs), 1)
 
-        # Preflight must have been called for 0, 1, 2, 3 in order
-        self.assertEqual(preflight_calls, [0, 1, 2, 3])
+        # Preflight called for target 3
+        self.assertEqual(preflight_calls, [3])
 
-        # Decode raw transactions and verify sequential order, calldata and incrementing nonce
         nonces = []
         target_epochs = []
         for i, tx_info in enumerate(broadcasted_txs):
@@ -351,18 +354,14 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
             calldata = decoded[5].hex()
             nonces.append(nonce)
 
-            # Function selector must be initEpochSeed (0e2a5ea2)
             self.assertTrue(calldata.startswith(SELECTOR_INIT_EPOCH_SEED))
             epoch_arg = int(calldata[8:72], 16)
             steps_arg = int(calldata[72:136], 16)
             self.assertEqual(steps_arg, 24)
             target_epochs.append(epoch_arg)
 
-        # Order must be strictly 0, 1, 2, 3
-        self.assertEqual(target_epochs, [0, 1, 2, 3])
-
-        # Nonces must strictly increment: e.g. 10, 11, 12, 13
-        self.assertEqual(nonces, [10, 11, 12, 13])
+        self.assertEqual(target_epochs, [3])
+        self.assertEqual(nonces, [10])
 
     @patch("time.sleep")
     @patch("script.keeper.rpc_call")
@@ -403,8 +402,8 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                 elif sel == SELECTOR_INIT_EPOCH_SEED:
                     target_epoch = int(tx_data[8:72], 16)
                     preflight_calls.append(target_epoch)
-                    if target_epoch == 2:
-                        # Preflight for epoch 2 fails with PrevSeedNotInitialized (0x4105720d)
+                    if target_epoch == 3:
+                        # Preflight for epoch 3 fails with PrevSeedNotInitialized (0x4105720d)
                         raise RuntimeError("RPC Error (eth_call): {'code': 3, 'data': '0x4105720d', 'message': 'execution reverted: PrevSeedNotInitialized()'}")
                     return "0x"
                 return "0x"
@@ -430,11 +429,11 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
         with patch.object(bot, "alert") as mock_alert:
             bot.step()
 
-            # Preflight was called for 0, 1, and 2 (stopped before 3)
-            self.assertEqual(preflight_calls, [0, 1, 2])
+            # Preflight was called for 3
+            self.assertEqual(preflight_calls, [3])
 
-            # Only transactions 0 and 1 were broadcast! Epoch 2 and 3 were never broadcast!
-            self.assertEqual(len(broadcasted_txs), 2)
+            # Zero transactions broadcast due to preflight revert
+            self.assertEqual(len(broadcasted_txs), 0)
 
             # Check that decoded error name PrevSeedNotInitialized was alerted
             alert_msgs = [call[0][0] for call in mock_alert.call_args_list]
@@ -485,11 +484,8 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                 return tx_hash
             elif method == "eth_getTransactionReceipt":
                 tx_hash = params[0]
-                if tx_hash == f"0x{'d' * 60}0000":
-                    return {"blockNumber": "0x100", "gasUsed": "0x12000", "status": "0x1"}
-                elif tx_hash == f"0x{'d' * 60}0001":
-                    # Revert on chain
-                    return {"blockNumber": "0x101", "gasUsed": "0x5000", "status": "0x0"}
+                # Revert on chain
+                return {"blockNumber": "0x101", "gasUsed": "0x5000", "status": "0x0"}
             return None
 
         mock_rpc.side_effect = rpc_side_effect
@@ -506,8 +502,8 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
         with patch.object(bot, "alert") as mock_alert:
             bot.step()
 
-            # Epoch 0 succeeded, Epoch 1 reverted; Epoch 2 and 3 were never broadcast!
-            self.assertEqual(len(broadcasted_txs), 2)
+            # Tx reverted on chain; halted immediately
+            self.assertEqual(len(broadcasted_txs), 1)
             alert_msgs = [call[0][0] for call in mock_alert.call_args_list]
             combined_alerts = " ".join(alert_msgs)
             self.assertIn("REVERTED", combined_alerts)
@@ -2612,12 +2608,9 @@ class TestManualReviewLockAndDryRunFixes(unittest.TestCase):
 
         bot.handle_epoch_seed(cur_epoch=3, seed=0)
 
-        # 1. Must simulate all 4 steps: 0, 1, 2, 3 without early interruption
-        self.assertEqual(len(captured_simulations), 4)
+        # 1. Must simulate batch call initEpochSeed(3, 24) without early interruption
+        self.assertEqual(len(captured_simulations), 1)
         expected_funcs = [
-            f"initEpochSeed(0, {bot.max_seed_steps})",
-            f"initEpochSeed(1, {bot.max_seed_steps})",
-            f"initEpochSeed(2, {bot.max_seed_steps})",
             f"initEpochSeed(3, {bot.max_seed_steps})"
         ]
         simulated_funcs = [s[0] for s in captured_simulations]
@@ -2680,6 +2673,421 @@ class TestManualReviewLockAndDryRunFixes(unittest.TestCase):
         mock_subproc.assert_not_called()
         for call_args in mock_rpc.call_args_list:
             self.assertNotEqual(call_args[0][1], "eth_sendRawTransaction")
+
+
+class TestKeeperEpochSeedBatching(unittest.TestCase):
+    @patch("time.sleep")
+    @patch("script.keeper.rpc_call")
+    def test_batch_seed_lag_15_max_steps_24_sends_single_tx(self, mock_rpc, mock_sleep):
+        """Lag 15 epochs (min_e=0, cur_epoch=14), max_seed_steps=24: sends exactly 1 batch transaction."""
+        from eth_account import Account
+        test_account = Account.create()
+        test_key = test_account.key.hex()
+
+        broadcasted_txs = []
+        cur_epoch = 14
+        seeds = {e: 0 for e in range(cur_epoch + 1)}
+
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_getTransactionCount":
+                return "0x1"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_estimateGas":
+                return "0x186a0"
+            elif method == "eth_call":
+                tx_data = params[0].get("data", "")
+                if tx_data.startswith("0x"):
+                    tx_data = tx_data[2:]
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_LAST_SYNCED:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_EPOCH_SEED:
+                    e = int(tx_data[8:72], 16)
+                    val = seeds.get(e, 0)
+                    return hex(val) if val != 0 else "0x0"
+                elif sel == SELECTOR_INIT_EPOCH_SEED:
+                    return "0x"
+                return "0x"
+            elif method == "eth_sendRawTransaction":
+                tx_hash = f"0x{'e' * 60}{len(broadcasted_txs):04x}"
+                broadcasted_txs.append({"raw": params[0], "hash": tx_hash})
+                for e in range(cur_epoch + 1):
+                    seeds[e] = 0xabcdef01 + e
+                return tx_hash
+            elif method == "eth_getTransactionReceipt":
+                return {"blockNumber": "0x100", "gasUsed": "0x12000", "status": "0x1"}
+            return None
+
+        mock_rpc.side_effect = rpc_side
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key=test_key,
+            dry_run=False,
+            max_seed_steps=24,
+            tx_timeout=2,
+            max_retries=1
+        )
+
+        bot.handle_epoch_seed(cur_epoch=14, seed=0)
+
+        self.assertEqual(len(broadcasted_txs), 1)
+        raw_bytes = bytes.fromhex(broadcasted_txs[0]["raw"].replace("0x", ""))
+        decoded = rlp.decode(raw_bytes)
+        calldata = decoded[5].hex()
+        self.assertTrue(calldata.startswith(SELECTOR_INIT_EPOCH_SEED))
+        target_epoch = int(calldata[8:72], 16)
+        steps = int(calldata[72:136], 16)
+        self.assertEqual(target_epoch, 14)
+        self.assertEqual(steps, 24)
+
+    @patch("time.sleep")
+    @patch("script.keeper.rpc_call")
+    def test_batch_seed_lag_30_sends_two_txs_and_rereads_state(self, mock_rpc, mock_sleep):
+        """Lag 30 epochs (min_e=0, cur_epoch=29): sends 2 transactions, re-reading state before second."""
+        from eth_account import Account
+        test_account = Account.create()
+        test_key = test_account.key.hex()
+
+        broadcasted_txs = []
+        cur_epoch = 29
+        seeds = {e: 0 for e in range(cur_epoch + 1)}
+        state_queries_after_tx1 = []
+
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_getTransactionCount":
+                return hex(10 + len(broadcasted_txs))
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_estimateGas":
+                return "0x186a0"
+            elif method == "eth_call":
+                tx_data = params[0].get("data", "")
+                if tx_data.startswith("0x"):
+                    tx_data = tx_data[2:]
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_LAST_SYNCED:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_EPOCH_SEED:
+                    e = int(tx_data[8:72], 16)
+                    val = seeds.get(e, 0)
+                    if len(broadcasted_txs) == 1:
+                        state_queries_after_tx1.append(e)
+                    return hex(val) if val != 0 else "0x0"
+                elif sel == SELECTOR_INIT_EPOCH_SEED:
+                    return "0x"
+                return "0x"
+            elif method == "eth_sendRawTransaction":
+                tx_idx = len(broadcasted_txs)
+                tx_hash = f"0x{'f' * 60}{tx_idx:04x}"
+                broadcasted_txs.append({"raw": params[0], "hash": tx_hash})
+                if tx_idx == 0:
+                    for e in range(24):
+                        seeds[e] = 0x1000 + e
+                elif tx_idx == 1:
+                    for e in range(24, 30):
+                        seeds[e] = 0x2000 + e
+                return tx_hash
+            elif method == "eth_getTransactionReceipt":
+                return {"blockNumber": "0x100", "gasUsed": "0x12000", "status": "0x1"}
+            return None
+
+        mock_rpc.side_effect = rpc_side
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key=test_key,
+            dry_run=False,
+            max_seed_steps=24,
+            tx_timeout=2,
+            max_retries=1
+        )
+
+        bot.handle_epoch_seed(cur_epoch=29, seed=0)
+
+        self.assertEqual(len(broadcasted_txs), 2)
+        self.assertGreater(len(state_queries_after_tx1), 0)
+        self.assertIn(29, state_queries_after_tx1)
+
+        for tx_info in broadcasted_txs:
+            raw_bytes = bytes.fromhex(tx_info["raw"].replace("0x", ""))
+            decoded = rlp.decode(raw_bytes)
+            calldata = decoded[5].hex()
+            self.assertTrue(calldata.startswith(SELECTOR_INIT_EPOCH_SEED))
+            self.assertEqual(int(calldata[8:72], 16), 29)
+            self.assertEqual(int(calldata[72:136], 16), 24)
+
+    @patch("time.sleep")
+    @patch("script.keeper.rpc_call")
+    def test_batch_seed_receipt_success_state_not_advanced_halts(self, mock_rpc, mock_sleep):
+        """When transaction receipt confirms success but on-chain state does not advance, bot alerts and halts."""
+        from eth_account import Account
+        test_account = Account.create()
+        test_key = test_account.key.hex()
+
+        broadcasted_txs = []
+        cur_epoch = 29
+
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_getTransactionCount":
+                return "0x1"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_estimateGas":
+                return "0x186a0"
+            elif method == "eth_call":
+                tx_data = params[0].get("data", "")
+                if tx_data.startswith("0x"):
+                    tx_data = tx_data[2:]
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_LAST_SYNCED:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_EPOCH_SEED:
+                    return "0x0"
+                elif sel == SELECTOR_INIT_EPOCH_SEED:
+                    return "0x"
+                return "0x"
+            elif method == "eth_sendRawTransaction":
+                tx_hash = f"0x{'a' * 60}{len(broadcasted_txs):04x}"
+                broadcasted_txs.append({"raw": params[0], "hash": tx_hash})
+                return tx_hash
+            elif method == "eth_getTransactionReceipt":
+                return {"blockNumber": "0x100", "gasUsed": "0x12000", "status": "0x1"}
+            return None
+
+        mock_rpc.side_effect = rpc_side
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key=test_key,
+            dry_run=False,
+            max_seed_steps=24,
+            tx_timeout=2,
+            max_retries=1
+        )
+
+        captured_alerts = []
+        bot.alert = lambda msg: captured_alerts.append(msg)
+
+        bot.handle_epoch_seed(cur_epoch=29, seed=0)
+
+        self.assertEqual(len(broadcasted_txs), 1)
+        halt_alerts = [a for a in captured_alerts if "did not advance" in a]
+        self.assertEqual(len(halt_alerts), 1)
+
+    @patch("time.sleep")
+    @patch("script.keeper.rpc_call")
+    def test_batch_seed_uncertain_outcome_locks_and_zero_subsequent_broadcasts(self, mock_rpc, mock_sleep):
+        """When transaction triggers UNCERTAIN outcome during batch seed initialization, keeper locks and refuses further broadcasts."""
+        from eth_account import Account
+        test_account = Account.create()
+        test_key = test_account.key.hex()
+
+        cur_epoch = 29
+
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_getTransactionCount":
+                return "0x1"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_estimateGas":
+                return "0x186a0"
+            elif method == "eth_call":
+                tx_data = params[0].get("data", "")
+                if tx_data.startswith("0x"):
+                    tx_data = tx_data[2:]
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_LAST_SYNCED:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_EPOCH_SEED:
+                    return "0x0"
+                elif sel == SELECTOR_INIT_EPOCH_SEED:
+                    return "0x"
+                return "0x"
+            elif method == "eth_sendRawTransaction":
+                return "invalid_hash_string"
+            return None
+
+        mock_rpc.side_effect = rpc_side
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key=test_key,
+            dry_run=False,
+            max_seed_steps=24,
+            tx_timeout=2,
+            max_retries=1
+        )
+
+        bot.handle_epoch_seed(cur_epoch=29, seed=0)
+
+        self.assertTrue(bot.locked_for_manual_review)
+
+        calls_before = len(mock_rpc.call_args_list)
+        bot.step()
+        bot.send_transaction("0xabcdef", "attempt_while_locked", preflight=False)
+        for call_args in mock_rpc.call_args_list[calls_before:]:
+            self.assertNotEqual(call_args[0][1], "eth_sendRawTransaction")
+
+    @patch("script.keeper.rpc_call")
+    def test_batch_seed_dry_run_estimation_matches_expected_and_zero_broadcasts(self, mock_rpc):
+        """In dry-run mode, calculates ceil(n / max_seed_steps), logs explicit estimate, and broadcasts zero real transactions."""
+        calls_made = []
+        cur_epoch = 29
+
+        def rpc_side(url, method, params):
+            calls_made.append(method)
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_getTransactionCount":
+                return "0x1"
+            elif method == "eth_call":
+                tx_data = params[0].get("data", "")
+                if tx_data.startswith("0x"):
+                    tx_data = tx_data[2:]
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_LAST_SYNCED:
+                    return hex(cur_epoch)
+                elif sel == SELECTOR_EPOCH_SEED:
+                    return "0x0"
+                return "0x"
+            return None
+
+        mock_rpc.side_effect = rpc_side
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            keeper_address="0x1111111111111111111111111111111111111111",
+            dry_run=True,
+            max_seed_steps=24
+        )
+
+        captured_logs = []
+        bot.log = lambda level, msg: captured_logs.append((level, msg))
+
+        captured_simulations = []
+        orig_send = bot.send_transaction
+
+        def record_send(calldata, desc, func_name=None, preflight=True):
+            res = orig_send(calldata, desc, func_name, preflight)
+            captured_simulations.append((func_name, res))
+            return res
+
+        bot.send_transaction = record_send
+
+        expected_tx_count = (30 + 24 - 1) // 24
+        self.assertEqual(expected_tx_count, 2)
+
+        bot.handle_epoch_seed(cur_epoch=29, seed=0)
+
+        self.assertEqual(len(captured_simulations), expected_tx_count)
+        for func_name, res in captured_simulations:
+            self.assertEqual(func_name, "initEpochSeed(29, 24)")
+            self.assertEqual(res.status, TxExecutionStatus.DRY_RUN)
+
+        estimate_logs = [msg for lvl, msg in captured_logs if "Estimated transactions to send: 2" in msg and "simulation estimate only" in msg]
+        self.assertEqual(len(estimate_logs), 1)
+        self.assertNotIn("eth_sendRawTransaction", calls_made)
+
+    @patch("script.keeper.rpc_call")
+    def test_batch_seed_already_initialized_zero_transactions(self, mock_rpc):
+        """When seed is already initialized (passed directly or detected on-chain), zero transactions are broadcast."""
+        calls_made = []
+
+        def rpc_side(url, method, params):
+            calls_made.append(method)
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_getTransactionCount":
+                return "0x1"
+            elif method == "eth_call":
+                tx_data = params[0].get("data", "")
+                if tx_data.startswith("0x"):
+                    tx_data = tx_data[2:]
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH_SEED:
+                    return hex(0x12345678)
+                return "0x"
+            return None
+
+        mock_rpc.side_effect = rpc_side
+
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key="0x" + "1" * 64,
+            dry_run=False
+        )
+
+        with patch.object(bot, "send_transaction") as mock_send:
+            bot.handle_epoch_seed(cur_epoch=5, seed=0xabcdef)
+            mock_send.assert_not_called()
+
+            bot.handle_epoch_seed(cur_epoch=5, seed=0)
+            mock_send.assert_not_called()
+
+        self.assertNotIn("eth_sendRawTransaction", calls_made)
+
+    @patch("script.keeper.rpc_call")
+    def test_max_seed_steps_validation(self, mock_rpc):
+        """Tests that max_seed_steps is validated: capped at MAX_SEED_STEPS if > 24, and exits on <= 0."""
+        mock_rpc.side_effect = lambda url, method, params: "0x6080604052" if method == "eth_getCode" else "0x0"
+        bot = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+            max_seed_steps=50,
+            dry_run=True
+        )
+        self.assertEqual(bot.max_seed_steps, 24)
+
+        with self.assertRaises(SystemExit) as cm:
+            KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                max_seed_steps=0,
+                dry_run=True
+            )
+        self.assertEqual(cm.exception.code, 1)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ DEFAULT_MIN_GAS_PRICE_GWEI = 0.1
 DEFAULT_GAS_MULTIPLIER = 1.5
 DEFAULT_TX_TIMEOUT = 60
 DEFAULT_MAX_RETRIES = 3
+MAX_SEED_STEPS = 24
 
 # Wallet-related environment variables isolated from cast subprocesses to prevent ambient overrides
 WALLET_ENV_VARS_TO_ISOLATE = (
@@ -562,7 +563,7 @@ class KeeperBot:
                  account=None, password_file=None,
                  dry_run=True, poll_interval=15, min_gas_price_gwei=DEFAULT_MIN_GAS_PRICE_GWEI,
                  gas_multiplier=DEFAULT_GAS_MULTIPLIER, tx_timeout=DEFAULT_TX_TIMEOUT,
-                 max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=24):
+                 max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=MAX_SEED_STEPS):
         self.rpc_url = rpc_url
         self.miner = miner_address.strip().lower() if miner_address and isinstance(miner_address, str) else (miner_address or "")
         self.dry_run = dry_run
@@ -661,7 +662,17 @@ class KeeperBot:
             self.alert("Startup check failed: poll_interval must be a non-negative integer.")
             sys.exit(1)
 
-        self.max_seed_steps = max_seed_steps
+        try:
+            parsed_seed_steps = int(max_seed_steps)
+            if parsed_seed_steps <= 0:
+                raise ValueError("non-positive")
+            if parsed_seed_steps > MAX_SEED_STEPS:
+                self.log("WARN", f"max_seed_steps ({parsed_seed_steps}) exceeds contract MAX_SEED_STEPS ({MAX_SEED_STEPS}). Capping at {MAX_SEED_STEPS}.")
+                parsed_seed_steps = MAX_SEED_STEPS
+            self.max_seed_steps = parsed_seed_steps
+        except Exception:
+            self.alert("Startup check failed: max_seed_steps must be a positive integer.")
+            sys.exit(1)
         self.current_nonce = None
         self._chain_id = None
         self.current_epoch = None
@@ -854,6 +865,23 @@ class KeeperBot:
         seed_data = SELECTOR_EPOCH_SEED + encode_uint256(epoch_num)
         res_seed = eth_call(self.rpc_url, self.miner, seed_data)
         return int(res_seed, 16) if res_seed else 0
+
+    def find_earliest_uninitialized_epoch(self, target_epoch):
+        if target_epoch < 0:
+            return 0
+        if self.get_epoch_seed(0) == 0:
+            return 0
+        if self.get_epoch_seed(target_epoch) != 0:
+            return target_epoch + 1
+        low = 0
+        high = target_epoch
+        while low < high:
+            mid = (low + high) // 2
+            if self.get_epoch_seed(mid) != 0:
+                low = mid + 1
+            else:
+                high = mid
+        return low
 
     def get_epoch_state(self):
         res_epoch = eth_call(self.rpc_url, self.miner, SELECTOR_EPOCH)
@@ -1481,36 +1509,89 @@ class KeeperBot:
             self.log("OK", "Epoch " + str(cur_epoch) + " seed already initialized: " + hex(seed)[:10] + "...")
             return
 
-        # Find earliest uninitialized epoch e <= cur_epoch
-        min_e = cur_epoch
-        for e in range(cur_epoch - 1, -1, -1):
-            s = self.get_epoch_seed(e)
-            if s == 0:
-                min_e = e
-            else:
-                break
+        if self.get_epoch_seed(cur_epoch) != 0:
+            self.log("OK", "Epoch " + str(cur_epoch) + " seed already initialized on-chain. Skipping.")
+            return
+
+        min_e = self.find_earliest_uninitialized_epoch(cur_epoch)
+        if min_e > cur_epoch:
+            self.log("OK", "Epoch " + str(cur_epoch) + " seed already initialized. Skipping.")
+            return
+
+        n = cur_epoch - min_e + 1
+        if n <= 0:
+            return
+
+        max_steps = min(int(getattr(self, "max_seed_steps", MAX_SEED_STEPS)), MAX_SEED_STEPS)
+        if max_steps <= 0:
+            max_steps = MAX_SEED_STEPS
 
         if min_e == cur_epoch:
             self.log("ACTION", "Epoch " + str(cur_epoch) + " seed uninitialized (0x0). Needs initEpochSeed.")
         else:
-            self.log("ACTION", f"Epoch seeds uninitialized from {min_e} to {cur_epoch}. Initializing sequentially...")
+            self.log("ACTION", f"Epoch seeds uninitialized from {min_e} to {cur_epoch} (total: {n} epochs). Initializing in batches of up to {max_steps}...")
 
-        for e in range(min_e, cur_epoch + 1):
-            if not self.dry_run:
-                jitter = random.uniform(0.0, 3.0)
-                self.log("ACTION", f"Applying {jitter:.2f}s random jitter before sending initEpochSeed...")
-                time.sleep(jitter)
-            calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(e) + encode_uint256(self.max_seed_steps)
-            func_desc = f"initEpochSeed({e}, {self.max_seed_steps})"
+        if self.dry_run:
+            estimated_txs = (n + max_steps - 1) // max_steps
+            self.log(
+                "DRY-RUN",
+                f"Estimated transactions to send: {estimated_txs} "
+                f"(calculated via ceil({n} / {max_steps}) with max_seed_steps={max_steps}; "
+                f"simulation estimate only, on-chain state not checked)"
+            )
+            for step_idx in range(estimated_txs):
+                calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(cur_epoch) + encode_uint256(max_steps)
+                func_desc = f"initEpochSeed({cur_epoch}, {max_steps})"
+                receipt = self.send_transaction(calldata, func_desc, func_desc)
+                if receipt is None or not (receipt.get("dry_run") or self.is_receipt_successful(receipt)):
+                    self.alert(f"Failed to simulate {func_desc}.")
+                    break
+            return
+
+        max_allowed_calls = (n + max_steps - 1) // max_steps + 1
+        calls_sent = 0
+        prev_min_e = min_e
+
+        while calls_sent < max_allowed_calls:
+            if self.get_epoch_seed(cur_epoch) != 0:
+                self.log("OK", f"Epoch {cur_epoch} seed is already initialized on-chain. Skipping.")
+                break
+
+            jitter = random.uniform(0.0, 3.0)
+            self.log("ACTION", f"Applying {jitter:.2f}s random jitter before sending initEpochSeed...")
+            time.sleep(jitter)
+
+            calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(cur_epoch) + encode_uint256(max_steps)
+            func_desc = f"initEpochSeed({cur_epoch}, {max_steps})"
             receipt = self.send_transaction(calldata, func_desc, func_desc)
-            if receipt is None or not (receipt.get("dry_run") or self.is_receipt_successful(receipt)):
+            calls_sent += 1
+
+            if receipt is None or not self.is_receipt_successful(receipt):
                 self.alert(f"Failed to confirm {func_desc}. Stopping seed initialization sequence.")
                 break
-            if receipt is not None and isinstance(receipt, dict):
-                for log in receipt.get("logs", []):
+
+            if isinstance(receipt, (dict, TxResult)):
+                logs = receipt.get("receipt", {}).get("logs", []) if isinstance(receipt, TxResult) else receipt.get("logs", [])
+                for log in logs:
                     topics = log.get("topics", [])
                     if topics and topics[0].lower() == EVENT_EPOCH_SETTLED_TOPIC.lower():
                         self.log("EVENT", f"Observed EpochSettled event in tx {func_desc}")
+
+            new_cur_seed = self.get_epoch_seed(cur_epoch)
+            if new_cur_seed != 0:
+                self.log("OK", f"Epoch {cur_epoch} seed successfully initialized: {hex(new_cur_seed)[:10]}...")
+                break
+
+            new_min_e = self.find_earliest_uninitialized_epoch(cur_epoch)
+            if new_min_e <= prev_min_e:
+                self.alert(f"On-chain state did not advance after confirmed {func_desc} (earliest uninitialized still {new_min_e}, cur_epoch={cur_epoch} seed=0x0). Halting.")
+                break
+
+            self.log("ACTION", f"Epoch seed initialization progressed: earliest uninitialized epoch advanced from {prev_min_e} to {new_min_e}.")
+            prev_min_e = new_min_e
+        else:
+            if self.get_epoch_seed(cur_epoch) == 0:
+                self.alert(f"Reached maximum allowed seed initialization calls ({max_allowed_calls}) without fully initializing epoch {cur_epoch}. Halting to prevent infinite loop.")
 
     def handle_sync_lag(self, cur_epoch, last_synced):
         if last_synced < cur_epoch:
@@ -1586,6 +1667,7 @@ def main():
     parser.add_argument("--gas-multiplier", type=float, default=None, help="Gas price multiplier (default: 1.5)")
     parser.add_argument("--tx-timeout", type=int, default=None, help="Tx confirmation timeout in seconds before speedup (default: 60)")
     parser.add_argument("--max-retries", type=int, default=None, help="Max replacement retries with identical nonce (default: 3)")
+    parser.add_argument("--max-seed-steps", type=int, default=None, help=f"Max uninitialized epochs to process per initEpochSeed transaction (default: {MAX_SEED_STEPS}, max: {MAX_SEED_STEPS})")
     args = parser.parse_args()
 
     if args.no_env:
@@ -1701,6 +1783,11 @@ def main():
     if retries is None:
         retries = DEFAULT_MAX_RETRIES
 
+    raw_max_seed_steps = args.max_seed_steps if args.max_seed_steps is not None else get_cfg("KEEPER_MAX_SEED_STEPS")
+    seed_steps = parse_numeric(raw_max_seed_steps, int, "--max-seed-steps / KEEPER_MAX_SEED_STEPS")
+    if seed_steps is None:
+        seed_steps = MAX_SEED_STEPS
+
     raw_interval = args.interval if args.interval is not None else get_cfg("KEEPER_POLL_INTERVAL")
     interval = parse_numeric(raw_interval, int, "--interval / KEEPER_POLL_INTERVAL")
     if interval is None:
@@ -1718,7 +1805,8 @@ def main():
         min_gas_price_gwei=min_floor,
         gas_multiplier=multiplier,
         tx_timeout=timeout,
-        max_retries=retries
+        max_retries=retries,
+        max_seed_steps=seed_steps
     )
 
     if args.once:
