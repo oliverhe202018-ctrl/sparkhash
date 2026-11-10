@@ -35,7 +35,7 @@ from eth_abi import encode, decode
 from eth_hash.auto import keccak
 
 REQUIRED_CHAIN_ID = 97
-DEFAULT_MINER_CONTRACT = "0x420382a0f874c1F120621f847d81581e8737504e"
+DEFAULT_MINER_CONTRACT = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
 DEFAULT_RPC_URLS = [
     "https://bsc-testnet-rpc.publicnode.com",
     "https://data-seed-prebsc-1-s1.binance.org:8545",

@@ -285,7 +285,7 @@ class TestDynamicVaultAndStakeEligibility(unittest.TestCase):
     Fully mocked: no real RPC, no real GPU, no transactions.
     """
     MINER_PROXY_A = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
-    VAULT_B = "0x40b92431de886Ea46117407c8f7123a31FB3F744"
+    VAULT_B = "0xBaDC0de000000000000000000000000000000002"
     MINER_ADDR = "0x2e9e19f7F1D3a2b01ba5BbA7c37E58398568d82c"
 
     def _encode_address_ret(self, addr_hex: str) -> str:
