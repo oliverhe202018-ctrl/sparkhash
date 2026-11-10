@@ -1,4 +1,6 @@
-﻿# PoolCoin BSC 测试网 (chainId: 97) 全流程运行与验证报告
+﻿> **说明**：本文件是 RC1 的历史记录，地址与 START 已被 RC2 取代，当前有效部署见 docs/deployment-bsc-testnet-rc2.md。
+
+# PoolCoin BSC 测试网 (chainId: 97) 全流程运行与验证报告
 
 本报告完整整理记录 PoolCoin 协议在 BSC 测试网（chainId: 97）从合约部署、部署后断言核验、Keeper 运维同步、CPU/GPU 挖矿实测与正确性测试、链上真实提交到奖励结算领取的全链路链上数据与命令回执，并总结列出主网前关键已知问题与技术待办。所有内容均严格来自链上交易回执与本地测试输出，逐项附上交易哈希或命令来源。
 
