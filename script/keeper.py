@@ -414,6 +414,21 @@ class RpcError(RuntimeError):
         super().__init__("RPC Error (" + method + "): " + sanitize_text(str(error_obj)))
 
 
+class NonceError(RuntimeError):
+    """Base exception for live nonce resolution and consistency failures."""
+    pass
+
+
+class NonceQueryError(NonceError):
+    """Raised when querying or parsing on-chain pending nonce fails in live mode."""
+    pass
+
+
+class NonceDivergenceError(NonceError):
+    """Raised when cached current_nonce exceeds on-chain pending nonce in live mode."""
+    pass
+
+
 def decode_revert_error(err):
     """
     Decodes revert error from RPC error dict, Exception, or hex string.
@@ -772,24 +787,41 @@ class KeeperBot:
             self.state_manager.release_lock()
             self._domain_lock_acquired = False
 
-    def manual_unlock(self, expected_nonce=None, operator_reason=None):
-        sm = self._ensure_state_manager()
-        if not sm or not sm.domain_valid:
-            raise DomainValidationError("Cannot unlock without a valid state domain")
+    @staticmethod
+    def _parse_rpc_nonce(val: Any) -> int:
+        if val is None or isinstance(val, bool):
+            raise ValueError(f"Unparseable nonce response of type {type(val).__name__}")
+        if isinstance(val, int):
+            if val < 0:
+                raise ValueError("Negative integer nonce")
+            return val
+        if isinstance(val, str):
+            cleaned = val.strip()
+            if not cleaned:
+                raise ValueError("Empty string nonce")
+            if cleaned.startswith(("0x", "0X")):
+                if not re.match(r"^0[xX][0-9a-fA-F]+$", cleaned):
+                    raise ValueError("Malformed hexadecimal nonce")
+                return int(cleaned, 16)
+            if not re.match(r"^[0-9]+$", cleaned):
+                raise ValueError("Malformed decimal nonce")
+            return int(cleaned, 10)
+        raise ValueError(f"Unsupported nonce response type {type(val).__name__}")
 
-        onchain_snapshot = "快照不可用"
+    def _collect_unlock_onchain_snapshot(self, state_data: Optional[Dict[str, Any]] = None) -> Any:
+        sensitive = [self.password_file] if getattr(self, "password_file", None) else None
+        known_secrets = getattr(self, "_known_secrets", None)
         try:
             res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
-            latest_nonce = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
+            latest_nonce = self._parse_rpc_nonce(res_l)
             res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
-            pending_nonce = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
+            pending_nonce = self._parse_rpc_nonce(res_p)
 
             receipts_status = {}
-            st = sm.load_state() if sm else None
-            if st:
-                h_list = st.get("tx_hashes")
+            if state_data:
+                h_list = state_data.get("tx_hashes")
                 if not isinstance(h_list, list):
-                    h_single = st.get("tx_hash")
+                    h_single = state_data.get("tx_hash")
                     h_list = [h_single] if (h_single and h_single != "Unknown") else []
                 for h in h_list:
                     if h and h != "Unknown":
@@ -804,16 +836,30 @@ class KeeperBot:
                                 receipts_status[h] = "not_found_or_pending"
                         except Exception:
                             receipts_status[h] = "receipt_query_failed"
-            onchain_snapshot = {
+            return {
                 "latest_nonce": latest_nonce,
                 "pending_nonce": pending_nonce,
                 "tx_receipts": receipts_status
             }
         except Exception as snap_e:
-            self.log("WARN", f"Failed to retrieve on-chain snapshot for manual unlock: {format_exception_safe(snap_e)}")
-            onchain_snapshot = "快照不可用"
+            safe_err = sanitize_text(
+                format_exception_safe(snap_e),
+                sensitive_values=sensitive,
+                known_secrets=known_secrets,
+            )
+            self.log("WARN", f"Failed to retrieve on-chain snapshot for manual unlock: {safe_err}")
+            return "快照不可用"
 
-        result = sm.manual_unlock(expected_nonce=expected_nonce, operator_reason=operator_reason, onchain_snapshot=onchain_snapshot)
+    def manual_unlock(self, expected_nonce=None, operator_reason=None):
+        sm = self._ensure_state_manager()
+        if not sm or not sm.domain_valid:
+            raise DomainValidationError("Cannot unlock without a valid state domain")
+
+        result = sm.manual_unlock(
+            expected_nonce=expected_nonce,
+            operator_reason=operator_reason,
+            snapshot_provider=self._collect_unlock_onchain_snapshot,
+        )
         self.locked_for_manual_review = False
         self.manual_review_context = None
         return result
@@ -1029,23 +1075,81 @@ class KeeperBot:
         )
 
     def get_nonce(self):
-        """Fetches pending nonce for keeper account, or returns 0 if address unavailable."""
-        remote_nonce = 0
-        if not self.dry_run:
-            self.validate_identity(self.keeper_address)
-        if self.keeper_address:
+        """Fetches pending nonce for keeper account; enforces strict checks in live mode."""
+        if self.dry_run:
+            remote_nonce = 0
+            if self.keeper_address:
+                try:
+                    res = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
+                    if res:
+                        remote_nonce = int(res, 16) if isinstance(res, str) and res.startswith("0x") else int(res)
+                except Exception as e:
+                    self.log("WARN", f"Failed to query eth_getTransactionCount ({format_exception_safe(e)}); defaulting to 0")
+            if self.current_nonce is not None:
+                nonce = max(self.current_nonce, remote_nonce)
+            else:
+                nonce = remote_nonce
+            self.current_nonce = nonce
+            return nonce
+
+        self.validate_identity(self.keeper_address)
+        sensitive = [self.password_file] if getattr(self, "password_file", None) else None
+        known_secrets = getattr(self, "_known_secrets", None)
+
+        if not self.keeper_address:
+            msg = sanitize_text(
+                "Failed to resolve keeper address for live pending nonce query; "
+                "aborting current round without fallback to 0 or cached nonce.",
+                sensitive_values=sensitive,
+                known_secrets=known_secrets,
+            )
+            self.alert(msg)
+            raise NonceQueryError(msg)
+
+        try:
+            res = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
+            pending_nonce = self._parse_rpc_nonce(res)
+        except Exception as e:
+            err_detail = sanitize_text(
+                format_exception_safe(e),
+                sensitive_values=sensitive,
+                known_secrets=known_secrets,
+            )
+            msg = sanitize_text(
+                f"Failed to query or parse on-chain pending nonce for {self.keeper_address} ({err_detail}); "
+                "aborting current round without fallback to 0 or cached nonce.",
+                sensitive_values=sensitive,
+                known_secrets=known_secrets,
+            )
+            self.alert(msg)
+            raise NonceQueryError(msg) from e
+
+        if self.current_nonce is not None and self.current_nonce > pending_nonce:
+            latest_display = "unavailable"
             try:
-                res = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
-                if res:
-                    remote_nonce = int(res, 16) if isinstance(res, str) and res.startswith("0x") else int(res)
-            except Exception as e:
-                self.log("WARN", f"Failed to query eth_getTransactionCount ({format_exception_safe(e)}); defaulting to 0")
-        if self.current_nonce is not None:
-            nonce = max(self.current_nonce, remote_nonce)
-        else:
-            nonce = remote_nonce
-        self.current_nonce = nonce
-        return nonce
+                res_latest = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
+                latest_display = self._parse_rpc_nonce(res_latest)
+            except Exception as latest_e:
+                latest_err = sanitize_text(
+                    format_exception_safe(latest_e),
+                    sensitive_values=sensitive,
+                    known_secrets=known_secrets,
+                )
+                self.log("WARN", f"Failed to query diagnostic latest nonce for {self.keeper_address}: {latest_err}")
+
+            msg = sanitize_text(
+                f"Nonce divergence between RPC view and cached process state for {self.keeper_address}: "
+                f"latest={latest_display}, pending={pending_nonce}, cached={self.current_nonce}. "
+                "Aborting current round without using cached nonce or downgrading to on-chain nonce; "
+                "will re-evaluate next round.",
+                sensitive_values=sensitive,
+                known_secrets=known_secrets,
+            )
+            self.alert(msg)
+            raise NonceDivergenceError(msg)
+
+        self.current_nonce = pending_nonce
+        return pending_nonce
 
     def estimate_gas_limit(self, calldata, default_gas=300000):
         """Estimates gas for transaction with a safety buffer."""

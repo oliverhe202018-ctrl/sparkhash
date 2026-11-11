@@ -3,10 +3,11 @@ import hashlib
 import json
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 
 CURRENT_STATE_VERSION = 1
@@ -280,6 +281,7 @@ class KeeperStateManager:
 
         self.domain = domain
         self._lock = None
+        self._thread_lock = threading.Lock()
 
     def set_domain(self, domain: StateDomain):
         self.domain = domain
@@ -313,13 +315,17 @@ class KeeperStateManager:
     def acquire_lock(self) -> bool:
         if not self.domain_valid:
             return False
-        if self._lock is None:
-            self._lock = DomainFileLock(self.get_lock_path())
-        return self._lock.acquire()
+        with self._thread_lock:
+            if self._lock is not None and self._lock._acquired:
+                return False
+            if self._lock is None:
+                self._lock = DomainFileLock(self.get_lock_path())
+            return self._lock.acquire()
 
     def release_lock(self):
-        if self._lock:
-            self._lock.release()
+        with self._thread_lock:
+            if self._lock:
+                self._lock.release()
 
     def load_state(self) -> Optional[Dict[str, Any]]:
         """
@@ -740,11 +746,14 @@ class KeeperStateManager:
         self,
         expected_nonce: Optional[int] = None,
         operator_reason: Optional[str] = None,
-        onchain_snapshot: Optional[Any] = None
+        onchain_snapshot: Optional[Any] = None,
+        snapshot_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> Dict[str, Any]:
         """
         Executes manual unlock workflow after operator verification.
         Acquires sender/domain lock to guarantee mutual exclusion during unlock.
+        Re-reads state inside the lock, optionally collects a read-only on-chain snapshot
+        via snapshot_provider(state_data), then writes audit log and updated state.
         Does not delete state file or audit log; updates state to IDLE and preserves history.
         Writes onchain_snapshot to audit log ('快照不可用' if unavailable).
         """
@@ -777,6 +786,12 @@ class KeeperStateManager:
                 if int(expected_nonce) != int(file_nonce):
                     raise InvalidStateError(f"Expected nonce mismatch: expected {expected_nonce}, file has {file_nonce}")
 
+            snapshot_value = onchain_snapshot
+            if snapshot_provider is not None:
+                snapshot_value = snapshot_provider(state_data)
+            if snapshot_value is None:
+                snapshot_value = "快照不可用"
+
             now = datetime.now(timezone.utc).isoformat()
             audit_entry = {
                 "action": "MANUAL_UNLOCK",
@@ -788,7 +803,7 @@ class KeeperStateManager:
                 "previous_tx_hash": state_data.get("tx_hash"),
                 "previous_tx_hashes": state_data.get("tx_hashes", []),
                 "operator_reason": sanitize_state_value(operator_reason.strip()),
-                "onchain_snapshot": onchain_snapshot if onchain_snapshot is not None else "快照不可用",
+                "onchain_snapshot": snapshot_value,
                 "note": "Unlocked manually by operator affirmation after on-chain verification. Not automated cryptographic proof of on-chain confirmation."
             }
             append_audit_log(self.get_audit_path(), audit_entry)

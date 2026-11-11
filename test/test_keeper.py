@@ -86,6 +86,9 @@ from script.keeper import (
     parse_numeric,
     format_exception_safe,
     KeeperBot,
+    NonceError,
+    NonceQueryError,
+    NonceDivergenceError,
     WALLET_ENV_VARS_TO_ISOLATE,
     get_isolated_cast_env,
     main,
@@ -4083,3 +4086,416 @@ class TestKeeperReconciliationAndFaultMitigations(unittest.TestCase):
             unlock_log2 = logs2[-1]
             self.assertEqual(unlock_log2["action"], "MANUAL_UNLOCK")
             self.assertEqual(unlock_log2["onchain_snapshot"], "快照不可用")
+
+    @patch("script.keeper.time", new_callable=_FakeKeeperTime)
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_live_get_nonce_pending_failure_and_unparseable_aborts_without_state_or_lock(self, mock_subproc, mock_rpc, mock_time):
+        """Live pending nonce query failure or unparseable response aborts round before PREPARING_TO_SEND with sanitized alert and no manual lock."""
+        self.addCleanup(clear_configured_secrets)
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        sensitive_rpc = "https://rpc_user:rpc_secret_pass_999@mock-rpc.local:8545/secret_rpc_path?token=rpc_tok_888"
+        secret_pwd_file = "C:/top_secret_vault/keeper_secret.pwd"
+
+        nonce_behavior = {"mode": "raise"}
+
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            if method == "eth_chainId":
+                return "0x61"
+            if method == "eth_gasPrice":
+                return "0x5f5e100"
+            if method == "eth_call":
+                tx_data = (params[0].get("data", "") if params else "").replace("0x", "")
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH:
+                    return "0x0"
+                if sel == SELECTOR_LAST_SYNCED:
+                    return "0x0"
+                if sel == SELECTOR_EPOCH_SEED:
+                    return "0x0"
+                return "0x0"
+            if method == "eth_getTransactionCount":
+                if nonce_behavior["mode"] == "raise":
+                    raise RuntimeError(f"Connection error to {sensitive_rpc} using {secret_pwd_file}")
+                return nonce_behavior["value"]
+            if method == "eth_sendRawTransaction":
+                raise AssertionError("eth_sendRawTransaction must not be called on pending nonce failure")
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_side
+        cast_send_calls = []
+
+        def subproc_side(cmd, *args, **kwargs):
+            if "send" in cmd:
+                cast_send_calls.append(list(cmd))
+                raise AssertionError("cast send must not be invoked on pending nonce failure")
+            return MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+
+        mock_subproc.side_effect = subproc_side
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url=sensitive_rpc,
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file=secret_pwd_file,
+                dry_run=False,
+                state_dir=tmp_dir,
+            )
+            sm = bot._ensure_state_manager()
+            captured_alerts = []
+            bot.alert = lambda msg: captured_alerts.append(msg)
+
+            # Case A: RPC exception with cached current_nonce preset -> must NOT fall back to 0 or 4
+            bot.current_nonce = 4
+            nonce_behavior["mode"] = "raise"
+            with self.assertRaises(NonceQueryError) as cm:
+                bot.send_transaction("0x1234", "test_pending_exc", preflight=False)
+
+            self.assertEqual(len(cast_send_calls), 0)
+            self.assertFalse(bot.locked_for_manual_review)
+            self.assertFalse(bot._domain_lock_acquired)
+            self.assertEqual(bot.current_nonce, 4)
+            self.assertIsNone(sm.load_state())
+            self.assertFalse(os.path.exists(sm.get_state_path()))
+
+            combined_text = "\n".join(captured_alerts + [str(cm.exception)])
+            self.assertNotIn("rpc_secret_pass_999", combined_text)
+            self.assertNotIn("rpc_user", combined_text)
+            self.assertNotIn("secret_rpc_path", combined_text)
+            self.assertNotIn("rpc_tok_888", combined_text)
+            self.assertNotIn("top_secret_vault", combined_text)
+            self.assertNotIn("keeper_secret.pwd", combined_text)
+
+            # Case B: Unparseable responses -> raise NonceQueryError, no state/lock/broadcast
+            for bad_val in (None, "", "   ", "0x", "not-hex", "-1", True, False, {}, []):
+                captured_alerts.clear()
+                bot.current_nonce = 4
+                nonce_behavior["mode"] = "return"
+                nonce_behavior["value"] = bad_val
+                with self.assertRaises(NonceQueryError):
+                    bot.send_transaction("0x1234", f"test_bad_{type(bad_val).__name__}", preflight=False)
+                self.assertEqual(len(cast_send_calls), 0)
+                self.assertFalse(bot.locked_for_manual_review)
+                self.assertFalse(bot._domain_lock_acquired)
+                self.assertEqual(bot.current_nonce, 4)
+                self.assertIsNone(sm.load_state())
+
+            # Case C: step() catches NonceQueryError, aborts round without lock or state
+            captured_alerts.clear()
+            nonce_behavior["mode"] = "raise"
+            bot.step()
+            self.assertEqual(len(cast_send_calls), 0)
+            self.assertFalse(bot.locked_for_manual_review)
+            self.assertIsNone(sm.load_state())
+            self.assertTrue(len(captured_alerts) >= 1)
+            step_alerts = "\n".join(captured_alerts)
+            self.assertNotIn("rpc_secret_pass_999", step_alerts)
+            self.assertNotIn("keeper_secret.pwd", step_alerts)
+
+            # Case D: dry-run behavior remains unchanged (falls back to 0 without raising)
+            nonce_behavior["mode"] = "raise"
+            bot_dry = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                keeper_address=sender,
+                dry_run=True,
+            )
+            self.assertEqual(bot_dry.get_nonce(), 0)
+
+    @patch("script.keeper.time", new_callable=_FakeKeeperTime)
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_live_get_nonce_cached_gt_pending_aborts_and_le_pending_uses_pending(self, mock_subproc, mock_rpc, mock_time):
+        """Cached current_nonce > pending aborts round with latest/pending/cached alert; <= pending uses pending."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        fake_tx = "0x" + "7" * 64
+
+        nonce_view = {"latest": "0x4", "pending": "0x5", "fail_latest": False}
+        sync_state = {"epoch": 1, "last_synced": 0, "seed": 1}
+
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            if method == "eth_chainId":
+                return "0x61"
+            if method == "eth_gasPrice":
+                return "0x5f5e100"
+            if method == "eth_call":
+                tx_data = (params[0].get("data", "") if params else "").replace("0x", "")
+                sel = tx_data[:8]
+                if sel == SELECTOR_EPOCH:
+                    return hex(sync_state["epoch"])
+                if sel == SELECTOR_LAST_SYNCED:
+                    return hex(sync_state["last_synced"])
+                if sel == SELECTOR_EPOCH_SEED:
+                    return hex(sync_state["seed"])
+                return "0x0"
+            if method == "eth_getTransactionCount":
+                tag = params[1] if len(params) > 1 else "pending"
+                if tag == "latest":
+                    if nonce_view["fail_latest"]:
+                        raise RuntimeError("latest query timeout")
+                    return nonce_view["latest"]
+                return nonce_view["pending"]
+            if method == "eth_getTransactionReceipt":
+                return {"status": "0x1", "blockNumber": "0x100", "gasUsed": "0x5208"}
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_side
+        sent_cmds = []
+
+        def subproc_side(cmd, *args, **kwargs):
+            if "send" in cmd:
+                sent_cmds.append(list(cmd))
+                return MagicMock(returncode=0, stdout=f"txHash: {fake_tx}" + chr(10), stderr="")
+            return MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+
+        mock_subproc.side_effect = subproc_side
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir,
+            )
+            sm = bot._ensure_state_manager()
+            captured_alerts = []
+            bot.alert = lambda msg: captured_alerts.append(msg)
+
+            # 1. cached (8) > pending (5): aborts, no broadcast, no state, no lock, no downgrade
+            bot.current_nonce = 8
+            with self.assertRaises(NonceDivergenceError):
+                bot.send_transaction("0x1234", "test_divergence", preflight=False)
+
+            self.assertEqual(len(sent_cmds), 0)
+            self.assertFalse(bot.locked_for_manual_review)
+            self.assertFalse(bot._domain_lock_acquired)
+            self.assertEqual(bot.current_nonce, 8)
+            self.assertIsNone(sm.load_state())
+            div_alert = "\n".join(captured_alerts)
+            self.assertIn("latest=4", div_alert)
+            self.assertIn("pending=5", div_alert)
+            self.assertIn("cached=8", div_alert)
+
+            # 2. If latest diagnostic query fails, divergence still aborts cleanly with unavailable latest
+            captured_alerts.clear()
+            nonce_view["fail_latest"] = True
+            with self.assertRaises(NonceDivergenceError):
+                bot.send_transaction("0x1234", "test_divergence_no_latest", preflight=False)
+            self.assertEqual(len(sent_cmds), 0)
+            self.assertEqual(bot.current_nonce, 8)
+            self.assertIsNone(sm.load_state())
+            div_alert_unavail = "\n".join(captured_alerts)
+            self.assertIn("latest=unavailable", div_alert_unavail)
+            self.assertIn("pending=5", div_alert_unavail)
+            self.assertIn("cached=8", div_alert_unavail)
+
+            # 3. step() re-evaluates next round: aborts while pending=5, succeeds when RPC catches up to pending=8 (cached == pending)
+            nonce_view["fail_latest"] = False
+            captured_alerts.clear()
+            bot.step()
+            self.assertEqual(len(sent_cmds), 0)
+            self.assertFalse(bot.locked_for_manual_review)
+            self.assertEqual(bot.current_nonce, 8)
+            self.assertIsNone(sm.load_state())
+
+            nonce_view["latest"] = "0x8"
+            nonce_view["pending"] = "0x8"
+            bot.step()
+            self.assertEqual(len(sent_cmds), 1)
+            self.assertEqual(sent_cmds[0][sent_cmds[0].index("--nonce") + 1], "8")
+            self.assertEqual(bot.current_nonce, 9)
+
+            # 4. cached (4) < pending (10): uses pending (10)
+            bot.current_nonce = 4
+            nonce_view["latest"] = "0xa"
+            nonce_view["pending"] = "0xa"
+            res = bot.send_transaction("0x1234", "test_cached_lt_pending", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+            self.assertEqual(sent_cmds[-1][sent_cmds[-1].index("--nonce") + 1], "10")
+            self.assertEqual(bot.current_nonce, 11)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_lock_for_manual_review_persists_lock_when_get_nonce_fails(self, mock_subproc, mock_rpc):
+        """Nonce query failure or divergence inside lock_for_manual_review must not prevent MANUAL_REVIEW_LOCKED persistence."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        nonce_state = {"mode": "raise"}
+
+        def rpc_side(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            if method == "eth_chainId":
+                return "0x61"
+            if method == "eth_getTransactionCount":
+                if nonce_state["mode"] == "raise":
+                    raise RuntimeError("RPC nonce endpoint offline")
+                return "0x5"
+            return "0x0"
+
+        mock_rpc.side_effect = rpc_side
+        mock_subproc.side_effect = lambda *a, **kw: MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+
+        # Subcase 1: pending query throws during lock_for_manual_review(nonce=None)
+        with tempfile.TemporaryDirectory() as tmp_dir1:
+            bot1 = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir1,
+            )
+            sm1 = bot1._ensure_state_manager()
+            bot1.lock_for_manual_review(
+                reason="Uncertain outcome while nonce RPC unreachable",
+                nonce=None,
+                func_name="sync(1)",
+                reason_code="NONCE_FAIL_LOCK",
+            )
+            self.assertTrue(bot1.locked_for_manual_review)
+            self.assertIsNone(bot1.manual_review_context["nonce"])
+            disk1 = sm1.load_state()
+            self.assertIsNotNone(disk1)
+            self.assertEqual(disk1["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(disk1["nonce"], "Unknown")
+            self.assertEqual(disk1["reason_code"], "NONCE_FAIL_LOCK")
+            with open(sm1.get_audit_path(), "r", encoding="utf-8") as f:
+                audits1 = [json.loads(line) for line in f if line.strip()]
+            self.assertTrue(any(a.get("action") == "MANUAL_REVIEW_LOCKED" for a in audits1))
+
+        # Subcase 2: divergence (cached > pending) during lock_for_manual_review(nonce=None)
+        nonce_state["mode"] = "ok"
+        with tempfile.TemporaryDirectory() as tmp_dir2:
+            bot2 = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir2,
+            )
+            sm2 = bot2._ensure_state_manager()
+            bot2.current_nonce = 12
+            bot2.lock_for_manual_review(
+                reason="Uncertain outcome with diverged cached nonce",
+                nonce=None,
+                func_name="sync(1)",
+                reason_code="DIVERGENCE_LOCK",
+            )
+            self.assertTrue(bot2.locked_for_manual_review)
+            self.assertEqual(bot2.current_nonce, 12)
+            self.assertIsNone(bot2.manual_review_context["nonce"])
+            disk2 = sm2.load_state()
+            self.assertIsNotNone(disk2)
+            self.assertEqual(disk2["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(disk2["nonce"], "Unknown")
+            self.assertEqual(disk2["reason_code"], "DIVERGENCE_LOCK")
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_manual_unlock_reads_snapshot_after_lock_and_state_reread(self, mock_subproc, mock_rpc):
+        """KeeperBot.manual_unlock acquires sender lock, re-reads state, takes snapshot, then writes audit and state."""
+        import script.keeper_state as keeper_state_mod
+        from script.keeper_state import KeeperStateManager, StateDomain
+
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        tx_h = "0x" + "f" * 64
+        events = []
+
+        mock_subproc.side_effect = lambda *a, **kw: MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            domain = StateDomain(chain_id=97, miner_address=miner, sender_address=sender)
+            sm_setup = KeeperStateManager(state_dir=tmp_dir, domain=domain)
+            sm_setup.record_manual_review_lock(reason="Review needed", nonce=7, operation="sync(1)", tx_hash=tx_h)
+
+            def rpc_side(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    tag = params[1] if len(params) > 1 else ""
+                    events.append(("rpc_count", tag, bool(sm_bot._lock and sm_bot._lock._acquired)))
+                    return "0x7"
+                if method == "eth_getTransactionReceipt":
+                    events.append(("rpc_receipt", params[0], bool(sm_bot._lock and sm_bot._lock._acquired)))
+                    return {"status": "0x1", "blockNumber": "0x200"}
+                return "0x0"
+
+            mock_rpc.side_effect = rpc_side
+
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir,
+            )
+            sm_bot = bot._ensure_state_manager()
+
+            orig_acquire = sm_bot.acquire_lock
+            orig_load = sm_bot.load_state
+            orig_release = sm_bot.release_lock
+            orig_audit = keeper_state_mod.append_audit_log
+            orig_atomic = keeper_state_mod.atomic_write_json
+
+            def tracked_acquire():
+                ok = orig_acquire()
+                events.append(("acquire_lock", ok))
+                return ok
+
+            def tracked_load():
+                res = orig_load()
+                events.append(("load_state", bool(sm_bot._lock and sm_bot._lock._acquired)))
+                return res
+
+            def tracked_release():
+                events.append(("release_lock", bool(sm_bot._lock and sm_bot._lock._acquired)))
+                return orig_release()
+
+            def tracked_audit(path, entry):
+                events.append(("append_audit_log", bool(sm_bot._lock and sm_bot._lock._acquired)))
+                return orig_audit(path, entry)
+
+            def tracked_atomic(path, data):
+                events.append(("atomic_write_json", bool(sm_bot._lock and sm_bot._lock._acquired)))
+                return orig_atomic(path, data)
+
+            with patch.object(sm_bot, "acquire_lock", side_effect=tracked_acquire), \
+                 patch.object(sm_bot, "load_state", side_effect=tracked_load), \
+                 patch.object(sm_bot, "release_lock", side_effect=tracked_release), \
+                 patch.object(keeper_state_mod, "append_audit_log", side_effect=tracked_audit), \
+                 patch.object(keeper_state_mod, "atomic_write_json", side_effect=tracked_atomic):
+                res = bot.manual_unlock(expected_nonce=7, operator_reason="Verified order of snapshot")
+
+            self.assertEqual(res["status"], "IDLE")
+            self.assertFalse(bot.locked_for_manual_review)
+
+            expected_seq = [
+                ("acquire_lock", True),
+                ("load_state", True),
+                ("rpc_count", "latest", True),
+                ("rpc_count", "pending", True),
+                ("rpc_receipt", tx_h, True),
+                ("append_audit_log", True),
+                ("atomic_write_json", True),
+                ("release_lock", True),
+            ]
+            self.assertEqual(events, expected_seq)
+
+            with open(sm_bot.get_audit_path(), "r", encoding="utf-8") as f:
+                audits = [json.loads(line) for line in f if line.strip()]
+            self.assertEqual(audits[-1]["onchain_snapshot"]["tx_receipts"][tx_h]["status"], "0x1")

@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch, MagicMock
@@ -436,6 +437,195 @@ if sm.acquire_lock():
         res_blocked = bot.send_transaction("0x1234", "test_blocked_by_reread", preflight=False)
         self.assertEqual(res_blocked.status, TxExecutionStatus.UNCERTAIN)
         self.assertTrue(bot.locked_for_manual_review)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_send_refused_while_manual_unlock_holds_lock(self, mock_subproc, mock_rpc):
+        """[反向竞态测试] Concurrent send_transaction is refused while manual_unlock holds the sender lock (cross-process & in-process, zero sleep)."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        tx_h = "0x" + "d" * 64
+
+        domain = StateDomain(chain_id=97, miner_address=miner, sender_address=sender)
+        sm_setup = KeeperStateManager(state_dir=self.state_dir, domain=domain)
+        sm_setup.record_manual_review_lock(
+            reason="Simulated crash lock before unlock",
+            nonce=10,
+            operation="sync(1)",
+            tx_hash=tx_h,
+            reason_code="REVERSE_RACE_TEST",
+        )
+
+        # Part 1: Independent subprocess runs KeeperBot.manual_unlock and pauses inside snapshot RPC while holding OS lock
+        code_unlocker = f"""
+import sys
+from unittest.mock import patch, MagicMock
+sys.path.insert(0, r"{REPO_ROOT}")
+from script.keeper import KeeperBot
+
+def subproc_rpc(url, method, params):
+    if method == "eth_getCode":
+        return "0x6080604052"
+    if method == "eth_chainId":
+        return "0x61"
+    if method == "eth_getTransactionCount":
+        if len(params) > 1 and params[1] == "latest":
+            sys.stdout.write("UNLOCK_HOLDING_LOCK" + chr(10))
+            sys.stdout.flush()
+            sys.stdin.readline()
+        return "0xa"
+    if method == "eth_getTransactionReceipt":
+        return {{"status": "0x1", "blockNumber": "0x100"}}
+    return "0x0"
+
+with patch("script.keeper.rpc_call", side_effect=subproc_rpc), \\
+     patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="{sender}" + chr(10), stderr="")):
+    bot = KeeperBot(
+        rpc_url="http://mock-rpc",
+        miner_address="{miner}",
+        account="test-keystore-account",
+        password_file="fake-passwords/dev.pwd",
+        dry_run=False,
+        state_dir=r"{self.state_dir}",
+    )
+    res = bot.manual_unlock(expected_nonce=10, operator_reason="Unlock holding lock during send race")
+    sys.stdout.write("UNLOCK_DONE:" + res["status"] + chr(10))
+    sys.stdout.flush()
+"""
+        proc_unlock = subprocess.Popen(
+            [sys.executable, "-c", code_unlocker],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        cast_send_calls = []
+
+        def parent_rpc(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            if method == "eth_chainId":
+                return "0x61"
+            if method == "eth_sendRawTransaction":
+                cast_send_calls.append(method)
+                raise AssertionError("eth_sendRawTransaction must not be called while unlock holds lock")
+            return "0x0"
+
+        def parent_subproc(cmd, *args, **kwargs):
+            if "send" in cmd:
+                cast_send_calls.append(list(cmd))
+                raise AssertionError("cast send must not be called while unlock holds lock")
+            return MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+
+        mock_rpc.side_effect = parent_rpc
+        mock_subproc.side_effect = parent_subproc
+
+        try:
+            line = proc_unlock.stdout.readline()
+            self.assertEqual(line.strip(), "UNLOCK_HOLDING_LOCK")
+
+            bot_sender = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=self.state_dir,
+            )
+            res_send = bot_sender.send_transaction("0x1234", "concurrent_send_during_unlock", preflight=False)
+            self.assertEqual(res_send.status, TxExecutionStatus.UNCERTAIN)
+            self.assertIn("locked by another active Keeper process", res_send.error)
+            self.assertEqual(len(cast_send_calls), 0)
+            self.assertEqual(sm_setup.load_state()["status"], "MANUAL_REVIEW_LOCKED")
+
+            proc_unlock.stdin.write("CONTINUE\n")
+            proc_unlock.stdin.flush()
+            proc_unlock.stdin.close()
+            done_line = proc_unlock.stdout.readline()
+            self.assertEqual(done_line.strip(), "UNLOCK_DONE:IDLE")
+            self.assertEqual(proc_unlock.wait(timeout=10), 0)
+            self.assertEqual(sm_setup.load_state()["status"], "IDLE")
+        finally:
+            if proc_unlock.poll() is None:
+                proc_unlock.kill()
+                proc_unlock.wait()
+
+        # Part 2: In-process thread race on both same and distinct KeeperBot instances via Event synchronization
+        sm_setup.record_manual_review_lock(
+            reason="Second lock for in-process reverse race",
+            nonce=11,
+            operation="sync(1)",
+            tx_hash=tx_h,
+            reason_code="REVERSE_RACE_THREAD_TEST",
+        )
+        entered_snapshot = threading.Event()
+        allow_snapshot_finish = threading.Event()
+        unlock_result = {}
+
+        def thread_rpc(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            if method == "eth_chainId":
+                return "0x61"
+            if method == "eth_getTransactionCount":
+                if len(params) > 1 and params[1] == "latest":
+                    entered_snapshot.set()
+                    self.assertTrue(allow_snapshot_finish.wait(timeout=10))
+                return "0xb"
+            if method == "eth_getTransactionReceipt":
+                return {"status": "0x1", "blockNumber": "0x101"}
+            if method == "eth_sendRawTransaction":
+                cast_send_calls.append(method)
+                raise AssertionError("eth_sendRawTransaction must not be called during concurrent unlock")
+            return "0x0"
+
+        mock_rpc.side_effect = thread_rpc
+
+        bot_unlock = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address=miner,
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            state_dir=self.state_dir,
+        )
+        bot_other = KeeperBot(
+            rpc_url="http://mock-rpc",
+            miner_address=miner,
+            account="test-keystore-account",
+            password_file="fake-passwords/dev.pwd",
+            dry_run=False,
+            state_dir=self.state_dir,
+        )
+
+        def run_unlock():
+            try:
+                unlock_result["state"] = bot_unlock.manual_unlock(
+                    expected_nonce=11,
+                    operator_reason="Thread unlock race test",
+                )
+            except Exception as exc:
+                unlock_result["error"] = exc
+
+        t = threading.Thread(target=run_unlock)
+        t.start()
+        try:
+            self.assertTrue(entered_snapshot.wait(timeout=10))
+            # Both same instance and another instance must be refused without entering critical section
+            res_same = bot_unlock.send_transaction("0x1234", "same_instance_send", preflight=False)
+            self.assertEqual(res_same.status, TxExecutionStatus.UNCERTAIN)
+            res_other = bot_other.send_transaction("0x1234", "other_instance_send", preflight=False)
+            self.assertEqual(res_other.status, TxExecutionStatus.UNCERTAIN)
+            self.assertEqual(len(cast_send_calls), 0)
+        finally:
+            allow_snapshot_finish.set()
+            t.join(timeout=10)
+
+        self.assertNotIn("error", unlock_result)
+        self.assertEqual(unlock_result["state"]["status"], "IDLE")
+        self.assertTrue(sm_setup.acquire_lock())
+        sm_setup.release_lock()
 
 
 if __name__ == "__main__":
