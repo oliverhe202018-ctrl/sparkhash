@@ -14,6 +14,60 @@ import sys
 import io
 import rlp
 import subprocess
+import tempfile
+import json
+import time as _real_time
+
+class _FakeKeeperTime:
+    def __init__(self, initial=1000.0):
+        self._now = initial
+
+    def time(self):
+        return self._now
+
+    def sleep(self, seconds):
+        self._now += seconds
+
+    def __getattr__(self, name):
+        return getattr(_real_time, name)
+
+
+import atexit
+
+# Ensure all tests execute in an isolated temporary directory for keeper persistent state.
+# Never touches or pollutes actual running state in ~/.poolcoin/keeper_state.
+_ORIG_KEEPER_STATE_DIR = os.environ.get("KEEPER_STATE_DIR")
+_TEST_TMP_STATE_DIR = tempfile.TemporaryDirectory()
+os.environ["KEEPER_STATE_DIR"] = _TEST_TMP_STATE_DIR.name
+
+def tearDownModule():
+    """Restores original KEEPER_STATE_DIR and cleans temporary directory."""
+    if _ORIG_KEEPER_STATE_DIR is None:
+        os.environ.pop("KEEPER_STATE_DIR", None)
+    else:
+        os.environ["KEEPER_STATE_DIR"] = _ORIG_KEEPER_STATE_DIR
+    try:
+        _TEST_TMP_STATE_DIR.cleanup()
+    except Exception:
+        pass
+
+atexit.register(tearDownModule)
+
+import shutil
+
+def clean_test_state_dir():
+    """Test fixture helper: cleans state/lock files in the test state directory."""
+    state_dir = os.environ.get("KEEPER_STATE_DIR")
+    if state_dir and os.path.isdir(state_dir):
+        for f in os.listdir(state_dir):
+            fp = os.path.join(state_dir, f)
+            try:
+                if os.path.isfile(fp) or os.path.islink(fp):
+                    os.unlink(fp)
+                elif os.path.isdir(fp):
+                    shutil.rmtree(fp)
+            except Exception:
+                pass
 
 # Ensure repo root is on sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -27,7 +81,7 @@ from script.keeper import (
     sanitize_url,
     sanitize_text,
     register_secret,
-    clear_configured_secrets,
+    clear_configured_secrets as _prod_clear_configured_secrets,
     _CONFIGURED_SECRETS,
     parse_numeric,
     format_exception_safe,
@@ -44,6 +98,25 @@ from script.keeper import (
     DEFAULT_GAS_MULTIPLIER,
     MAX_SEED_STEPS
 )
+
+def clear_configured_secrets():
+    _prod_clear_configured_secrets()
+    clean_test_state_dir()
+
+_orig_testcase_setup = unittest.TestCase.setUp
+_orig_testcase_teardown = unittest.TestCase.tearDown
+
+def _auto_clean_setup(self):
+    clean_test_state_dir()
+    _orig_testcase_setup(self)
+
+def _auto_clean_teardown(self):
+    clean_test_state_dir()
+    _orig_testcase_teardown(self)
+
+unittest.TestCase.setUp = _auto_clean_setup
+unittest.TestCase.tearDown = _auto_clean_teardown
+
 
 
 class TestGasPriceCalculations(unittest.TestCase):
@@ -161,8 +234,9 @@ class TestKeeperBotDryRun(unittest.TestCase):
 
 
 class TestKeeperBotSpeedupRetry(unittest.TestCase):
+    @patch("script.keeper.time", new_callable=_FakeKeeperTime)
     @patch("script.keeper.rpc_call")
-    def test_speedup_retry_reuses_identical_nonce_and_bumps_gas_price(self, mock_rpc):
+    def test_speedup_retry_reuses_identical_nonce_and_bumps_gas_price(self, mock_rpc, mock_time):
         """When confirmation times out, bot must re-broadcast with IDENTICAL nonce and higher gasPrice."""
         from eth_account import Account
         test_account = Account.create()
@@ -201,7 +275,7 @@ class TestKeeperBotSpeedupRetry(unittest.TestCase):
             miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
             private_key=test_key,
             dry_run=False,
-            tx_timeout=1, # 1 sec timeout for test speed
+            tx_timeout=1, # 1 sec timeout with mocked clock
             max_retries=2
         )
 
@@ -1670,6 +1744,7 @@ class TestFoundryKeystoreIntegration(unittest.TestCase):
         self.assertEqual(mock_subproc.call_count, 2)
 
         # 2. Exception on cast send (e.g. TimeoutExpired)
+        clear_configured_secrets()
         import subprocess
         mock_subproc.reset_mock()
         mock_subproc.side_effect = [
@@ -1693,6 +1768,7 @@ class TestFoundryKeystoreIntegration(unittest.TestCase):
         self.assertEqual(mock_subproc.call_count, 2)
 
         # 3. Success code but no txHash in stdout
+        clear_configured_secrets()
         mock_subproc.reset_mock()
         mock_subproc.side_effect = [
             MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
@@ -1940,6 +2016,7 @@ class TestKeeperUncertainTransactionRecovery(unittest.TestCase):
         self.assertEqual(mock_subproc.call_count, 2)
 
         # Case 2: Zero exit code but missing 32-byte hash in stdout
+        clear_configured_secrets()
         mock_subproc.reset_mock()
         mock_subproc.side_effect = [
             MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
@@ -1992,6 +2069,7 @@ class TestKeeperUncertainTransactionRecovery(unittest.TestCase):
         self.assertEqual(bot_ks.current_nonce, 5)
 
         # 2. Private key mode
+        clear_configured_secrets()
         test_key = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f3608a8"
         def rpc_pk(url, method, params):
             if method == "eth_getCode":
@@ -2205,9 +2283,10 @@ class TestKeeperUncertainTransactionRecovery(unittest.TestCase):
         self.assertTrue(bot3.locked_for_manual_review)
         self.assertEqual(bot3.manual_review_context["tx_hash"], valid_hash)
 
+    @patch("script.keeper.time", new_callable=_FakeKeeperTime)
     @patch("script.keeper.rpc_call")
     @patch("subprocess.run")
-    def test_speedup_replacement_strictly_reuses_nonce_target_calldata_value(self, mock_subproc, mock_rpc):
+    def test_speedup_replacement_strictly_reuses_nonce_target_calldata_value(self, mock_subproc, mock_rpc, mock_time):
         """Speed-up retry strictly keeps identical nonce, target, calldata, value and bumps gasPrice."""
         fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
         hash0 = "0x" + "1" * 64
@@ -3092,3 +3171,915 @@ class TestKeeperEpochSeedBatching(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestKeeperPersistentStateAndLocking(unittest.TestCase):
+    """
+    Exhaustive verification of Keeper persistent state, crash protection,
+    concurrency locking, domain binding, and manual unlock workflows.
+    """
+    def setUp(self):
+        clear_configured_secrets()
+
+    def tearDown(self):
+        clear_configured_secrets()
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_first_normal_startup(self, mock_subproc, mock_rpc):
+        """1. First normal startup with clean state allows sending and transitions to CONFIRMED_SUCCESS."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        fake_tx = "0x" + "a" * 64
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else {"status": "0x1", "blockNumber": "0x100", "gasUsed": "0x5208"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"txHash: {fake_tx}\n", stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            sm = bot._ensure_state_manager()
+            self.assertTrue(sm.domain_valid)
+            can_proceed, block_reason, state_data = sm.check_startup_protection()
+            self.assertTrue(can_proceed)
+            self.assertIsNone(block_reason)
+
+            res = bot.send_transaction("0x1234", "test_normal", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+
+            # Verify state on disk is CONFIRMED_SUCCESS
+            saved_state = sm.load_state()
+            self.assertIsNotNone(saved_state)
+            self.assertEqual(saved_state["status"], "CONFIRMED_SUCCESS")
+            self.assertEqual(saved_state["tx_hash"], fake_tx)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_manual_review_lock_persists_across_restart(self, mock_subproc, mock_rpc):
+        """2. Manual review lock persists across bot restarts/instances and prevents sending."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error: execution reverted: out of gas")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot1 = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            res1 = bot1.send_transaction("0x1234", "test_call", preflight=False)
+            self.assertEqual(res1.status, TxExecutionStatus.UNCERTAIN)
+            self.assertTrue(bot1.locked_for_manual_review)
+
+            # Restart simulation: new KeeperBot instance on same domain & state_dir
+            mock_subproc.reset_mock()
+            mock_subproc.side_effect = [
+                MagicMock(returncode=0, stdout=fake_addr + "\n", stderr="")
+            ]
+            bot2 = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            res2 = bot2.send_transaction("0x1234", "test_call2", preflight=False)
+            self.assertEqual(res2.status, TxExecutionStatus.UNCERTAIN)
+            self.assertTrue(bot2.locked_for_manual_review)
+            self.assertIn("locked for manual review", res2.error)
+            # Only wallet address was queried, cast send was NEVER called
+            self.assertEqual(mock_subproc.call_count, 1)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_state_write_failure_aborts_before_signing_or_sending(self, mock_subproc, mock_rpc):
+        """3. When persistent state write fails before broadcast, transaction aborts without signing or sending."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            sm = bot._ensure_state_manager()
+            # Force record_preparing_to_send to fail
+            from script.keeper_state import StateWriteError
+            sm.record_preparing_to_send = MagicMock(side_effect=StateWriteError("Simulated disk full"))
+
+            res = bot.send_transaction("0x1234", "test_abort", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+            self.assertTrue(bot.locked_for_manual_review)
+            self.assertIn("Failed to persist in-flight state", res.error)
+            # Only wallet address was queried during identity validation, cast send was NEVER called
+            self.assertEqual(mock_subproc.call_count, 1)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_crash_after_broadcast_before_receipt_halts_restart(self, mock_subproc, mock_rpc):
+        """4. Simulated crash after broadcast before receipt halts restart into manual review."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Manually inject in-flight crash state (PREPARING_TO_SEND)
+            from script.keeper_state import KeeperStateManager, StateDomain, atomic_write_json
+            domain = StateDomain(chain_id=97, miner_address="0x420382a0f874c1F120621f847d81581e8737504e", sender_address=fake_addr)
+            sm_pre = KeeperStateManager(state_dir=tmp_dir, domain=domain)
+            sm_pre.record_preparing_to_send(operation="sync()", epoch=10, nonce=5, details="Crash before confirmation simulation")
+
+            # Restart simulation: new bot instance
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            res = bot.send_transaction("0x1234", "sync()", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+            self.assertTrue(bot.locked_for_manual_review)
+            self.assertIn("crash before confirmation", res.error)
+
+            # Verify on disk that status transitioned to MANUAL_REVIEW_LOCKED
+            state = sm_pre.load_state()
+            self.assertEqual(state["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(state["reason_code"], "CRASH_BEFORE_CONFIRMATION")
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_timeout_and_unknown_tx_outcomes_trigger_manual_review(self, mock_subproc, mock_rpc):
+        """5. Timeout on all attempts triggers UNCERTAIN outcome and persists MANUAL_REVIEW_LOCKED."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        fake_tx = "0x" + "b" * 64
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else None  # Receipt times out
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"txHash: {fake_tx}\n", stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                tx_timeout=0.01,
+                max_retries=0,
+                state_dir=tmp_dir
+            )
+            res = bot.send_transaction("0x1234", "test_timeout", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+            self.assertTrue(bot.locked_for_manual_review)
+
+            sm = bot._ensure_state_manager()
+            state = sm.load_state()
+            self.assertEqual(state["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(state["tx_hash"], fake_tx)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_invalid_domain_corrupt_file_and_unknown_version_refuse_sending(self, mock_subproc, mock_rpc):
+        """6. Invalid domain, corrupted state file, and unknown version strictly refuse sending."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            sm = bot._ensure_state_manager()
+            state_path = sm.get_state_path()
+
+            # Case A: Corrupted JSON file
+            with open(state_path, "w", encoding="utf-8") as f:
+                f.write("{invalid json content syntax...")
+            can_proceed, reason, _ = sm.check_startup_protection()
+            self.assertFalse(can_proceed)
+            self.assertIn("not valid JSON", reason)
+            res = bot.send_transaction("0x1234", "test_corrupt", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+
+            # Case B: Unknown state version
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump({"version": 999, "domain": sm.domain.to_dict(), "status": "CONFIRMED_SUCCESS", "updated_at": "2026-01-01"}, f)
+            can_proceed, reason, _ = sm.check_startup_protection()
+            self.assertFalse(can_proceed)
+            self.assertIn("Unsupported state version", reason)
+
+            # Case C: Domain mismatch
+            with open(state_path, "w", encoding="utf-8") as f:
+                bad_domain = sm.domain.to_dict()
+                bad_domain["chain_id"] = 1  # Ethereum mainnet instead of BSC testnet
+                json.dump({"version": 1, "domain": bad_domain, "status": "CONFIRMED_SUCCESS", "updated_at": "2026-01-01"}, f)
+            can_proceed, reason, _ = sm.check_startup_protection()
+            self.assertFalse(can_proceed)
+            self.assertIn("domain mismatch", reason)
+
+    def test_concurrent_instances_same_domain_only_one_enters_sending(self):
+        """7. Two keeper instances on the same domain cannot concurrently enter the sending phase."""
+        from script.keeper_state import KeeperStateManager, StateDomain, DomainFileLock
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            domain = StateDomain(chain_id=97, miner_address="0x420382a0f874c1F120621f847d81581e8737504e", sender_address="0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A")
+            sm1 = KeeperStateManager(state_dir=tmp_dir, domain=domain)
+            sm2 = KeeperStateManager(state_dir=tmp_dir, domain=domain)
+
+            # Instance 1 acquires the lock
+            self.assertTrue(sm1.acquire_lock())
+
+            # Instance 2 tries to acquire the same domain lock and is refused
+            self.assertFalse(sm2.acquire_lock())
+
+            # Instance 1 releases the lock
+            sm1.release_lock()
+
+            # Now Instance 2 can acquire the lock
+            self.assertTrue(sm2.acquire_lock())
+            sm2.release_lock()
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_confirmed_success_completes_state_transition(self, mock_subproc, mock_rpc):
+        """8. Confirmed success transitions state and writes audit trail."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        fake_tx = "0x" + "c" * 64
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else {"status": "0x1", "blockNumber": "0x150", "gasUsed": "0x7000"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=0, stdout=f"txHash: {fake_tx}\n", stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            res = bot.send_transaction("0x1234", "test_success", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+
+            sm = bot._ensure_state_manager()
+            state = sm.load_state()
+            self.assertEqual(state["status"], "CONFIRMED_SUCCESS")
+            self.assertEqual(state["tx_hash"], fake_tx)
+            self.assertEqual(state["block_number"], 0x150)
+
+            # Check audit log
+            with open(sm.get_audit_path(), "r", encoding="utf-8") as f:
+                audit_records = [json.loads(line) for line in f if line.strip()]
+            self.assertTrue(any(r.get("action") == "CONFIRMED_SUCCESS" for r in audit_records))
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_manual_unlock_domain_binding_and_audit_history(self, mock_subproc, mock_rpc):
+        """9. Manual unlock requires domain match, verifies expected_nonce, transitions to IDLE, and preserves audit log."""
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            sm = bot._ensure_state_manager()
+            sm.record_manual_review_lock(
+                reason="Uncertain outcome",
+                nonce=5,
+                operation="test_op",
+                tx_hash="0x" + "d" * 64,
+                reason_code="MANUAL_TEST"
+            )
+
+            # Verification: bot is locked
+            can_proceed, _, _ = sm.check_startup_protection()
+            self.assertFalse(can_proceed)
+
+            # Nonce mismatch raises InvalidStateError
+            from script.keeper_state import InvalidStateError
+            with self.assertRaises(InvalidStateError):
+                bot.manual_unlock(expected_nonce=99, operator_reason="Valid reason")
+
+            # Successful manual unlock with correct nonce and operator reason
+            unlock_res = bot.manual_unlock(expected_nonce=5, operator_reason="Operator verified tx on BSCScan")
+            self.assertEqual(unlock_res["status"], "IDLE")
+            self.assertEqual(unlock_res["reason_code"], "UNLOCKED_MANUALLY")
+
+            # Check that state file still exists and audit log has entry
+            state_after = sm.load_state()
+            self.assertEqual(state_after["status"], "IDLE")
+
+            with open(sm.get_audit_path(), "r", encoding="utf-8") as f:
+                audit_records = [json.loads(line) for line in f if line.strip()]
+            unlock_entry = [r for r in audit_records if r.get("action") == "MANUAL_UNLOCK"]
+            self.assertEqual(len(unlock_entry), 1)
+            self.assertIn("Operator verified tx", unlock_entry[0]["operator_reason"])
+
+            # Now bot can proceed without block
+            can_proceed_after, _, _ = sm.check_startup_protection()
+            self.assertTrue(can_proceed_after)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_sensitive_exceptions_and_rpc_credentials_excluded_from_state(self, mock_subproc, mock_rpc):
+        """10. Sensitive RPC credentials, passwords, and file paths are sanitized from state file and audit log."""
+        secret_pwd = "super_secret_keeper_password_xyz123"
+        secret_path = "C:/sensitive/keystore/vault.pwd"
+        fake_addr = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=fake_addr + "\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr=f"cast send error with password {secret_pwd} at {secret_path}")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url=f"https://operator:{secret_pwd}@bsc.rpc.example.com",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file=secret_path,
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            bot.send_transaction("0x1234", "test_sanitize", preflight=False)
+            self.assertTrue(bot.locked_for_manual_review)
+
+            sm = bot._ensure_state_manager()
+            with open(sm.get_state_path(), "r", encoding="utf-8") as f:
+                state_raw = f.read()
+            with open(sm.get_audit_path(), "r", encoding="utf-8") as f:
+                audit_raw = f.read()
+
+            self.assertNotIn(secret_pwd, state_raw)
+            self.assertNotIn(secret_path, state_raw)
+            self.assertNotIn(secret_pwd, audit_raw)
+            self.assertNotIn(secret_path, audit_raw)
+
+
+
+
+class TestKeeperReconciliationAndFaultMitigations(unittest.TestCase):
+    """
+    Offline mock-only test suite verifying Keeper reconciliation requirements:
+    1. Active process holding lock with PREPARING_TO_SEND prevents mutation and memory lock in concurrent step / --check-lock.
+    2. Forcefully terminated process crash recovery converts PREPARING_TO_SEND to MANUAL_REVIEW_LOCKED.
+    3. Cached nonce outside lock is never used; fresh nonce queried under lock.
+    4. Cast send command construction includes --data, --async, isolated env, shell=False.
+    5. max_retries total attempts semantic (max_retries + 1) for 0, 1, 2.
+    6. Multiple replacement hashes retained in chronological order and listed in context.
+    7. Revert state persistence failure transitions to manual review lock (no except: pass).
+    8. Legacy state missing tx_hashes loaded compatibly without unlocking.
+    9. manual_unlock snapshot logging for both success and failure cases.
+    """
+    def setUp(self):
+        clear_configured_secrets()
+
+    def tearDown(self):
+        clear_configured_secrets()
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_active_process_holding_lock_step_and_check_lock_bytes_unchanged(self, mock_subproc, mock_rpc):
+        """Active process holding lock with PREPARING_TO_SEND: step() and --check-lock leave state file bytes unchanged and do not set memory lock."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = None
+        mock_subproc.return_value = MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            from script.keeper_state import KeeperStateManager, StateDomain
+            domain = StateDomain(chain_id=97, miner_address=miner, sender_address=sender)
+            sm_active = KeeperStateManager(state_dir=tmp_dir, domain=domain)
+            self.assertTrue(sm_active.acquire_lock())
+
+            # Active process writes PREPARING_TO_SEND
+            sm_active.record_preparing_to_send(operation="test_send", epoch=1, nonce=5, details="Active send")
+            state_path = sm_active.get_state_path()
+            with open(state_path, "rb") as f:
+                orig_bytes = f.read()
+
+            # Second keeper bot in another process/context runs step()
+            bot_b = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            bot_b.step()
+
+            # Must NOT set memory lock and must NOT modify disk state
+            self.assertFalse(bot_b.locked_for_manual_review)
+            with open(state_path, "rb") as f:
+                self.assertEqual(f.read(), orig_bytes)
+
+            # Check --check-lock behavior: status must be 发送中 and bytes unchanged
+            sm_b = bot_b._ensure_state_manager()
+            status_cat, details, state_data = sm_b.inspect_lock_status()
+            self.assertEqual(status_cat, "发送中")
+            self.assertEqual(details, "Active Keeper process currently broadcasting/in-flight (lock is held)")
+            self.assertIsNotNone(state_data)
+            self.assertEqual(state_data["status"], "PREPARING_TO_SEND")
+            with open(state_path, "rb") as f:
+                self.assertEqual(f.read(), orig_bytes)
+
+            sm_active.release_lock()
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_terminated_process_crash_recovery_transitions_to_manual_review_lock(self, mock_subproc, mock_rpc):
+        """Terminated process left PREPARING_TO_SEND: new process holding lock converts to MANUAL_REVIEW_LOCKED."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x5" if method == "eth_getTransactionCount"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            from script.keeper_state import KeeperStateManager, StateDomain
+            domain = StateDomain(chain_id=97, miner_address=miner, sender_address=sender)
+            sm = KeeperStateManager(state_dir=tmp_dir, domain=domain)
+            sm.acquire_lock()
+            sm.record_preparing_to_send(operation="test_crash", epoch=2, nonce=8, details="In-flight before crash")
+            # Simulate crash: process died, lock released by OS
+            sm.release_lock()
+
+            # New process comes up
+            bot_new = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            bot_new.step()
+
+            # Verify step converted crash state to manual review lock
+            self.assertTrue(bot_new.locked_for_manual_review)
+            disk_state = sm.load_state()
+            self.assertIsNotNone(disk_state)
+            self.assertEqual(disk_state["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(disk_state["reason_code"], "CRASH_BEFORE_CONFIRMATION")
+            self.assertEqual(disk_state["nonce"], 8)
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_cached_nonce_outside_lock_never_used_for_broadcast(self, mock_subproc, mock_rpc):
+        """Cached nonce outside lock is never used; fresh nonce is queried under mutex lock."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        fake_tx = "0x" + "a" * 64
+
+        call_count = {"nonce_queries": 0}
+        def dynamic_rpc(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            elif method == "eth_call":
+                return "0x0"
+            elif method == "eth_getTransactionCount":
+                call_count["nonce_queries"] += 1
+                if call_count["nonce_queries"] == 1:
+                    return "0xa"  # 10 (queried outside lock)
+                return "0xf"      # 15 (queried inside lock after external advance)
+            elif method == "eth_getTransactionReceipt":
+                return {"status": "0x1", "blockNumber": "0x100", "gasUsed": "0x5208"}
+            return "0x0"
+
+        mock_rpc.side_effect = dynamic_rpc
+        observed_cmds = []
+        def subproc_run(cmd, *args, **kwargs):
+            if "send" in cmd:
+                observed_cmds.append(list(cmd))
+                return MagicMock(returncode=0, stdout=f"txHash: {fake_tx}" + chr(10), stderr="")
+            return MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+        mock_subproc.side_effect = subproc_run
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            # Query and cache nonce outside the lock
+            nonce_outside = bot.get_nonce()
+            self.assertEqual(nonce_outside, 10)
+            self.assertEqual(bot.current_nonce, 10)
+
+            # Another process occupies nonce 10; on-chain pending count becomes 15
+            # Now bot executes send_transaction; under lock it must re-read nonce 15 and broadcast with 15
+            res = bot.send_transaction("0x1234", "test_nonce_fresh", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+
+            self.assertEqual(len(observed_cmds), 1)
+            cmd = observed_cmds[0]
+            nonce_idx = cmd.index("--nonce")
+            self.assertEqual(cmd[nonce_idx + 1], "15")
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_cast_send_command_construction_and_isolation(self, mock_subproc, mock_rpc):
+        """Cast send command construction strictly includes --data, --async, uses isolated env, and shell=False."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        fake_tx = "0x" + "b" * 64
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else {"status": "0x1", "blockNumber": "0x100", "gasUsed": "0x5208"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+
+        captured_kwargs = []
+        captured_cmd = []
+        def subproc_run(cmd, *args, **kwargs):
+            if "send" in cmd:
+                captured_cmd.extend(cmd)
+                captured_kwargs.append(kwargs)
+                return MagicMock(returncode=0, stdout=f"txHash: {fake_tx}" + chr(10), stderr="")
+            return MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+        mock_subproc.side_effect = subproc_run
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            calldata = "0xaabbccdd"
+            res = bot.send_transaction(calldata, "test_cmd_flags", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+
+            self.assertIn("--data", captured_cmd)
+            self.assertEqual(captured_cmd[captured_cmd.index("--data") + 1], calldata)
+            self.assertIn("--async", captured_cmd)
+            self.assertIn("shell", captured_kwargs[0])
+            self.assertIs(captured_kwargs[0]["shell"], False)
+            self.assertIn("env", captured_kwargs[0])
+            self.assertEqual(captured_kwargs[0]["env"], get_isolated_cast_env())
+
+    @patch("script.keeper.time", new_callable=_FakeKeeperTime)
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_max_retries_total_attempt_count_semantics(self, mock_subproc, mock_rpc, mock_time):
+        """max_retries for 0, 1, 2 results in exactly max_retries + 1 total broadcast attempts."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else None  # Receipts always timeout to force all speed-up attempts
+        )
+
+        for max_retries in (0, 1, 2):
+            expected_attempts = max_retries + 1
+            broadcast_count = [0]
+            def subproc_run(cmd, *args, **kwargs):
+                if "send" in cmd:
+                    broadcast_count[0] += 1
+                    tx_h = "0x" + f"{broadcast_count[0]:x}" * 64
+                    return MagicMock(returncode=0, stdout=f"txHash: {tx_h}" + chr(10), stderr="")
+                return MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+            mock_subproc.side_effect = subproc_run
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=miner,
+                    account="test-keystore-account",
+                    password_file="fake-passwords/dev.pwd",
+                    dry_run=False,
+                    max_retries=max_retries,
+                    tx_timeout=1,
+                    state_dir=tmp_dir
+                )
+                res = bot.send_transaction("0x1234", "test_retries", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+                self.assertEqual(broadcast_count[0], expected_attempts, f"max_retries={max_retries} must execute exactly {expected_attempts} attempts")
+
+    @patch("script.keeper.time", new_callable=_FakeKeeperTime)
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_multiple_replacement_hashes_retained_and_listed_in_context(self, mock_subproc, mock_rpc, mock_time):
+        """Multiple replacement hashes are tracked in tx_hashes list and listed in context upon exhaustion."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        hash0 = "0x" + "1" * 64
+        hash1 = "0x" + "2" * 64
+        hash2 = "0x" + "3" * 64
+
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else None
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=sender + chr(10), stderr=""),
+            MagicMock(returncode=0, stdout=f"txHash: {hash0}" + chr(10), stderr=""),
+            MagicMock(returncode=0, stdout=f"txHash: {hash1}" + chr(10), stderr=""),
+            MagicMock(returncode=0, stdout=f"txHash: {hash2}" + chr(10), stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                max_retries=2,
+                tx_timeout=1,
+                state_dir=tmp_dir
+            )
+            res = bot.send_transaction("0x1234", "test_replacement_hashes", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+            self.assertEqual(bot.manual_review_context["tx_hash"], hash2)
+            self.assertEqual(bot.manual_review_context["tx_hashes"], [hash0, hash1, hash2])
+
+            sm = bot._ensure_state_manager()
+            saved = sm.load_state()
+            self.assertIsNotNone(saved)
+            self.assertEqual(saved["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(saved["tx_hash"], hash2)
+            self.assertEqual(saved["tx_hashes"], [hash0, hash1, hash2])
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_revert_state_write_failure_enters_manual_review(self, mock_subproc, mock_rpc):
+        """Onchain revert whose state write fails enters manual review with STATE_WRITE_FAILURE (no except: pass)."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        fake_tx = "0x" + "c" * 64
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x0" if method == "eth_call"
+            else "0x5" if method == "eth_getTransactionCount"
+            else {"status": "0x0", "blockNumber": "0x101", "gasUsed": "0x5208"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+        mock_subproc.side_effect = [
+            MagicMock(returncode=0, stdout=sender + chr(10), stderr=""),
+            MagicMock(returncode=0, stdout=f"txHash: {fake_tx}" + chr(10), stderr="")
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            sm = bot._ensure_state_manager()
+            from script.keeper_state import StateWriteError
+            with patch.object(sm, "record_confirmed_revert", side_effect=StateWriteError("Disk full simulation")):
+                res = bot.send_transaction("0x1234", "test_revert_fail", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+                self.assertTrue(bot.locked_for_manual_review)
+                saved_state = sm.load_state()
+                self.assertIsNotNone(saved_state)
+                self.assertEqual(saved_state["status"], "MANUAL_REVIEW_LOCKED")
+                self.assertEqual(saved_state["reason_code"], "STATE_WRITE_FAILURE")
+                self.assertIn(fake_tx, saved_state["tx_hashes"])
+                self.assertEqual(saved_state["tx_hash"], fake_tx)
+
+    def test_legacy_state_missing_tx_hashes_loaded_compatibly(self):
+        """Legacy state file missing tx_hashes key is read compatibly and not treated as unlocked."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        legacy_hash = "0x" + "d" * 64
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            from script.keeper_state import KeeperStateManager, StateDomain
+            domain = StateDomain(chain_id=97, miner_address=miner, sender_address=sender)
+            sm = KeeperStateManager(state_dir=tmp_dir, domain=domain)
+            legacy_data = {
+                "version": 1,
+                "domain": domain.to_dict(),
+                "status": "MANUAL_REVIEW_LOCKED",
+                "operation": "test_legacy",
+                "epoch": 1,
+                "nonce": 5,
+                "tx_hash": legacy_hash,
+                "reason_code": "MANUAL_LOCK",
+                "created_at": "2026-11-10T00:00:00Z",
+                "updated_at": "2026-11-10T00:00:00Z",
+                "details": "Legacy state missing tx_hashes"
+            }
+            with open(sm.get_state_path(), "w", encoding="utf-8") as f:
+                json.dump(legacy_data, f)
+
+            loaded = sm.load_state()
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["tx_hashes"], [legacy_hash])
+
+            can_proceed, reason, state_out = sm.check_startup_protection()
+            self.assertFalse(can_proceed)
+            self.assertEqual(reason, "Keeper is locked for manual review (reason: MANUAL_LOCK)")
+            self.assertIsNotNone(state_out)
+            self.assertEqual(state_out["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(state_out["reason_code"], "MANUAL_LOCK")
+            self.assertEqual(state_out["tx_hashes"], [legacy_hash])
+
+    @patch("script.keeper.rpc_call")
+    @patch("subprocess.run")
+    def test_manual_unlock_snapshot_audit_record_success_and_failure(self, mock_subproc, mock_rpc):
+        """manual_unlock records read-only snapshot in audit log on success, or '快照不可用' on RPC failure."""
+        miner = "0x420382a0f874c1F120621f847d81581e8737504e"
+        sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+        tx_h = "0x" + "e" * 64
+
+        # Part 1: RPC Success
+        mock_rpc.side_effect = lambda url, method, params: (
+            "0x6080604052" if method == "eth_getCode"
+            else "0x61" if method == "eth_chainId"
+            else "0x7" if method == "eth_getTransactionCount"
+            else {"status": "0x1", "blockNumber": "0x200"} if method == "eth_getTransactionReceipt"
+            else "0x0"
+        )
+        mock_subproc.side_effect = lambda *a, **kw: MagicMock(returncode=0, stdout=sender + chr(10), stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            from script.keeper_state import KeeperStateManager, StateDomain
+            domain = StateDomain(chain_id=97, miner_address=miner, sender_address=sender)
+            sm = KeeperStateManager(state_dir=tmp_dir, domain=domain)
+            sm.record_manual_review_lock(reason="Review needed", nonce=7, operation="test", tx_hash=tx_h)
+
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir
+            )
+            bot.manual_unlock(expected_nonce=7, operator_reason="Operator verified on-chain success")
+
+            with open(sm.get_audit_path(), "r", encoding="utf-8") as f:
+                logs = [json.loads(line) for line in f if line.strip()]
+            unlock_log = logs[-1]
+            self.assertEqual(unlock_log["action"], "MANUAL_UNLOCK")
+            snapshot = unlock_log["onchain_snapshot"]
+            self.assertIsInstance(snapshot, dict)
+            self.assertEqual(snapshot["latest_nonce"], 7)
+            self.assertEqual(snapshot["pending_nonce"], 7)
+            self.assertEqual(snapshot["tx_receipts"][tx_h]["status"], "0x1")
+
+        # Part 2: RPC Failure during snapshot query
+        def rpc_fail_snapshot(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            elif method == "eth_chainId":
+                return "0x61"
+            raise Exception("RPC connectivity failed")
+        mock_rpc.side_effect = rpc_fail_snapshot
+
+        with tempfile.TemporaryDirectory() as tmp_dir2:
+            sm2 = KeeperStateManager(state_dir=tmp_dir2, domain=domain)
+            sm2.record_manual_review_lock(reason="Review needed", nonce=8, operation="test", tx_hash=tx_h)
+
+            bot2 = KeeperBot(
+                rpc_url="http://mock-rpc-dead",
+                miner_address=miner,
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                state_dir=tmp_dir2
+            )
+            bot2.manual_unlock(expected_nonce=8, operator_reason="Operator verified offline without RPC")
+
+            with open(sm2.get_audit_path(), "r", encoding="utf-8") as f:
+                logs2 = [json.loads(line) for line in f if line.strip()]
+            unlock_log2 = logs2[-1]
+            self.assertEqual(unlock_log2["action"], "MANUAL_UNLOCK")
+            self.assertEqual(unlock_log2["onchain_snapshot"], "快照不可用")

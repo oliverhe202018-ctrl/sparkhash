@@ -13,6 +13,29 @@ from urllib.parse import urlsplit
 from enum import Enum
 from typing import Optional, Dict, Any
 
+try:
+    from script.keeper_state import (
+        KeeperStateManager,
+        StateDomain,
+        DomainValidationError,
+        DomainLockedError,
+        CorruptStateError,
+        UnknownStateVersionError,
+        InvalidStateError,
+        StateWriteError,
+    )
+except ImportError:
+    from keeper_state import (
+        KeeperStateManager,
+        StateDomain,
+        DomainValidationError,
+        DomainLockedError,
+        CorruptStateError,
+        UnknownStateVersionError,
+        InvalidStateError,
+        StateWriteError,
+    )
+
 # Contract function selectors (verified against MinerV1 compiled ABI)
 SELECTOR_EPOCH = "900cf0cf"          # epoch() -> uint256
 SELECTOR_LAST_SYNCED = "93afb4c5"    # lastSynced() -> uint256
@@ -563,7 +586,8 @@ class KeeperBot:
                  account=None, password_file=None,
                  dry_run=True, poll_interval=15, min_gas_price_gwei=DEFAULT_MIN_GAS_PRICE_GWEI,
                  gas_multiplier=DEFAULT_GAS_MULTIPLIER, tx_timeout=DEFAULT_TX_TIMEOUT,
-                 max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=MAX_SEED_STEPS):
+                 max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=MAX_SEED_STEPS,
+                 state_dir=None):
         self.rpc_url = rpc_url
         self.miner = miner_address.strip().lower() if miner_address and isinstance(miner_address, str) else (miner_address or "")
         self.dry_run = dry_run
@@ -680,6 +704,9 @@ class KeeperBot:
 
         self.locked_for_manual_review = False
         self.manual_review_context = None
+        self.state_dir = state_dir or os.environ.get("KEEPER_STATE_DIR")
+        self.state_manager = None
+        self._domain_lock_acquired = False
 
         if self.rpc_url and isinstance(self.rpc_url, str):
             try:
@@ -701,6 +728,95 @@ class KeeperBot:
 
         # Derive or assign keeper public address for nonce queries and validate identity
         self.validate_identity(keeper_address)
+
+    def _ensure_state_manager(self) -> Optional[KeeperStateManager]:
+        if self.state_manager is not None and self.state_manager.domain_valid:
+            return self.state_manager
+
+        chain_id = None
+        try:
+            chain_id = self.get_chain_id()
+        except (Exception, SystemExit):
+            chain_id = None
+
+        miner_addr = None
+        try:
+            if self.miner:
+                miner_addr = to_checksum_address(self.miner)
+        except (Exception, SystemExit):
+            miner_addr = None
+
+        sender_addr = None
+        try:
+            if self.keeper_address:
+                sender_addr = to_checksum_address(self.keeper_address)
+        except (Exception, SystemExit):
+            sender_addr = None
+
+        domain = None
+        if chain_id is not None and miner_addr is not None and sender_addr is not None:
+            try:
+                domain = StateDomain(chain_id=chain_id, miner_address=miner_addr, sender_address=sender_addr)
+            except Exception:
+                domain = None
+
+        if self.state_manager is None:
+            self.state_manager = KeeperStateManager(state_dir=self.state_dir, domain=domain)
+        elif domain is not None and not self.state_manager.domain_valid:
+            self.state_manager.set_domain(domain)
+
+        return self.state_manager
+
+    def close(self):
+        if getattr(self, "_domain_lock_acquired", False) and getattr(self, "state_manager", None):
+            self.state_manager.release_lock()
+            self._domain_lock_acquired = False
+
+    def manual_unlock(self, expected_nonce=None, operator_reason=None):
+        sm = self._ensure_state_manager()
+        if not sm or not sm.domain_valid:
+            raise DomainValidationError("Cannot unlock without a valid state domain")
+
+        onchain_snapshot = "快照不可用"
+        try:
+            res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
+            latest_nonce = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
+            res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
+            pending_nonce = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
+
+            receipts_status = {}
+            st = sm.load_state() if sm else None
+            if st:
+                h_list = st.get("tx_hashes")
+                if not isinstance(h_list, list):
+                    h_single = st.get("tx_hash")
+                    h_list = [h_single] if (h_single and h_single != "Unknown") else []
+                for h in h_list:
+                    if h and h != "Unknown":
+                        try:
+                            rec = rpc_call(self.rpc_url, "eth_getTransactionReceipt", [h])
+                            if rec:
+                                receipts_status[h] = {
+                                    "status": rec.get("status"),
+                                    "blockNumber": rec.get("blockNumber")
+                                }
+                            else:
+                                receipts_status[h] = "not_found_or_pending"
+                        except Exception:
+                            receipts_status[h] = "receipt_query_failed"
+            onchain_snapshot = {
+                "latest_nonce": latest_nonce,
+                "pending_nonce": pending_nonce,
+                "tx_receipts": receipts_status
+            }
+        except Exception as snap_e:
+            self.log("WARN", f"Failed to retrieve on-chain snapshot for manual unlock: {format_exception_safe(snap_e)}")
+            onchain_snapshot = "快照不可用"
+
+        result = sm.manual_unlock(expected_nonce=expected_nonce, operator_reason=operator_reason, onchain_snapshot=onchain_snapshot)
+        self.locked_for_manual_review = False
+        self.manual_review_context = None
+        return result
 
     def validate_account_name(self, name: str):
         if not name or not name.strip():
@@ -980,8 +1096,13 @@ class KeeperBot:
             self.alert(f"Preflight check failed for {func_desc}: {err_name}")
             return False, err_name
 
-    def lock_for_manual_review(self, reason: str, nonce: Optional[int], func_name: str, tx_hash: Optional[str] = None):
+    def lock_for_manual_review(self, reason: str, nonce: Optional[int], func_name: str, tx_hash: Optional[str] = None, reason_code: Optional[str] = None, tx_hashes: Optional[list] = None):
         self.locked_for_manual_review = True
+        if nonce is None and getattr(self, "keeper_address", None):
+            try:
+                nonce = self.get_nonce()
+            except (Exception, SystemExit):
+                nonce = None
 
         sensitive = [self.password_file] if getattr(self, "password_file", None) else None
 
@@ -1013,6 +1134,15 @@ class KeeperBot:
         except (Exception, SystemExit):
             clean_hash = None
 
+        hashes = list(tx_hashes) if isinstance(tx_hashes, list) else []
+        if clean_hash and clean_hash not in hashes:
+            hashes.append(clean_hash)
+
+        try:
+            clean_reason = sanitize_text(reason, sensitive_values=sensitive)
+        except (Exception, SystemExit):
+            clean_reason = "Transaction outcome uncertain"
+
         self.manual_review_context = {
             "chain_id": chain_id,
             "signer_address": signer,
@@ -1021,11 +1151,25 @@ class KeeperBot:
             "function_name": func_name,
             "tx_hash": clean_hash
         }
+        if hashes:
+            self.manual_review_context["tx_hashes"] = hashes
 
         try:
-            clean_reason = sanitize_text(reason, sensitive_values=sensitive)
-        except (Exception, SystemExit):
-            clean_reason = "Transaction outcome uncertain"
+            sm = self._ensure_state_manager()
+            if sm and sm.domain_valid:
+                sm.record_manual_review_lock(
+                    reason=clean_reason,
+                    nonce=nonce,
+                    operation=func_name,
+                    tx_hash=clean_hash,
+                    reason_code=reason_code or "MANUAL_LOCK",
+                    details=clean_reason,
+                    tx_hashes=hashes
+                )
+        except (Exception, SystemExit) as persist_err:
+            safe_err = sanitize_text(format_exception_safe(persist_err), sensitive_values=sensitive)
+            self.log("WARN", f"Failed to persist manual review lock to disk: {safe_err}")
+
 
         try:
             self.alert("=================================================================")
@@ -1056,6 +1200,8 @@ class KeeperBot:
         if func_name is None:
             func_name = desc
 
+        nonce = getattr(self, "current_nonce", None)
+
         if getattr(self, "locked_for_manual_review", False):
             self.alert(f"Transaction broadcast BLOCKED: Keeper is locked pending manual review. Broadcast refused for {func_name}.")
             return TxResult(
@@ -1065,26 +1211,24 @@ class KeeperBot:
                 context=getattr(self, "manual_review_context", None)
             )
 
-        if preflight:
-            ok, err_name = self.preflight_check(calldata, func_name)
-            if not ok:
-                self.log("ACTION", f"Skipping {func_name}: preflight simulation failed ({err_name})")
-                return TxResult(
-                    status=TxExecutionStatus.PREFLIGHT_FAILURE,
-                    error=f"preflight simulation failed: {err_name}",
-                    context={
-                        "chain_id": self.get_chain_id(),
-                        "target_contract": to_checksum_address(self.miner),
-                        "function_name": func_name,
-                        "calldata": calldata,
-                        "revert_error": err_name
-                    }
-                )
-
-        gas_price = self.get_gas_price()
-        nonce = self.get_nonce()
-
         if self.dry_run:
+            if preflight:
+                ok, err_name = self.preflight_check(calldata, func_name)
+                if not ok:
+                    self.log("ACTION", f"Skipping {func_name}: preflight simulation failed ({err_name})")
+                    return TxResult(
+                        status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                        error=f"preflight simulation failed: {err_name}",
+                        context={
+                            "chain_id": self.get_chain_id(),
+                            "target_contract": to_checksum_address(self.miner),
+                            "function_name": func_name,
+                            "calldata": calldata,
+                            "revert_error": err_name
+                        }
+                    )
+            gas_price = self.get_gas_price()
+            nonce = self.get_nonce()
             chain_id = self.get_chain_id()
             cur_epoch = getattr(self, "current_epoch", None)
             if cur_epoch is None:
@@ -1113,17 +1257,460 @@ class KeeperBot:
                 dry_run=True
             )
 
-        if not self.dry_run:
-            self.validate_identity(self.keeper_address)
+        self.validate_identity(self.keeper_address)
 
-        gas_limit = self.estimate_gas_limit(calldata, default_gas=300000)
-        target_addr = to_checksum_address(self.miner)
-        current_gas_price = gas_price
-        active_tx_hash = None
+        sm = self._ensure_state_manager()
+        if not sm or not sm.domain_valid:
+            err_msg = "Cannot safely determine state domain (chainId, miner, or sender invalid). Broadcast refused."
+            self.alert(f"Transaction broadcast BLOCKED: {err_msg}")
+            self.lock_for_manual_review(reason=err_msg, nonce=nonce, func_name=func_name, reason_code="INVALID_DOMAIN")
+            return TxResult(
+                status=TxExecutionStatus.UNCERTAIN,
+                nonce=nonce,
+                error=err_msg,
+                context=self.manual_review_context
+            )
 
-        if self.account:
-            cast_bin = shutil.which("cast") or "cast"
-            isolated_env = get_isolated_cast_env()
+        # 1. Acquire mutex lock FIRST (sender-level mutual exclusion across processes)
+        if not getattr(self, "_domain_lock_acquired", False):
+            if not sm.acquire_lock():
+                err_msg = f"Sender {self.keeper_address} on chain {self.get_chain_id()} is locked by another active Keeper process"
+                self.alert(f"Transaction broadcast BLOCKED: {err_msg}")
+                return TxResult(
+                    status=TxExecutionStatus.UNCERTAIN,
+                    nonce=nonce,
+                    error=err_msg,
+                    context=getattr(self, "manual_review_context", None)
+                )
+            self._domain_lock_acquired = True
+
+        try:
+            # 2. Re-read persistent state INSIDE the lock (avoids TOCTOU race)
+            can_proceed, block_reason, state_data = sm.check_startup_protection()
+            if not can_proceed:
+                if state_data and state_data.get("status") == "PREPARING_TO_SEND":
+                    updated_state = sm.recover_crash_to_manual_review(state_data)
+                    self.locked_for_manual_review = True
+                    self.manual_review_context = sm.build_context_from_state(updated_state)
+                    err_msg = "crash before confirmation detected from previous run (status: PREPARING_TO_SEND). Broadcast refused and locked for manual review."
+                    self.alert(f"Transaction broadcast BLOCKED: {err_msg}")
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        nonce=updated_state.get("nonce", nonce),
+                        error=err_msg,
+                        context=self.manual_review_context
+                    )
+                else:
+                    self.locked_for_manual_review = True
+                    if state_data:
+                        self.manual_review_context = sm.build_context_from_state(state_data)
+                    reported_nonce = state_data.get("nonce") if (state_data and state_data.get("nonce") != "Unknown") else nonce
+                    self.alert(f"Transaction broadcast BLOCKED: {block_reason}")
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        nonce=reported_nonce,
+                        error=block_reason,
+                        context=self.manual_review_context
+                    )
+
+            # 3. Perform preflight simulation under the lock
+            if preflight:
+                ok, err_name = self.preflight_check(calldata, func_name)
+                if not ok:
+                    self.log("ACTION", f"Skipping {func_name}: preflight simulation failed ({err_name})")
+                    return TxResult(
+                        status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                        error=f"preflight simulation failed: {err_name}",
+                        context={
+                            "chain_id": self.get_chain_id(),
+                            "target_contract": to_checksum_address(self.miner),
+                            "function_name": func_name,
+                            "calldata": calldata,
+                            "revert_error": err_name
+                        }
+                    )
+
+            # 4. Re-fetch fresh gas price and fresh nonce INSIDE the lock
+            gas_price = self.get_gas_price()
+            nonce = self.get_nonce()
+
+            gas_limit = self.estimate_gas_limit(calldata, default_gas=300000)
+            target_addr = to_checksum_address(self.miner)
+            current_gas_price = gas_price
+            active_tx_hash = None
+            broadcasted_hashes = []
+
+            def _check_all_known_receipts():
+                for h in broadcasted_hashes:
+                    self.log("INFO", f"Checking receipt for broadcasted txHash {h}...")
+                    receipt = self.wait_for_receipt(h, min(self.tx_timeout, 15))
+                    if receipt:
+                        st_r = receipt.get("status")
+                        blk = int(receipt.get("blockNumber", "0x0"), 16)
+                        used = int(receipt.get("gasUsed", "0x0"), 16)
+                        if st_r in ("0x1", 1, True):
+                            self.log("SUCCESS", f"Transaction {h} CONFIRMED in block {blk}! Gas used: {used}")
+                            self.current_nonce = nonce + 1
+                            if sm:
+                                try:
+                                    sm.record_confirmed_success(tx_hash=h, block_number=blk, gas_used=used)
+                                except Exception as sm_e:
+                                    err_str = format_exception_safe(sm_e)
+                                    self.alert(f"Transaction confirmed on-chain but failed to save CONFIRMED_SUCCESS state: {err_str}")
+                                    self.lock_for_manual_review(
+                                        reason=f"Tx confirmed on-chain ({h}) but failed to write state ({err_str})",
+                                        nonce=nonce,
+                                        func_name=func_name,
+                                        tx_hash=h,
+                                        reason_code="STATE_WRITE_FAILURE",
+                                        tx_hashes=broadcasted_hashes
+                                    )
+                                    return TxResult(
+                                        status=TxExecutionStatus.UNCERTAIN,
+                                        tx_hash=h,
+                                        nonce=nonce,
+                                        error=err_str,
+                                        context=self.manual_review_context
+                                    )
+                            return TxResult(
+                                status=TxExecutionStatus.CONFIRMED_SUCCESS,
+                                tx_hash=h,
+                                receipt=receipt,
+                                nonce=nonce
+                            )
+                        else:
+                            self.alert(f"Transaction {h} REVERTED in block {blk}!")
+                            self.current_nonce = nonce + 1
+                            if sm:
+                                try:
+                                    sm.record_confirmed_revert(tx_hash=h, block_number=blk, gas_used=used, revert_reason="revert")
+                                except Exception as sm_e:
+                                    err_str = format_exception_safe(sm_e)
+                                    self.alert(f"Transaction reverted on-chain but failed to save CONFIRMED_REVERT state: {err_str}")
+                                    self.lock_for_manual_review(
+                                        reason=f"Tx reverted on-chain ({h}) but failed to write state ({err_str})",
+                                        nonce=nonce,
+                                        func_name=func_name,
+                                        tx_hash=h,
+                                        reason_code="STATE_WRITE_FAILURE",
+                                        tx_hashes=broadcasted_hashes
+                                    )
+                                    return TxResult(
+                                        status=TxExecutionStatus.UNCERTAIN,
+                                        tx_hash=h,
+                                        nonce=nonce,
+                                        error=f"Tx reverted on-chain but failed to write state: {err_str}",
+                                        context=self.manual_review_context
+                                    )
+                            return TxResult(
+                                status=TxExecutionStatus.CONFIRMED_REVERT,
+                                tx_hash=h,
+                                receipt=receipt,
+                                nonce=nonce
+                            )
+                return None
+
+            if not self.dry_run and sm:
+                try:
+                    sm.record_preparing_to_send(
+                        operation=func_name,
+                        epoch=getattr(self, "current_epoch", "Unknown"),
+                        nonce=nonce,
+                        details=f"Broadcasting {func_name} with nonce {nonce}"
+                    )
+                except Exception as e:
+                    err_str = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file] if self.password_file else None)
+                    self.alert(f"Transaction broadcast ABORTED: Failed to write in-flight state before sending: {err_str}")
+                    self.lock_for_manual_review(
+                        reason=f"Failed to persist in-flight state ({err_str})",
+                        nonce=nonce,
+                        func_name=func_name,
+                        reason_code="STATE_WRITE_FAILURE"
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        nonce=nonce,
+                        error=f"Failed to persist in-flight state: {err_str}",
+                        context=self.manual_review_context
+                    )
+
+            if self.account:
+                cast_bin = shutil.which("cast") or "cast"
+                isolated_env = get_isolated_cast_env()
+
+                for attempt in range(self.max_retries + 1):
+                    if attempt > 0:
+                        net_price = self.get_network_gas_price()
+                        current_gas_price = get_bumped_gas_price(
+                            current_gas_price,
+                            min_bump_ratio=1.15,
+                            network_gas_price_wei=net_price,
+                            min_gas_price_gwei=self.min_gas_price_gwei,
+                            multiplier=self.gas_multiplier
+                        )
+                        self.log("RETRY", f"Speed-up replacement attempt #{attempt} for {func_name} with IDENTICAL nonce {nonce}, bumped gasPrice: {current_gas_price / 1e9:.4f} gwei ({current_gas_price} wei)")
+
+                    cmd = [
+                        cast_bin, "send", target_addr,
+                        "--data", calldata,
+                        "--account", self.account,
+                        "--password-file", self.password_file,
+                        "--rpc-url", self.rpc_url,
+                        "--gas-price", str(current_gas_price),
+                        "--gas-limit", str(gas_limit),
+                        "--nonce", str(nonce),
+                        "--async"
+                    ]
+
+                    tx_hash = None
+                    try:
+                        proc = subprocess.run(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            shell=False,
+                            timeout=self.tx_timeout,
+                            env=isolated_env
+                        )
+                    except subprocess.TimeoutExpired:
+                        err_str = f"cast send subprocess timed out after {self.tx_timeout}s"
+                        self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
+                        if broadcasted_hashes:
+                            rec_res = _check_all_known_receipts()
+                            if rec_res:
+                                return rec_res
+                        self.lock_for_manual_review(
+                            reason=f"cast send timed out during execution ({err_str})",
+                            nonce=nonce,
+                            func_name=func_name,
+                            tx_hash=active_tx_hash,
+                            tx_hashes=broadcasted_hashes
+                        )
+                        return TxResult(
+                            status=TxExecutionStatus.UNCERTAIN,
+                            tx_hash=active_tx_hash,
+                            nonce=nonce,
+                            error=err_str,
+                            context=self.manual_review_context
+                        )
+                    except Exception as e:
+                        err_str = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file])
+                        self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
+                        if broadcasted_hashes:
+                            rec_res = _check_all_known_receipts()
+                            if rec_res:
+                                return rec_res
+                        self.lock_for_manual_review(
+                            reason=f"cast send execution exception ({err_str})",
+                            nonce=nonce,
+                            func_name=func_name,
+                            tx_hash=active_tx_hash,
+                            tx_hashes=broadcasted_hashes
+                        )
+                        return TxResult(
+                            status=TxExecutionStatus.UNCERTAIN,
+                            tx_hash=active_tx_hash,
+                            nonce=nonce,
+                            error=err_str,
+                            context=self.manual_review_context
+                        )
+
+                    out = proc.stdout or ""
+                    err = proc.stderr or ""
+                    if proc.returncode != 0:
+                        err_str = sanitize_text(f"{err}\n{out}".strip(), sensitive_values=[self.password_file])
+                        is_nonce_err = "nonce too low" in err_str.lower() or "already known" in err_str.lower()
+                        if is_nonce_err:
+                            diag_latest = None
+                            diag_pending = None
+                            try:
+                                res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
+                                diag_latest = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
+                                res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
+                                diag_pending = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
+                            except Exception as diag_e:
+                                self.log("WARN", f"Failed to fetch diagnostic nonces: {format_exception_safe(diag_e)}")
+                            self.log("WARN", f"RPC response: {err_str} (Diagnostic nonces: latest={diag_latest}, pending={diag_pending}, attempted_nonce={nonce})")
+                        else:
+                            self.alert(f"cast send failed on attempt {attempt} (code {proc.returncode}): {err_str}")
+
+                        if broadcasted_hashes:
+                            rec_res = _check_all_known_receipts()
+                            if rec_res:
+                                return rec_res
+
+                        self.lock_for_manual_review(
+                            reason=f"cast send failed on attempt {attempt} (code {proc.returncode}): {err_str}",
+                            nonce=nonce,
+                            func_name=func_name,
+                            tx_hash=active_tx_hash,
+                            tx_hashes=broadcasted_hashes
+                        )
+                        return TxResult(
+                            status=TxExecutionStatus.UNCERTAIN,
+                            tx_hash=active_tx_hash,
+                            nonce=nonce,
+                            error=err_str,
+                            context=self.manual_review_context
+                        )
+
+                    m = re.search(r"0x[0-9a-fA-F]{64}", out)
+                    if not m:
+                        err_str = sanitize_text(out, sensitive_values=[self.password_file])
+                        self.alert(f"cast send succeeded (code 0) but no valid txHash found in output: {err_str}")
+                        if broadcasted_hashes:
+                            rec_res = _check_all_known_receipts()
+                            if rec_res:
+                                return rec_res
+                        self.lock_for_manual_review(
+                            reason=f"cast send succeeded on attempt {attempt} but output missing valid txHash",
+                            nonce=nonce,
+                            func_name=func_name,
+                            tx_hash=active_tx_hash,
+                            tx_hashes=broadcasted_hashes
+                        )
+                        return TxResult(
+                            status=TxExecutionStatus.UNCERTAIN,
+                            tx_hash=active_tx_hash,
+                            nonce=nonce,
+                            error="Missing txHash in cast send output",
+                            context=self.manual_review_context
+                        )
+
+                    tx_hash = m.group(0)
+                    active_tx_hash = tx_hash
+                    if tx_hash not in broadcasted_hashes:
+                        broadcasted_hashes.append(tx_hash)
+                    if sm:
+                        try:
+                            sm.record_broadcasted(tx_hash)
+                        except Exception as sm_e:
+                            err_str = format_exception_safe(sm_e)
+                            self.alert(f"Failed to record broadcasted txHash {tx_hash} to state file: {err_str}")
+                            self.lock_for_manual_review(
+                                reason=f"Broadcasted txHash {tx_hash} could not be persisted to state ({err_str})",
+                                nonce=nonce,
+                                func_name=func_name,
+                                tx_hash=tx_hash,
+                                reason_code="STATE_WRITE_FAILURE"
+                            )
+                            return TxResult(
+                                status=TxExecutionStatus.UNCERTAIN,
+                                tx_hash=tx_hash,
+                                nonce=nonce,
+                                error=err_str,
+                                context=self.manual_review_context
+                            )
+                    self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
+
+                    receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
+                    if receipt:
+                        status = receipt.get("status")
+                        blk = int(receipt.get("blockNumber", "0x0"), 16)
+                        used = int(receipt.get("gasUsed", "0x0"), 16)
+                        if status in ("0x1", 1, True):
+                            self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
+                            self.current_nonce = nonce + 1
+                            if sm:
+                                try:
+                                    sm.record_confirmed_success(tx_hash=tx_hash, block_number=blk, gas_used=used)
+                                except Exception as sm_e:
+                                    err_str = format_exception_safe(sm_e)
+                                    self.alert(f"Transaction confirmed on-chain but failed to save CONFIRMED_SUCCESS state: {err_str}")
+                                    self.lock_for_manual_review(
+                                        reason=f"Tx confirmed on-chain ({tx_hash}) but failed to write state ({err_str})",
+                                        nonce=nonce,
+                                        func_name=func_name,
+                                        tx_hash=tx_hash,
+                                        reason_code="STATE_WRITE_FAILURE"
+                                    )
+                                    return TxResult(
+                                        status=TxExecutionStatus.UNCERTAIN,
+                                        tx_hash=tx_hash,
+                                        nonce=nonce,
+                                        error=err_str,
+                                        context=self.manual_review_context
+                                    )
+                            return TxResult(
+                                status=TxExecutionStatus.CONFIRMED_SUCCESS,
+                                tx_hash=tx_hash,
+                                receipt=receipt,
+                                nonce=nonce
+                            )
+                        else:
+                            self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
+                            self.current_nonce = nonce + 1
+                            if sm:
+                                try:
+                                    sm.record_confirmed_revert(tx_hash=tx_hash, block_number=blk, gas_used=used, revert_reason="revert")
+                                except Exception as sm_e:
+                                    err_str = format_exception_safe(sm_e)
+                                    self.alert(f"Transaction reverted on-chain but failed to save CONFIRMED_REVERT state: {err_str}")
+                                    self.lock_for_manual_review(
+                                        reason=f"Tx reverted on-chain ({tx_hash}) but failed to write state ({err_str})",
+                                        nonce=nonce,
+                                        func_name=func_name,
+                                        tx_hash=tx_hash,
+                                        reason_code="STATE_WRITE_FAILURE",
+                                        tx_hashes=broadcasted_hashes
+                                    )
+                                    return TxResult(
+                                        status=TxExecutionStatus.UNCERTAIN,
+                                        tx_hash=tx_hash,
+                                        nonce=nonce,
+                                        error=f"Tx reverted on-chain but failed to write state: {err_str}",
+                                        context=self.manual_review_context
+                                    )
+                            return TxResult(
+                                status=TxExecutionStatus.CONFIRMED_REVERT,
+                                tx_hash=tx_hash,
+                                receipt=receipt,
+                                nonce=nonce
+                            )
+
+                    self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
+                    if attempt < self.max_retries:
+                        self.log("RETRY", f"Retrying with identical nonce {nonce}...")
+
+                self.alert(f"All {self.max_retries} speed-up attempts exhausted for {func_name} with nonce {nonce}!")
+                if broadcasted_hashes:
+                    rec_res = _check_all_known_receipts()
+                    if rec_res:
+                        return rec_res
+                self.lock_for_manual_review(
+                    reason=f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted",
+                    nonce=nonce,
+                    func_name=func_name,
+                    tx_hash=active_tx_hash,
+                    tx_hashes=broadcasted_hashes
+                )
+                return TxResult(
+                    status=TxExecutionStatus.PENDING_UNCONFIRMED,
+                    tx_hash=active_tx_hash,
+                    nonce=nonce,
+                    context=self.manual_review_context
+                )
+
+            if not self.private_key:
+                self.alert("Cannot broadcast " + desc + ": No private key provided in environment!")
+                return TxResult(
+                    status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                    error="No private key configured",
+                    context={"function_name": func_name}
+                )
+
+            try:
+                from eth_account import Account
+            except ImportError:
+                self.alert("Cannot broadcast " + desc + ": eth_account package not installed!")
+                return TxResult(
+                    status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                    error="eth_account not installed",
+                    context={"function_name": func_name}
+                )
+
+            chain_id = self.get_chain_id()
 
             for attempt in range(self.max_retries + 1):
                 if attempt > 0:
@@ -1137,66 +1724,51 @@ class KeeperBot:
                     )
                     self.log("RETRY", f"Speed-up replacement attempt #{attempt} for {func_name} with IDENTICAL nonce {nonce}, bumped gasPrice: {current_gas_price / 1e9:.4f} gwei ({current_gas_price} wei)")
 
-                cmd = [
-                    cast_bin, "send", target_addr,
-                    "--data", calldata,
-                    "--account", self.account,
-                    "--password-file", self.password_file,
-                    "--rpc-url", self.rpc_url,
-                    "--gas-price", str(current_gas_price),
-                    "--gas-limit", str(gas_limit),
-                    "--nonce", str(nonce),
-                    "--async"
-                ]
+                tx_dict = {
+                    "to": target_addr,
+                    "value": 0,
+                    "gas": gas_limit,
+                    "gasPrice": current_gas_price,
+                    "nonce": nonce,
+                    "chainId": chain_id,
+                    "data": calldata
+                }
+
+                try:
+                    signed = Account.sign_transaction(tx_dict, self.private_key)
+                    raw_bytes = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
+                    raw_hex = "0x" + raw_bytes.hex()
+                except Exception as e:
+                    err_str = format_exception_safe(e)
+                    self.alert(f"Failed to sign transaction on attempt {attempt}: {err_str}")
+                    if broadcasted_hashes:
+                        rec_res = _check_all_known_receipts()
+                        if rec_res:
+                            return rec_res
+                    self.lock_for_manual_review(
+                        reason=f"Failed to sign transaction ({err_str})",
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=active_tx_hash,
+                        tx_hashes=broadcasted_hashes
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=active_tx_hash,
+                        nonce=nonce,
+                        error=err_str,
+                        context=self.manual_review_context
+                    )
 
                 tx_hash = None
                 try:
-                    proc = subprocess.run(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        shell=False,
-                        timeout=self.tx_timeout,
-                        env=isolated_env
-                    )
-                except subprocess.TimeoutExpired:
-                    err_str = f"cast send subprocess timed out after {self.tx_timeout}s"
-                    self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
-                    self.lock_for_manual_review(
-                        reason=f"cast send timed out during execution ({err_str})",
-                        nonce=nonce,
-                        func_name=func_name,
-                        tx_hash=active_tx_hash
-                    )
-                    return TxResult(
-                        status=TxExecutionStatus.UNCERTAIN,
-                        tx_hash=active_tx_hash,
-                        nonce=nonce,
-                        error=err_str,
-                        context=self.manual_review_context
-                    )
+                    res = rpc_call(self.rpc_url, "eth_sendRawTransaction", [raw_hex])
+                    if isinstance(res, str) and re.match(r"^0x[0-9a-fA-F]{64}$", res):
+                        tx_hash = res
+                    else:
+                        self.alert(f"eth_sendRawTransaction returned non-hash response: {res}")
                 except Exception as e:
-                    err_str = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file])
-                    self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
-                    self.lock_for_manual_review(
-                        reason=f"cast send execution exception ({err_str})",
-                        nonce=nonce,
-                        func_name=func_name,
-                        tx_hash=active_tx_hash
-                    )
-                    return TxResult(
-                        status=TxExecutionStatus.UNCERTAIN,
-                        tx_hash=active_tx_hash,
-                        nonce=nonce,
-                        error=err_str,
-                        context=self.manual_review_context
-                    )
-
-                out = proc.stdout or ""
-                err = proc.stderr or ""
-                if proc.returncode != 0:
-                    err_str = sanitize_text(f"{err}\n{out}".strip(), sensitive_values=[self.password_file])
+                    err_str = format_exception_safe(e)
                     is_nonce_err = "nonce too low" in err_str.lower() or "already known" in err_str.lower()
                     if is_nonce_err:
                         diag_latest = None
@@ -1210,39 +1782,19 @@ class KeeperBot:
                             self.log("WARN", f"Failed to fetch diagnostic nonces: {format_exception_safe(diag_e)}")
                         self.log("WARN", f"RPC response: {err_str} (Diagnostic nonces: latest={diag_latest}, pending={diag_pending}, attempted_nonce={nonce})")
                     else:
-                        self.alert(f"cast send failed on attempt {attempt} (code {proc.returncode}): {err_str}")
+                        self.alert(f"eth_sendRawTransaction failed on attempt {attempt}: {err_str}")
 
-                    if active_tx_hash:
-                        self.log("INFO", f"Checking receipt for previously broadcasted txHash {active_tx_hash}...")
-                        receipt = self.wait_for_receipt(active_tx_hash, min(self.tx_timeout, 15))
-                        if receipt:
-                            status = receipt.get("status")
-                            blk = int(receipt.get("blockNumber", "0x0"), 16)
-                            used = int(receipt.get("gasUsed", "0x0"), 16)
-                            if status in ("0x1", 1, True):
-                                self.log("SUCCESS", f"Transaction {active_tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
-                                self.current_nonce = nonce + 1
-                                return TxResult(
-                                    status=TxExecutionStatus.CONFIRMED_SUCCESS,
-                                    tx_hash=active_tx_hash,
-                                    receipt=receipt,
-                                    nonce=nonce
-                                )
-                            else:
-                                self.alert(f"Transaction {active_tx_hash} REVERTED in block {blk}!")
-                                self.current_nonce = nonce + 1
-                                return TxResult(
-                                    status=TxExecutionStatus.CONFIRMED_REVERT,
-                                    tx_hash=active_tx_hash,
-                                    receipt=receipt,
-                                    nonce=nonce
-                                )
+                    if broadcasted_hashes:
+                        rec_res = _check_all_known_receipts()
+                        if rec_res:
+                            return rec_res
 
                     self.lock_for_manual_review(
-                        reason=f"cast send failed on attempt {attempt} (code {proc.returncode}): {err_str}",
+                        reason=f"eth_sendRawTransaction failed on attempt {attempt}: {err_str}",
                         nonce=nonce,
                         func_name=func_name,
-                        tx_hash=active_tx_hash
+                        tx_hash=active_tx_hash,
+                        tx_hashes=broadcasted_hashes
                     )
                     return TxResult(
                         status=TxExecutionStatus.UNCERTAIN,
@@ -1252,28 +1804,52 @@ class KeeperBot:
                         context=self.manual_review_context
                     )
 
-                m = re.search(r"0x[0-9a-fA-F]{64}", out)
-                if not m:
-                    err_str = sanitize_text(out, sensitive_values=[self.password_file])
-                    self.alert(f"cast send succeeded (code 0) but no valid txHash found in output: {err_str}")
+                if not tx_hash:
+                    if broadcasted_hashes:
+                        rec_res = _check_all_known_receipts()
+                        if rec_res:
+                            return rec_res
                     self.lock_for_manual_review(
-                        reason=f"cast send succeeded on attempt {attempt} but output missing valid txHash",
+                        reason="eth_sendRawTransaction did not return a valid txHash",
                         nonce=nonce,
                         func_name=func_name,
-                        tx_hash=active_tx_hash
+                        tx_hash=active_tx_hash,
+                        tx_hashes=broadcasted_hashes
                     )
                     return TxResult(
                         status=TxExecutionStatus.UNCERTAIN,
                         tx_hash=active_tx_hash,
                         nonce=nonce,
-                        error="Missing txHash in cast send output",
+                        error="Missing valid txHash from eth_sendRawTransaction",
                         context=self.manual_review_context
                     )
 
-                tx_hash = m.group(0)
                 active_tx_hash = tx_hash
+                if tx_hash not in broadcasted_hashes:
+                    broadcasted_hashes.append(tx_hash)
+                if sm:
+                    try:
+                        sm.record_broadcasted(tx_hash)
+                    except Exception as sm_e:
+                        err_str = format_exception_safe(sm_e)
+                        self.alert(f"Failed to record broadcasted txHash {tx_hash} to state file: {err_str}")
+                        self.lock_for_manual_review(
+                            reason=f"Broadcasted txHash {tx_hash} could not be persisted to state ({err_str})",
+                            nonce=nonce,
+                            func_name=func_name,
+                            tx_hash=tx_hash,
+                            reason_code="STATE_WRITE_FAILURE"
+                        )
+                        return TxResult(
+                            status=TxExecutionStatus.UNCERTAIN,
+                            tx_hash=tx_hash,
+                            nonce=nonce,
+                            error=err_str,
+                            context=self.manual_review_context
+                        )
                 self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
 
+                # Wait for receipt
                 receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
                 if receipt:
                     status = receipt.get("status")
@@ -1282,6 +1858,26 @@ class KeeperBot:
                     if status in ("0x1", 1, True):
                         self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
                         self.current_nonce = nonce + 1
+                        if sm:
+                            try:
+                                sm.record_confirmed_success(tx_hash=tx_hash, block_number=blk, gas_used=used)
+                            except Exception as sm_e:
+                                err_str = format_exception_safe(sm_e)
+                                self.alert(f"Transaction confirmed on-chain but failed to save CONFIRMED_SUCCESS state: {err_str}")
+                                self.lock_for_manual_review(
+                                    reason=f"Tx confirmed on-chain ({tx_hash}) but failed to write state ({err_str})",
+                                    nonce=nonce,
+                                    func_name=func_name,
+                                    tx_hash=tx_hash,
+                                    reason_code="STATE_WRITE_FAILURE"
+                                )
+                                return TxResult(
+                                    status=TxExecutionStatus.UNCERTAIN,
+                                    tx_hash=tx_hash,
+                                    nonce=nonce,
+                                    error=err_str,
+                                    context=self.manual_review_context
+                                )
                         return TxResult(
                             status=TxExecutionStatus.CONFIRMED_SUCCESS,
                             tx_hash=tx_hash,
@@ -1291,6 +1887,27 @@ class KeeperBot:
                     else:
                         self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
                         self.current_nonce = nonce + 1
+                        if sm:
+                            try:
+                                sm.record_confirmed_revert(tx_hash=tx_hash, block_number=blk, gas_used=used, revert_reason="revert")
+                            except Exception as sm_e:
+                                err_str = format_exception_safe(sm_e)
+                                self.alert(f"Transaction reverted on-chain but failed to save CONFIRMED_REVERT state: {err_str}")
+                                self.lock_for_manual_review(
+                                    reason=f"Tx reverted on-chain ({tx_hash}) but failed to write state ({err_str})",
+                                    nonce=nonce,
+                                    func_name=func_name,
+                                    tx_hash=tx_hash,
+                                    reason_code="STATE_WRITE_FAILURE",
+                                    tx_hashes=broadcasted_hashes
+                                )
+                                return TxResult(
+                                    status=TxExecutionStatus.UNCERTAIN,
+                                    tx_hash=tx_hash,
+                                    nonce=nonce,
+                                    error=f"Tx reverted on-chain but failed to write state: {err_str}",
+                                    context=self.manual_review_context
+                                )
                         return TxResult(
                             status=TxExecutionStatus.CONFIRMED_REVERT,
                             tx_hash=tx_hash,
@@ -1303,11 +1920,16 @@ class KeeperBot:
                     self.log("RETRY", f"Retrying with identical nonce {nonce}...")
 
             self.alert(f"All {self.max_retries} speed-up attempts exhausted for {func_name} with nonce {nonce}!")
+            if broadcasted_hashes:
+                rec_res = _check_all_known_receipts()
+                if rec_res:
+                    return rec_res
             self.lock_for_manual_review(
                 reason=f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted",
                 nonce=nonce,
                 func_name=func_name,
-                tx_hash=active_tx_hash
+                tx_hash=active_tx_hash,
+                tx_hashes=broadcasted_hashes
             )
             return TxResult(
                 status=TxExecutionStatus.PENDING_UNCONFIRMED,
@@ -1315,194 +1937,11 @@ class KeeperBot:
                 nonce=nonce,
                 context=self.manual_review_context
             )
+        finally:
+            if not self.dry_run and sm and getattr(self, "_domain_lock_acquired", False):
+                sm.release_lock()
+                self._domain_lock_acquired = False
 
-        if not self.private_key:
-            self.alert("Cannot broadcast " + desc + ": No private key provided in environment!")
-            return TxResult(
-                status=TxExecutionStatus.PREFLIGHT_FAILURE,
-                error="No private key configured",
-                context={"function_name": func_name}
-            )
-
-        try:
-            from eth_account import Account
-        except ImportError:
-            self.alert("Cannot broadcast " + desc + ": eth_account package not installed!")
-            return TxResult(
-                status=TxExecutionStatus.PREFLIGHT_FAILURE,
-                error="eth_account not installed",
-                context={"function_name": func_name}
-            )
-
-        chain_id = self.get_chain_id()
-
-        for attempt in range(self.max_retries + 1):
-            if attempt > 0:
-                net_price = self.get_network_gas_price()
-                current_gas_price = get_bumped_gas_price(
-                    current_gas_price,
-                    min_bump_ratio=1.15,
-                    network_gas_price_wei=net_price,
-                    min_gas_price_gwei=self.min_gas_price_gwei,
-                    multiplier=self.gas_multiplier
-                )
-                self.log("RETRY", f"Speed-up replacement attempt #{attempt} for {func_name} with IDENTICAL nonce {nonce}, bumped gasPrice: {current_gas_price / 1e9:.4f} gwei ({current_gas_price} wei)")
-
-            tx_dict = {
-                "to": target_addr,
-                "value": 0,
-                "gas": gas_limit,
-                "gasPrice": current_gas_price,
-                "nonce": nonce,
-                "chainId": chain_id,
-                "data": calldata
-            }
-
-            try:
-                signed = Account.sign_transaction(tx_dict, self.private_key)
-                raw_bytes = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
-                raw_hex = "0x" + raw_bytes.hex()
-            except Exception as e:
-                err_str = format_exception_safe(e)
-                self.alert(f"Failed to sign transaction on attempt {attempt}: {err_str}")
-                self.lock_for_manual_review(
-                    reason=f"Failed to sign transaction ({err_str})",
-                    nonce=nonce,
-                    func_name=func_name,
-                    tx_hash=active_tx_hash
-                )
-                return TxResult(
-                    status=TxExecutionStatus.UNCERTAIN,
-                    tx_hash=active_tx_hash,
-                    nonce=nonce,
-                    error=err_str,
-                    context=self.manual_review_context
-                )
-
-            tx_hash = None
-            try:
-                res = rpc_call(self.rpc_url, "eth_sendRawTransaction", [raw_hex])
-                if isinstance(res, str) and re.match(r"^0x[0-9a-fA-F]{64}$", res):
-                    tx_hash = res
-                else:
-                    self.alert(f"eth_sendRawTransaction returned non-hash response: {res}")
-            except Exception as e:
-                err_str = format_exception_safe(e)
-                is_nonce_err = "nonce too low" in err_str.lower() or "already known" in err_str.lower()
-                if is_nonce_err:
-                    diag_latest = None
-                    diag_pending = None
-                    try:
-                        res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
-                        diag_latest = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
-                        res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
-                        diag_pending = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
-                    except Exception as diag_e:
-                        self.log("WARN", f"Failed to fetch diagnostic nonces: {format_exception_safe(diag_e)}")
-                    self.log("WARN", f"RPC response: {err_str} (Diagnostic nonces: latest={diag_latest}, pending={diag_pending}, attempted_nonce={nonce})")
-                else:
-                    self.alert(f"eth_sendRawTransaction failed on attempt {attempt}: {err_str}")
-
-                if active_tx_hash:
-                    self.log("INFO", f"Checking receipt for previously broadcasted txHash {active_tx_hash}...")
-                    receipt = self.wait_for_receipt(active_tx_hash, min(self.tx_timeout, 15))
-                    if receipt:
-                        status = receipt.get("status")
-                        blk = int(receipt.get("blockNumber", "0x0"), 16)
-                        used = int(receipt.get("gasUsed", "0x0"), 16)
-                        if status in ("0x1", 1, True):
-                            self.log("SUCCESS", f"Transaction {active_tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
-                            self.current_nonce = nonce + 1
-                            return TxResult(
-                                status=TxExecutionStatus.CONFIRMED_SUCCESS,
-                                tx_hash=active_tx_hash,
-                                receipt=receipt,
-                                nonce=nonce
-                            )
-                        else:
-                            self.alert(f"Transaction {active_tx_hash} REVERTED in block {blk}!")
-                            self.current_nonce = nonce + 1
-                            return TxResult(
-                                status=TxExecutionStatus.CONFIRMED_REVERT,
-                                tx_hash=active_tx_hash,
-                                receipt=receipt,
-                                nonce=nonce
-                            )
-
-                self.lock_for_manual_review(
-                    reason=f"eth_sendRawTransaction failed on attempt {attempt}: {err_str}",
-                    nonce=nonce,
-                    func_name=func_name,
-                    tx_hash=active_tx_hash
-                )
-                return TxResult(
-                    status=TxExecutionStatus.UNCERTAIN,
-                    tx_hash=active_tx_hash,
-                    nonce=nonce,
-                    error=err_str,
-                    context=self.manual_review_context
-                )
-
-            if not tx_hash:
-                self.lock_for_manual_review(
-                    reason="eth_sendRawTransaction did not return a valid txHash",
-                    nonce=nonce,
-                    func_name=func_name,
-                    tx_hash=active_tx_hash
-                )
-                return TxResult(
-                    status=TxExecutionStatus.UNCERTAIN,
-                    tx_hash=active_tx_hash,
-                    nonce=nonce,
-                    error="Missing valid txHash from eth_sendRawTransaction",
-                    context=self.manual_review_context
-                )
-
-            active_tx_hash = tx_hash
-            self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
-
-            # Wait for receipt
-            receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
-            if receipt:
-                status = receipt.get("status")
-                blk = int(receipt.get("blockNumber", "0x0"), 16)
-                used = int(receipt.get("gasUsed", "0x0"), 16)
-                if status in ("0x1", 1, True):
-                    self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
-                    self.current_nonce = nonce + 1
-                    return TxResult(
-                        status=TxExecutionStatus.CONFIRMED_SUCCESS,
-                        tx_hash=tx_hash,
-                        receipt=receipt,
-                        nonce=nonce
-                    )
-                else:
-                    self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
-                    self.current_nonce = nonce + 1
-                    return TxResult(
-                        status=TxExecutionStatus.CONFIRMED_REVERT,
-                        tx_hash=tx_hash,
-                        receipt=receipt,
-                        nonce=nonce
-                    )
-
-            self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
-            if attempt < self.max_retries:
-                self.log("RETRY", f"Retrying with identical nonce {nonce}...")
-
-        self.alert(f"All {self.max_retries} speed-up attempts exhausted for {func_name} with nonce {nonce}!")
-        self.lock_for_manual_review(
-            reason=f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted",
-            nonce=nonce,
-            func_name=func_name,
-            tx_hash=active_tx_hash
-        )
-        return TxResult(
-            status=TxExecutionStatus.PENDING_UNCONFIRMED,
-            tx_hash=active_tx_hash,
-            nonce=nonce,
-            context=self.manual_review_context
-        )
 
     def handle_epoch_seed(self, cur_epoch, seed):
         if seed != 0:
@@ -1610,6 +2049,31 @@ class KeeperBot:
         if getattr(self, "locked_for_manual_review", False):
             self.alert("Keeper is locked pending manual review. Broadcast refused.")
             return
+
+        if not self.dry_run:
+            sm = self._ensure_state_manager()
+            if sm and sm.domain_valid:
+                can_proceed, block_reason, state_data = sm.check_startup_protection()
+                if not can_proceed:
+                    st = state_data.get("status") if state_data else None
+                    if st == "PREPARING_TO_SEND":
+                        if not sm.acquire_lock():
+                            self.log("INFO", "Another active Keeper process is currently broadcasting (PREPARING_TO_SEND with lock held). Skipping step.")
+                            return
+                        try:
+                            updated_state = sm.recover_crash_to_manual_review(state_data)
+                            self.locked_for_manual_review = True
+                            self.manual_review_context = sm.build_context_from_state(updated_state)
+                            self.alert("Keeper is locked pending manual review: crash before confirmation detected from previous run. Broadcast refused.")
+                            return
+                        finally:
+                            sm.release_lock()
+                    else:
+                        self.locked_for_manual_review = True
+                        if state_data:
+                            self.manual_review_context = sm.build_context_from_state(state_data)
+                        self.alert(f"Keeper is locked pending manual review: {block_reason}. Broadcast refused.")
+                        return
         try:
             chain_id = self.get_chain_id()
             cur_epoch, last_synced, seed = self.get_epoch_state()
@@ -1668,6 +2132,12 @@ def main():
     parser.add_argument("--tx-timeout", type=int, default=None, help="Tx confirmation timeout in seconds before speedup (default: 60)")
     parser.add_argument("--max-retries", type=int, default=None, help="Max replacement retries with identical nonce (default: 3)")
     parser.add_argument("--max-seed-steps", type=int, default=None, help=f"Max uninitialized epochs to process per initEpochSeed transaction (default: {MAX_SEED_STEPS}, max: {MAX_SEED_STEPS})")
+    parser.add_argument("--state-dir", default=None, help="Directory for keeper persistent state and lock files (default: ~/.poolcoin/keeper_state)")
+    parser.add_argument("--check-lock", action="store_true", help="Inspect persistent lock status for the configured domain and exit")
+    parser.add_argument("--unlock-manual-review", action="store_true", help="Perform manual unlock for the configured domain")
+    parser.add_argument("--unlock-confirm", default=None, help="Must specify 'YES' to confirm manual unlock")
+    parser.add_argument("--unlock-reason", default=None, help="Mandatory explanation for manual unlock audit log")
+    parser.add_argument("--expected-nonce", type=int, default=None, help="Optional expected nonce validation for manual unlock")
     args = parser.parse_args()
 
     if args.no_env:
@@ -1806,8 +2276,40 @@ def main():
         gas_multiplier=multiplier,
         tx_timeout=timeout,
         max_retries=retries,
-        max_seed_steps=seed_steps
+        max_seed_steps=seed_steps,
+        state_dir=args.state_dir
     )
+
+    if args.check_lock:
+        sm = bot._ensure_state_manager()
+        if not sm or not sm.domain_valid:
+            sys.stderr.write("[ERROR] Cannot inspect lock: Unable to securely determine state domain (chainId, miner, sender).\n")
+            sys.exit(1)
+        status_cat, details, state_data = sm.inspect_lock_status()
+        print(f"Domain: chainId={sm.domain.chain_id}, miner={sm.domain.miner_address}, sender={sm.domain.sender_address}")
+        print(f"State file: {sm.get_state_path()}")
+        print(f"Lock status: {status_cat} ({details})")
+        if state_data:
+            print(f"Details: {json.dumps(state_data, indent=2, ensure_ascii=False)}")
+        if status_cat == "无锁":
+            sys.exit(0)
+        else:
+            sys.exit(2)
+
+    if args.unlock_manual_review:
+        if args.unlock_confirm != "YES":
+            sys.stderr.write("[ERROR] Manual unlock requires explicit confirmation: specify --unlock-confirm YES\n")
+            sys.exit(1)
+        if not args.unlock_reason or not args.unlock_reason.strip():
+            sys.stderr.write("[ERROR] Manual unlock requires a non-empty audit reason: specify --unlock-reason '<reason>'\n")
+            sys.exit(1)
+        try:
+            bot.manual_unlock(expected_nonce=args.expected_nonce, operator_reason=args.unlock_reason.strip())
+            print(f"[SUCCESS] Manual review lock successfully unlocked for domain {bot.miner}. Audit record logged.")
+            sys.exit(0)
+        except Exception as e:
+            sys.stderr.write(f"[ERROR] Manual unlock failed: {format_exception_safe(e)}\n")
+            sys.exit(1)
 
     if args.once:
         bot.step()
