@@ -36,6 +36,25 @@ if hasattr(sys.stderr, "reconfigure"):
 from eth_abi import encode, decode
 from eth_hash.auto import keccak
 
+try:
+    from script.cast_signer import (
+        CastSendUncertainError,
+        CastSignerError,
+        UNCERTAIN_TX_WARNING,
+        cast_send,
+        get_keystore_address,
+        parse_pending_nonce,
+    )
+except ImportError:
+    from cast_signer import (
+        CastSendUncertainError,
+        CastSignerError,
+        UNCERTAIN_TX_WARNING,
+        cast_send,
+        get_keystore_address,
+        parse_pending_nonce,
+    )
+
 REQUIRED_CHAIN_ID = 97
 DEFAULT_MINER_CONTRACT = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
 DEFAULT_RPC_URLS = [
@@ -358,49 +377,85 @@ def claim(args):
 
     miner_contract = to_checksum_address(args.miner_contract)
     
-    # 2. Determine Miner Address & Private Key
+    # 2. Determine Miner Address & Signing Mode
+    if bool(args.account) != bool(args.password_file):
+        print("[错误] --account 与 --password-file 必须同时提供！")
+        sys.exit(1)
+
+    has_keystore = bool(args.account and args.password_file)
+    env_pk = os.environ.get("PRIVATE_KEY") or os.environ.get("MINER_PRIVATE_KEY")
+    has_env_pk = bool(env_pk and env_pk.strip())
+
+    if has_keystore and has_env_pk:
+        print("[错误] 同时提供了 keystore 参数 (--account/--password-file) 与环境变量私钥。为避免签名方式歧义，请只选择其中一种方式。")
+        sys.exit(1)
+
     private_key = None
     miner_addr = None
 
     if args.send:
-        # Strictly read from environment variable
-        private_key = os.environ.get("PRIVATE_KEY") or os.environ.get("MINER_PRIVATE_KEY")
-        if not private_key:
-            print("[错误] --send 模式需要提供签名私钥！")
-            print("安全规则: 私钥只能从环境变量 PRIVATE_KEY (或 MINER_PRIVATE_KEY) 读取，禁止通过命令行或文件明文传递。")
-            print("请在运行前设置环境变量:")
-            print("  PowerShell: $env:PRIVATE_KEY=\"0x...\"")
-            print("  Bash:       export PRIVATE_KEY=\"0x...\"")
-            sys.exit(1)
-
-        from eth_account import Account
-        try:
-            account = Account.from_key(private_key)
-            miner_addr = to_checksum_address(account.address)
-        except Exception as e:
-            safe_err = format_exception_safe(
-                e,
-                sensitive_values=_collect_sensitive_values(args, extra_secrets=[private_key]),
-            )
-            print(f"[错误] 解析环境变量私钥失败: {safe_err}")
-            sys.exit(1)
-
-        if args.miner:
-            input_miner = to_checksum_address(args.miner)
-            if input_miner.lower() != miner_addr.lower():
-                print(f"[安全拦截] 环境变量私钥对应地址 ({miner_addr}) 与参数指定的矿工地址 ({input_miner}) 不一致！")
-                print("拒绝执行以避免资金或签名混乱。")
+        if has_keystore:
+            try:
+                miner_addr = get_keystore_address(args.account, args.password_file)
+            except CastSignerError as e:
+                safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+                print(f"[错误] Keystore 签名地址解析失败: {safe_err}")
                 sys.exit(1)
+
+            if args.miner:
+                input_miner = to_checksum_address(args.miner)
+                if input_miner.lower() != miner_addr.lower():
+                    print(f"[安全拦截] Keystore 签名地址 ({miner_addr}) 与参数指定的矿工地址 ({input_miner}) 不一致！")
+                    print("拒绝执行以避免资金或签名混乱。")
+                    sys.exit(1)
+        elif has_env_pk:
+            print("[警告] 正在使用环境变量私钥签名方式（不推荐）。建议改用 Foundry keystore 方式 (--account <别名> --password-file <密码文件>) 进行签名。")
+            private_key = env_pk.strip()
+            from eth_account import Account
+            try:
+                account = Account.from_key(private_key)
+                miner_addr = to_checksum_address(account.address)
+            except Exception as e:
+                safe_err = format_exception_safe(
+                    e,
+                    sensitive_values=_collect_sensitive_values(args, extra_secrets=[private_key]),
+                )
+                print(f"[错误] 解析环境变量私钥失败: {safe_err}")
+                sys.exit(1)
+
+            if args.miner:
+                input_miner = to_checksum_address(args.miner)
+                if input_miner.lower() != miner_addr.lower():
+                    print(f"[安全拦截] 环境变量私钥对应地址 ({miner_addr}) 与参数指定的矿工地址 ({input_miner}) 不一致！")
+                    print("拒绝执行以避免资金或签名混乱。")
+                    sys.exit(1)
+        else:
+            print("[错误] --send 模式需要提供签名私钥！")
+            print("安全规则: 推荐使用 Foundry keystore 参数: --account <别名> --password-file <密码文件>")
+            print("旧路径:   环境变量 PRIVATE_KEY (或 MINER_PRIVATE_KEY) 读取 (不推荐)")
+            sys.exit(1)
     else:
-        # Dry-run mode: can use --miner, or derive from env PRIVATE_KEY if available
-        if args.miner:
+        # Dry-run mode: can use --miner, or derive from keystore / env PRIVATE_KEY if available
+        if has_keystore:
+            try:
+                derived_addr = get_keystore_address(args.account, args.password_file)
+                if args.miner:
+                    input_miner = to_checksum_address(args.miner)
+                    if input_miner.lower() != derived_addr.lower():
+                        print(f"[安全拦截] Keystore 签名地址 ({derived_addr}) 与参数指定的矿工地址 ({input_miner}) 不一致！")
+                        sys.exit(1)
+                miner_addr = derived_addr
+            except CastSignerError as e:
+                safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+                print(f"[错误] Keystore 签名地址解析失败: {safe_err}")
+                sys.exit(1)
+        elif args.miner:
             miner_addr = to_checksum_address(args.miner)
         else:
-            env_pk = os.environ.get("PRIVATE_KEY") or os.environ.get("MINER_PRIVATE_KEY")
-            if env_pk:
+            if has_env_pk:
                 from eth_account import Account
                 try:
-                    account = Account.from_key(env_pk)
+                    account = Account.from_key(env_pk.strip())
                     miner_addr = to_checksum_address(account.address)
                 except Exception:
                     pass
@@ -509,26 +564,53 @@ def claim(args):
         return
 
     # 7. Broadcast Transaction
-    from eth_account import Account
-    nonce_hex = rpc_call(rpc_url, "eth_getTransactionCount", [miner_addr, "pending"])
-    account_nonce = int(nonce_hex, 16)
-
-    tx_dict = {
-        "to": miner_contract,
-        "from": miner_addr,
-        "value": 0,
-        "gas": gas_limit,
-        "gasPrice": target_gas_price_wei,
-        "nonce": account_nonce,
-        "chainId": chain_id,
-        "data": calldata_hex,
-    }
-
-    signed_tx = Account.sign_transaction(tx_dict, private_key)
-    raw_tx_hex = "0x" + signed_tx.raw_transaction.hex()
+    try:
+        nonce_res = rpc_call(rpc_url, "eth_getTransactionCount", [miner_addr, "pending"])
+        account_nonce = parse_pending_nonce(nonce_res)
+    except Exception as e:
+        safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+        print(f"[错误] 查询 pending nonce 失败: {safe_err}")
+        print("查询失败直接中止，不得回退为 0。")
+        sys.exit(1)
 
     print(f"\n[步骤 3/3] 正在向 BSC Testnet 广播交易 (Nonce: {account_nonce})...", flush=True)
-    tx_hash = rpc_call(rpc_url, "eth_sendRawTransaction", [raw_tx_hex])
+
+    if has_keystore:
+        try:
+            tx_hash = cast_send(
+                contract_address=miner_contract,
+                calldata=calldata_hex,
+                account=args.account,
+                password_file=args.password_file,
+                rpc_url=rpc_url,
+                nonce=account_nonce,
+                gas_price=target_gas_price_wei,
+                gas_limit=gas_limit,
+            )
+        except CastSendUncertainError as e:
+            safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+            print(f"[错误] {UNCERTAIN_TX_WARNING} ({safe_err})")
+            sys.exit(1)
+        except CastSignerError as e:
+            safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+            print(f"[错误] Keystore 发送失败: {safe_err}")
+            sys.exit(1)
+    else:
+        from eth_account import Account
+        tx_dict = {
+            "to": miner_contract,
+            "from": miner_addr,
+            "value": 0,
+            "gas": gas_limit,
+            "gasPrice": target_gas_price_wei,
+            "nonce": account_nonce,
+            "chainId": chain_id,
+            "data": calldata_hex,
+        }
+
+        signed_tx = Account.sign_transaction(tx_dict, private_key)
+        raw_tx_hex = "0x" + signed_tx.raw_transaction.hex()
+        tx_hash = rpc_call(rpc_url, "eth_sendRawTransaction", [raw_tx_hex])
     print(f"\n[广播成功] 交易哈希: {tx_hash}")
     print(f"BscScan 浏览器查询: https://testnet.bscscan.com/tx/{tx_hash}")
 
@@ -566,6 +648,8 @@ def main():
     parser = argparse.ArgumentParser(description="PoolCoin 挖矿奖励领取工具 (BSC Testnet)")
     parser.add_argument("--epoch", type=int, default=None, help="目标领取轮次 (epoch id)")
     parser.add_argument("--miner", type=str, default=None, help="矿工钱包地址 (只读预检时必填或从私钥推导)")
+    parser.add_argument("--account", type=str, default=None, help="Foundry keystore 钱包别名 (与 --password-file 搭配使用)")
+    parser.add_argument("--password-file", type=str, default=None, help="Foundry keystore 密码文件路径 (与 --account 搭配使用)")
     parser.add_argument("--send", action="store_true", help="发送真实链上交易 (默认仅进行 eth_call 预检)")
     parser.add_argument("--rpc", type=str, default=None, help="自定义 BSC Testnet RPC 节点")
     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="MinerV1 代理合约地址")

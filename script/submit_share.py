@@ -29,6 +29,25 @@ except ImportError:
     from safe_output import format_exception_safe, sanitize_text, sanitize_url
 from eth_hash.auto import keccak
 
+try:
+    from script.cast_signer import (
+        CastSendUncertainError,
+        CastSignerError,
+        UNCERTAIN_TX_WARNING,
+        cast_send,
+        get_keystore_address,
+        parse_pending_nonce,
+    )
+except ImportError:
+    from cast_signer import (
+        CastSendUncertainError,
+        CastSignerError,
+        UNCERTAIN_TX_WARNING,
+        cast_send,
+        get_keystore_address,
+        parse_pending_nonce,
+    )
+
 REQUIRED_CHAIN_ID = 97
 DEFAULT_MINER_CONTRACT = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
 DEFAULT_RPC_URL = "https://data-seed-prebsc-1-s1.binance.org:8545"
@@ -244,6 +263,31 @@ def submit(args):
     nonces = [nonce]
     calldata = encode_submit_shares(ks, nonces)
 
+    if bool(args.account) != bool(args.password_file):
+        print("[ERROR] --account and --password-file must be provided together!")
+        sys.exit(1)
+
+    has_keystore = bool(args.account and args.password_file)
+    env_pk = os.environ.get("MINER_PRIVATE_KEY") or os.environ.get("PRIVATE_KEY")
+    has_env_pk = bool(env_pk and env_pk.strip())
+
+    if has_keystore and has_env_pk:
+        print("[ERROR] Both keystore flags (--account/--password-file) and environment private key are provided. Please specify only one signing method.")
+        sys.exit(1)
+
+    if not args.send and has_keystore:
+        try:
+            derived_signer = get_keystore_address(args.account, args.password_file)
+            if derived_signer.lower() != miner_addr.lower():
+                print(f"[SECURITY ERROR] Keystore signer address corresponds to {derived_signer},")
+                print(f"                 which does NOT match miner address {miner_addr}!")
+                print("Submission rejected to prevent transaction failure.")
+                sys.exit(1)
+        except CastSignerError as e:
+            safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+            print(f"[ERROR] Failed to resolve keystore address: {safe_err}")
+            sys.exit(1)
+
     print("=== PoolCoin Share Submitter ===")
     print(f"Network:          BSC Testnet (Chain ID {chain_id})")
     print(f"Miner Contract:   {miner_contract}")
@@ -319,32 +363,45 @@ def submit(args):
     print("WARNING: YOU ARE ABOUT TO BROADCAST A REAL TRANSACTION TO BSC TESTNET!")
     print("=" * 50)
 
-    # Strictly read private key ONLY from environment variable (never from .env or file)
-    private_key = os.environ.get("MINER_PRIVATE_KEY")
-    if not private_key:
+    private_key = None
+    if has_keystore:
+        try:
+            signer_addr = get_keystore_address(args.account, args.password_file)
+        except CastSignerError as e:
+            safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+            print(f"[ERROR] Failed to resolve keystore address: {safe_err}")
+            sys.exit(1)
+
+        if signer_addr.lower() != miner_addr.lower():
+            print(f"[SECURITY ERROR] Keystore signer address corresponds to {signer_addr},")
+            print(f"                 which does NOT match miner address {miner_addr}!")
+            print("Submission rejected to prevent transaction failure.")
+            sys.exit(1)
+    elif has_env_pk:
+        print("[WARNING] Using environment private key is not recommended (不推荐). Please consider using --account and --password-file instead.")
+        private_key = env_pk.strip()
+        try:
+            from eth_account import Account
+            account = Account.from_key(private_key)
+            signer_addr = to_checksum_address(account.address)
+            if signer_addr.lower() != miner_addr.lower():
+                print(f"[SECURITY ERROR] MINER_PRIVATE_KEY corresponds to {signer_addr},")
+                print(f"                 which does NOT match miner address {miner_addr}!")
+                print("Submission rejected to prevent transaction failure.")
+                sys.exit(1)
+        except Exception as e:
+            safe_err = format_exception_safe(
+                e,
+                sensitive_values=_collect_sensitive_values(args, extra_secrets=[private_key]),
+            )
+            print(f"[ERROR] Failed to load private key from environment: {safe_err}")
+            sys.exit(1)
+    else:
         print("[ERROR] MINER_PRIVATE_KEY environment variable is not set!")
         print("Please set it in your current terminal session:")
         print("  PowerShell:  $env:MINER_PRIVATE_KEY=\"<0x_hex_private_key>\"")
         print("  Bash/Linux:  export MINER_PRIVATE_KEY=\"<0x_hex_private_key>\"")
         print("Note: Do NOT write your private key into .env or any file.")
-        sys.exit(1)
-
-    # Verify that private key matches miner address
-    try:
-        from eth_account import Account
-        account = Account.from_key(private_key)
-        signer_addr = to_checksum_address(account.address)
-        if signer_addr.lower() != miner_addr.lower():
-            print(f"[SECURITY ERROR] MINER_PRIVATE_KEY corresponds to {signer_addr},")
-            print(f"                 which does NOT match miner address {miner_addr}!")
-            print("Submission rejected to prevent transaction failure.")
-            sys.exit(1)
-    except Exception as e:
-        safe_err = format_exception_safe(
-            e,
-            sensitive_values=_collect_sensitive_values(args, extra_secrets=[private_key]),
-        )
-        print(f"[ERROR] Failed to load private key from environment: {safe_err}")
         sys.exit(1)
 
     # Print Full Transaction Summary for Manual Confirmation
@@ -368,27 +425,56 @@ def submit(args):
         return
 
     # Fetch Nonce
-    nonce_hex = rpc_call(args.rpc, "eth_getTransactionCount", [signer_addr, "pending"])
-    account_nonce = int(nonce_hex, 16)
+    try:
+        nonce_res = rpc_call(args.rpc, "eth_getTransactionCount", [signer_addr, "pending"])
+        account_nonce = parse_pending_nonce(nonce_res)
+    except Exception as e:
+        safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+        print(f"[ERROR] Failed to query pending nonce: {safe_err}")
+        print("Nonce query failed, aborting transaction broadcast (will not fallback to 0).")
+        sys.exit(1)
 
-    # Build Transaction Object
-    tx_dict = {
-        "to": miner_contract,
-        "from": signer_addr,
-        "value": 0,
-        "gas": gas_limit,
-        "gasPrice": target_gas_price_wei,
-        "nonce": account_nonce,
-        "chainId": chain_id,
-        "data": "0x" + calldata.hex(),
-    }
+    if has_keystore:
+        print("\nBroadcasting transaction to BSC Testnet via cast send...", flush=True)
+        try:
+            tx_hash = cast_send(
+                contract_address=miner_contract,
+                calldata="0x" + calldata.hex(),
+                account=args.account,
+                password_file=args.password_file,
+                rpc_url=args.rpc,
+                nonce=account_nonce,
+                gas_price=target_gas_price_wei,
+                gas_limit=gas_limit,
+            )
+        except CastSendUncertainError as e:
+            safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+            print(f"[ERROR] {UNCERTAIN_TX_WARNING} ({safe_err})")
+            sys.exit(1)
+        except CastSignerError as e:
+            safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+            print(f"[ERROR] Keystore operation failed: {safe_err}")
+            sys.exit(1)
+    else:
+        # Build Transaction Object
+        tx_dict = {
+            "to": miner_contract,
+            "from": signer_addr,
+            "value": 0,
+            "gas": gas_limit,
+            "gasPrice": target_gas_price_wei,
+            "nonce": account_nonce,
+            "chainId": chain_id,
+            "data": "0x" + calldata.hex(),
+        }
 
-    # Sign Transaction
-    signed_tx = Account.sign_transaction(tx_dict, private_key)
-    raw_tx_hex = "0x" + signed_tx.raw_transaction.hex()
+        # Sign Transaction
+        signed_tx = Account.sign_transaction(tx_dict, private_key)
+        raw_tx_hex = "0x" + signed_tx.raw_transaction.hex()
 
-    print("\nBroadcasting transaction to BSC Testnet...", flush=True)
-    tx_hash = rpc_call(args.rpc, "eth_sendRawTransaction", [raw_tx_hex])
+        print("\nBroadcasting transaction to BSC Testnet...", flush=True)
+        tx_hash = rpc_call(args.rpc, "eth_sendRawTransaction", [raw_tx_hex])
+
     print(f"\n[BROADCAST SUCCESS] Transaction Hash: {tx_hash}")
     print(f"View on BscScan Testnet: https://testnet.bscscan.com/tx/{tx_hash}")
 
@@ -431,6 +517,8 @@ def main():
     parser.add_argument("--epoch", type=int, default=None, help="Target epoch")
     parser.add_argument("--rpc", type=str, default=DEFAULT_RPC_URL, help="BSC Testnet RPC URL")
     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="Miner proxy address")
+    parser.add_argument("--account", type=str, default=None, help="Foundry keystore account name (must be used with --password-file)")
+    parser.add_argument("--password-file", type=str, default=None, help="Path to password file for Foundry keystore (must be used with --account)")
     parser.add_argument("--send", action="store_true", help="Broadcast transaction (default: simulation only)")
     parser.add_argument("--gas-multiplier", type=float, default=1.15, help="Gas price multiplier over eth_gasPrice (default: 1.15)")
     parser.add_argument("--gas-price-gwei", type=float, default=None, help="Explicit gas price in gwei (must be >= eth_gasPrice)")
