@@ -9,6 +9,7 @@ Includes gas price floor (>=0.1 gwei), multiplier, and replacement (speed-up) re
 """
 
 import os, sys, time, json, argparse, urllib.request, urllib.error, re, random, subprocess, shutil
+from decimal import Decimal
 from urllib.parse import urlsplit
 from enum import Enum
 from typing import Optional, Dict, Any
@@ -34,6 +35,23 @@ except ImportError:
         UnknownStateVersionError,
         InvalidStateError,
         StateWriteError,
+    )
+
+try:
+    from script.cast_signer import (
+        CastSignerError,
+        resolve_eip1559_fees,
+        validate_cli_fee_and_gas_args,
+        validate_eip1559_fees,
+        validate_gas_limit,
+    )
+except ImportError:
+    from cast_signer import (
+        CastSignerError,
+        resolve_eip1559_fees,
+        validate_cli_fee_and_gas_args,
+        validate_eip1559_fees,
+        validate_gas_limit,
     )
 
 # Contract function selectors (verified against MinerV1 compiled ABI)
@@ -602,7 +620,7 @@ class KeeperBot:
                  dry_run=True, poll_interval=15, min_gas_price_gwei=DEFAULT_MIN_GAS_PRICE_GWEI,
                  gas_multiplier=DEFAULT_GAS_MULTIPLIER, tx_timeout=DEFAULT_TX_TIMEOUT,
                  max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=MAX_SEED_STEPS,
-                 state_dir=None):
+                 state_dir=None, max_fee_per_gas_gwei=None, priority_fee_per_gas_gwei=None):
         self.rpc_url = rpc_url
         self.miner = miner_address.strip().lower() if miner_address and isinstance(miner_address, str) else (miner_address or "")
         self.dry_run = dry_run
@@ -670,11 +688,18 @@ class KeeperBot:
             sys.exit(1)
 
         try:
-            self.gas_multiplier = float(gas_multiplier)
-            if self.gas_multiplier < 0:
-                raise ValueError("negative")
-        except Exception:
-            self.alert("Startup check failed: gas_multiplier must be a non-negative number.")
+            parsed_fee_cfg = validate_cli_fee_and_gas_args(
+                gas_limit=1,
+                gas_multiplier=gas_multiplier,
+                max_fee_per_gas_gwei=max_fee_per_gas_gwei,
+                priority_fee_per_gas_gwei=priority_fee_per_gas_gwei,
+            )
+            self.gas_multiplier_input = gas_multiplier
+            self.gas_multiplier = parsed_fee_cfg["effective_multiplier"]
+            self.max_fee_per_gas_gwei = max_fee_per_gas_gwei
+            self.priority_fee_per_gas_gwei = priority_fee_per_gas_gwei
+        except Exception as e:
+            self.alert(f"Startup check failed: {format_exception_safe(e)}")
             sys.exit(1)
 
         try:
@@ -1074,6 +1099,44 @@ class KeeperBot:
             bump_ratio=bump_ratio
         )
 
+    def resolve_tx_fees(self) -> Dict[str, Any]:
+        """Resolves EIP-1559 dual fees using shared cast_signer validation and RPC rules."""
+        mult_arg = self.gas_multiplier_input if getattr(self, "gas_multiplier_input", None) is not None else self.gas_multiplier
+        return resolve_eip1559_fees(
+            self.rpc_url,
+            rpc_call,
+            gas_multiplier=mult_arg,
+            max_fee_per_gas_gwei=getattr(self, "max_fee_per_gas_gwei", None),
+            priority_fee_per_gas_gwei=getattr(self, "priority_fee_per_gas_gwei", None),
+        )
+
+    def _log_eip1559_fee_summary(self, level: str, fee_info: Dict[str, Any], gas_limit: int):
+        max_fee_wei = fee_info["max_fee_per_gas_wei"]
+        priority_fee_wei = fee_info["priority_fee_per_gas_wei"]
+        max_total_fee_wei = max_fee_wei * gas_limit
+        for warning in fee_info.get("warnings", []):
+            if isinstance(warning, tuple) and len(warning) == 3 and warning[0] == "priority_floor":
+                _, old_max, prio = warning
+                self.log(
+                    "WARN",
+                    f"Computed maxFeePerGas ({old_max} wei) was below maxPriorityFeePerGas ({prio} wei); "
+                    f"raised automatic maxFeePerGas to {prio} wei."
+                )
+        net_gas = fee_info.get("network_gas_price_wei")
+        net_prio = fee_info.get("network_priority_fee_wei")
+        net_gas_disp = f"{net_gas} wei" if net_gas is not None else "not queried (explicit override)"
+        net_prio_disp = f"{net_prio} wei" if net_prio is not None else "not queried (explicit override)"
+        max_src = "explicit" if fee_info.get("explicit_max_fee") else f"network*{fee_info.get('effective_multiplier')}x"
+        prio_src = "explicit" if fee_info.get("explicit_priority_fee") else "network"
+        max_gwei = Decimal(max_fee_wei) / Decimal(1_000_000_000)
+        prio_gwei = Decimal(priority_fee_wei) / Decimal(1_000_000_000)
+        self.log(level, f"  Tx Type:         EIP-1559 (type 2)")
+        self.log(level, f"  Max Fee / Gas:   {max_gwei} gwei ({max_fee_wei} wei) [{max_src}]")
+        self.log(level, f"  Priority Fee:    {prio_gwei} gwei ({priority_fee_wei} wei) [{prio_src}]")
+        self.log(level, f"  Network Fees:    eth_gasPrice={net_gas_disp}, eth_maxPriorityFeePerGas={net_prio_disp}")
+        self.log(level, f"  Gas Limit:       {gas_limit}")
+        self.log(level, f"  Max Total Fee:   {max_total_fee_wei} wei")
+
     def get_nonce(self):
         """Fetches pending nonce for keeper account; enforces strict checks in live mode."""
         if self.dry_run:
@@ -1255,6 +1318,8 @@ class KeeperBot:
             "function_name": func_name,
             "tx_hash": clean_hash
         }
+        if reason_code:
+            self.manual_review_context["reason_code"] = reason_code
         if hashes:
             self.manual_review_context["tx_hashes"] = hashes
 
@@ -1345,7 +1410,21 @@ class KeeperBot:
                             "revert_error": err_name
                         }
                     )
-            gas_price = self.get_gas_price()
+            try:
+                fee_info = self.resolve_tx_fees()
+                validate_eip1559_fees(fee_info["max_fee_per_gas_wei"], fee_info["priority_fee_per_gas_wei"])
+                gas_limit = validate_gas_limit(self.estimate_gas_limit(calldata, default_gas=300000))
+            except Exception as e:
+                err_str = sanitize_text(
+                    format_exception_safe(e),
+                    sensitive_values=[self.password_file] if self.password_file else None,
+                )
+                self.alert(f"Dry-run EIP-1559 fee resolution failed for {func_name}: {err_str}")
+                return TxResult(
+                    status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                    error=f"fee resolution failed: {err_str}",
+                    context={"function_name": func_name}
+                )
             nonce = self.get_nonce()
             chain_id = self.get_chain_id()
             cur_epoch = getattr(self, "current_epoch", None)
@@ -1359,7 +1438,7 @@ class KeeperBot:
             self.log("DRY-RUN", f"  On-Chain Epoch:  {cur_epoch}")
             self.log("DRY-RUN", f"  Chain ID:        {chain_id}")
             self.log("DRY-RUN", f"  Function:        {func_name}")
-            self.log("DRY-RUN", f"  Gas Price:       {gas_price / 1e9:.4f} gwei ({gas_price} wei) [Multiplier: {self.gas_multiplier}x, Floor: {self.min_gas_price_gwei} gwei]")
+            self._log_eip1559_fee_summary("DRY-RUN", fee_info, gas_limit)
             self.log("DRY-RUN", f"  Nonce:           {nonce}{' (simulated)' if not self.keeper_address else ''}")
             if self.account:
                 if self.keeper_address:
@@ -1449,12 +1528,27 @@ class KeeperBot:
                     )
 
             # 4. Re-fetch fresh gas price and fresh nonce INSIDE the lock
-            gas_price = self.get_gas_price()
+            try:
+                fee_info = self.resolve_tx_fees()
+                max_fee_wei = fee_info["max_fee_per_gas_wei"]
+                priority_fee_wei = fee_info["priority_fee_per_gas_wei"]
+                validate_eip1559_fees(max_fee_wei, priority_fee_wei)
+                gas_limit = validate_gas_limit(self.estimate_gas_limit(calldata, default_gas=300000))
+            except Exception as e:
+                err_str = sanitize_text(
+                    format_exception_safe(e),
+                    sensitive_values=[self.password_file] if self.password_file else None,
+                )
+                self.alert(f"Transaction broadcast ABORTED for {func_name}: EIP-1559 fee resolution failed ({err_str})")
+                return TxResult(
+                    status=TxExecutionStatus.PREFLIGHT_FAILURE,
+                    error=f"fee resolution failed: {err_str}",
+                    context={"function_name": func_name}
+                )
             nonce = self.get_nonce()
-
-            gas_limit = self.estimate_gas_limit(calldata, default_gas=300000)
             target_addr = to_checksum_address(self.miner)
-            current_gas_price = gas_price
+            self.log("INFO", f"Prepared type-2 {func_name} (nonce {nonce}):")
+            self._log_eip1559_fee_summary("INFO", fee_info, gas_limit)
             active_tx_hash = None
             broadcasted_hashes = []
 
@@ -1534,7 +1628,14 @@ class KeeperBot:
                         operation=func_name,
                         epoch=getattr(self, "current_epoch", "Unknown"),
                         nonce=nonce,
-                        details=f"Broadcasting {func_name} with nonce {nonce}"
+                        details=f"Broadcasting type-2 {func_name} with nonce {nonce}",
+                        tx_type=2,
+                        max_fee_per_gas_wei=max_fee_wei,
+                        max_priority_fee_per_gas_wei=priority_fee_wei,
+                        gas_limit=gas_limit,
+                        to_address=target_addr,
+                        value_wei=0,
+                        calldata=calldata,
                     )
                 except Exception as e:
                     err_str = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file] if self.password_file else None)
@@ -1556,25 +1657,15 @@ class KeeperBot:
                 cast_bin = shutil.which("cast") or "cast"
                 isolated_env = get_isolated_cast_env()
 
-                for attempt in range(self.max_retries + 1):
-                    if attempt > 0:
-                        net_price = self.get_network_gas_price()
-                        current_gas_price = get_bumped_gas_price(
-                            current_gas_price,
-                            min_bump_ratio=1.15,
-                            network_gas_price_wei=net_price,
-                            min_gas_price_gwei=self.min_gas_price_gwei,
-                            multiplier=self.gas_multiplier
-                        )
-                        self.log("RETRY", f"Speed-up replacement attempt #{attempt} for {func_name} with IDENTICAL nonce {nonce}, bumped gasPrice: {current_gas_price / 1e9:.4f} gwei ({current_gas_price} wei)")
-
+                for attempt in range(1):
                     cmd = [
                         cast_bin, "send", target_addr,
                         "--data", calldata,
                         "--account", self.account,
                         "--password-file", self.password_file,
                         "--rpc-url", self.rpc_url,
-                        "--gas-price", str(current_gas_price),
+                        "--gas-price", str(max_fee_wei),
+                        "--priority-gas-price", str(priority_fee_wei),
                         "--gas-limit", str(gas_limit),
                         "--nonce", str(nonce),
                         "--async"
@@ -1720,7 +1811,7 @@ class KeeperBot:
                                 error=err_str,
                                 context=self.manual_review_context
                             )
-                    self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
+                    self.log("TX", f"Broadcasted type-2 {func_name} txHash={tx_hash} (nonce={nonce}, maxFee={max_fee_wei} wei, priorityFee={priority_fee_wei} wei, attempt={attempt})")
 
                     receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
                     if receipt:
@@ -1789,24 +1880,34 @@ class KeeperBot:
 
                     self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
                     if attempt < self.max_retries:
-                        self.log("RETRY", f"Retrying with identical nonce {nonce}...")
+                        self.alert(
+                            f"Type-2 replacement halted for {func_name} (nonce {nonce}, tx {tx_hash}): "
+                            "legacy single-gasPrice replacement is disabled for EIP-1559 type-2 transactions; manual review required (K3 pending)."
+                        )
 
-                self.alert(f"All {self.max_retries} speed-up attempts exhausted for {func_name} with nonce {nonce}!")
                 if broadcasted_hashes:
                     rec_res = _check_all_known_receipts()
                     if rec_res:
                         return rec_res
+                lock_reason = (
+                    f"Type-2 transaction unconfirmed after {self.tx_timeout}s; legacy single-gasPrice replacement disabled in K2 (manual review required)"
+                    if self.max_retries > 0
+                    else f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted"
+                )
+                lock_code = "TYPE2_REPLACEMENT_DISABLED" if self.max_retries > 0 else None
                 self.lock_for_manual_review(
-                    reason=f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted",
+                    reason=lock_reason,
                     nonce=nonce,
                     func_name=func_name,
                     tx_hash=active_tx_hash,
+                    reason_code=lock_code,
                     tx_hashes=broadcasted_hashes
                 )
                 return TxResult(
                     status=TxExecutionStatus.PENDING_UNCONFIRMED,
                     tx_hash=active_tx_hash,
                     nonce=nonce,
+                    error=lock_reason,
                     context=self.manual_review_context
                 )
 
@@ -1830,23 +1931,14 @@ class KeeperBot:
 
             chain_id = self.get_chain_id()
 
-            for attempt in range(self.max_retries + 1):
-                if attempt > 0:
-                    net_price = self.get_network_gas_price()
-                    current_gas_price = get_bumped_gas_price(
-                        current_gas_price,
-                        min_bump_ratio=1.15,
-                        network_gas_price_wei=net_price,
-                        min_gas_price_gwei=self.min_gas_price_gwei,
-                        multiplier=self.gas_multiplier
-                    )
-                    self.log("RETRY", f"Speed-up replacement attempt #{attempt} for {func_name} with IDENTICAL nonce {nonce}, bumped gasPrice: {current_gas_price / 1e9:.4f} gwei ({current_gas_price} wei)")
-
+            for attempt in range(1):
                 tx_dict = {
+                    "type": 2,
                     "to": target_addr,
                     "value": 0,
                     "gas": gas_limit,
-                    "gasPrice": current_gas_price,
+                    "maxFeePerGas": max_fee_wei,
+                    "maxPriorityFeePerGas": priority_fee_wei,
                     "nonce": nonce,
                     "chainId": chain_id,
                     "data": calldata
@@ -1965,7 +2057,7 @@ class KeeperBot:
                             error=err_str,
                             context=self.manual_review_context
                         )
-                self.log("TX", f"Broadcasted {func_name} txHash={tx_hash} (nonce={nonce}, gasPrice={current_gas_price / 1e9:.4f} gwei, attempt={attempt})")
+                self.log("TX", f"Broadcasted type-2 {func_name} txHash={tx_hash} (nonce={nonce}, maxFee={max_fee_wei} wei, priorityFee={priority_fee_wei} wei, attempt={attempt})")
 
                 # Wait for receipt
                 receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
@@ -2035,24 +2127,34 @@ class KeeperBot:
 
                 self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
                 if attempt < self.max_retries:
-                    self.log("RETRY", f"Retrying with identical nonce {nonce}...")
+                    self.alert(
+                        f"Type-2 replacement halted for {func_name} (nonce {nonce}, tx {tx_hash}): "
+                        "legacy single-gasPrice replacement is disabled for EIP-1559 type-2 transactions; manual review required (K3 pending)."
+                    )
 
-            self.alert(f"All {self.max_retries} speed-up attempts exhausted for {func_name} with nonce {nonce}!")
             if broadcasted_hashes:
                 rec_res = _check_all_known_receipts()
                 if rec_res:
                     return rec_res
+            lock_reason = (
+                f"Type-2 transaction unconfirmed after {self.tx_timeout}s; legacy single-gasPrice replacement disabled in K2 (manual review required)"
+                if self.max_retries > 0
+                else f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted"
+            )
+            lock_code = "TYPE2_REPLACEMENT_DISABLED" if self.max_retries > 0 else None
             self.lock_for_manual_review(
-                reason=f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted",
+                reason=lock_reason,
                 nonce=nonce,
                 func_name=func_name,
                 tx_hash=active_tx_hash,
+                reason_code=lock_code,
                 tx_hashes=broadcasted_hashes
             )
             return TxResult(
                 status=TxExecutionStatus.PENDING_UNCONFIRMED,
                 tx_hash=active_tx_hash,
                 nonce=nonce,
+                error=lock_reason,
                 context=self.manual_review_context
             )
         finally:
@@ -2262,7 +2364,9 @@ def main():
     parser.add_argument("--account", default=None, help="Foundry keystore account name in ~/.foundry/keystores")
     parser.add_argument("--password-file", default=None, help="Path to password file for keystore decryption")
     parser.add_argument("--min-gas-price-gwei", type=float, default=None, help="Gas price floor in gwei (default: 0.1)")
-    parser.add_argument("--gas-multiplier", type=float, default=None, help="Gas price multiplier (default: 1.5)")
+    parser.add_argument("--gas-multiplier", type=str, default=None, help="Gas price multiplier (default: 1.5)")
+    parser.add_argument("--max-fee-per-gas-gwei", type=str, default=None, help="Explicit EIP-1559 maxFeePerGas in gwei")
+    parser.add_argument("--priority-fee-per-gas-gwei", type=str, default=None, help="Explicit EIP-1559 maxPriorityFeePerGas in gwei")
     parser.add_argument("--tx-timeout", type=int, default=None, help="Tx confirmation timeout in seconds before speedup (default: 60)")
     parser.add_argument("--max-retries", type=int, default=None, help="Max replacement retries with identical nonce (default: 3)")
     parser.add_argument("--max-seed-steps", type=int, default=None, help=f"Max uninitialized epochs to process per initEpochSeed transaction (default: {MAX_SEED_STEPS}, max: {MAX_SEED_STEPS})")
@@ -2373,9 +2477,24 @@ def main():
         min_floor = DEFAULT_MIN_GAS_PRICE_GWEI
 
     raw_multiplier = args.gas_multiplier if args.gas_multiplier is not None else get_cfg("KEEPER_GAS_PRICE_MULTIPLIER")
-    multiplier = parse_numeric(raw_multiplier, float, "--gas-multiplier / KEEPER_GAS_PRICE_MULTIPLIER")
-    if multiplier is None:
+    if args.gas_multiplier is not None:
+        multiplier = args.gas_multiplier
+    elif raw_multiplier is not None and str(raw_multiplier).strip() != "":
+        multiplier = raw_multiplier
+    else:
         multiplier = DEFAULT_GAS_MULTIPLIER
+
+    if args.max_fee_per_gas_gwei is not None:
+        max_fee_gwei = args.max_fee_per_gas_gwei
+    else:
+        raw_max_fee = get_cfg("KEEPER_MAX_FEE_PER_GAS_GWEI")
+        max_fee_gwei = raw_max_fee if (raw_max_fee is not None and str(raw_max_fee).strip() != "") else None
+
+    if args.priority_fee_per_gas_gwei is not None:
+        priority_fee_gwei = args.priority_fee_per_gas_gwei
+    else:
+        raw_priority_fee = get_cfg("KEEPER_PRIORITY_FEE_PER_GAS_GWEI")
+        priority_fee_gwei = raw_priority_fee if (raw_priority_fee is not None and str(raw_priority_fee).strip() != "") else None
 
     raw_timeout = args.tx_timeout if args.tx_timeout is not None else get_cfg("KEEPER_TX_TIMEOUT")
     timeout = parse_numeric(raw_timeout, int, "--tx-timeout / KEEPER_TX_TIMEOUT")
@@ -2411,7 +2530,9 @@ def main():
         tx_timeout=timeout,
         max_retries=retries,
         max_seed_steps=seed_steps,
-        state_dir=args.state_dir
+        state_dir=args.state_dir,
+        max_fee_per_gas_gwei=max_fee_gwei,
+        priority_fee_per_gas_gwei=priority_fee_gwei,
     )
 
     if args.check_lock:

@@ -101,6 +101,7 @@ from script.keeper import (
     DEFAULT_GAS_MULTIPLIER,
     MAX_SEED_STEPS
 )
+from script.keeper_state import KeeperStateManager, StateDomain
 
 def clear_configured_secrets():
     _prod_clear_configured_secrets()
@@ -202,6 +203,8 @@ class TestKeeperBotDryRun(unittest.TestCase):
                 return "0x0000000000000000000000000000000000000000000000000000000000000000"
             elif method == "eth_gasPrice":
                 return "0x5f5e100"  # 100,000,000 wei = 0.1 gwei
+            elif method == "eth_maxPriorityFeePerGas":
+                return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x5"
             return None
@@ -232,7 +235,11 @@ class TestKeeperBotDryRun(unittest.TestCase):
             self.assertIn("On-Chain Epoch:  0", combined_logs)
             self.assertIn("Chain ID:        97", combined_logs)
             self.assertIn("initEpochSeed(0, 24)", combined_logs)
-            self.assertIn("Gas Price:", combined_logs)
+            self.assertIn("Tx Type:         EIP-1559 (type 2)", combined_logs)
+            self.assertIn("Max Fee / Gas:", combined_logs)
+            self.assertIn("Priority Fee:", combined_logs)
+            self.assertIn("Gas Limit:", combined_logs)
+            self.assertIn("Max Total Fee:", combined_logs)
             self.assertIn("Nonce:", combined_logs)
 
 
@@ -240,7 +247,7 @@ class TestKeeperBotSpeedupRetry(unittest.TestCase):
     @patch("script.keeper.time", new_callable=_FakeKeeperTime)
     @patch("script.keeper.rpc_call")
     def test_speedup_retry_reuses_identical_nonce_and_bumps_gas_price(self, mock_rpc, mock_time):
-        """When confirmation times out, bot must re-broadcast with IDENTICAL nonce and higher gasPrice."""
+        """K2: private-key first send uses EIP-1559 type-2; on timeout with max_retries>0, halts without legacy gasPrice retry."""
         from eth_account import Account
         test_account = Account.create()
         test_key = test_account.key.hex()
@@ -251,6 +258,8 @@ class TestKeeperBotSpeedupRetry(unittest.TestCase):
             if method == "eth_getCode":
                 return "0x6080604052"
             elif method == "eth_gasPrice":
+                return "0x5f5e100"  # 100,000,000 wei = 0.1 gwei
+            elif method == "eth_maxPriorityFeePerGas":
                 return "0x5f5e100"  # 100,000,000 wei = 0.1 gwei
             elif method == "eth_getTransactionCount":
                 return "0x2"  # Nonce = 2
@@ -273,41 +282,36 @@ class TestKeeperBotSpeedupRetry(unittest.TestCase):
 
         mock_rpc.side_effect = rpc_side_effect
 
-        bot = KeeperBot(
-            rpc_url="http://mock-rpc",
-            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
-            private_key=test_key,
-            dry_run=False,
-            tx_timeout=1, # 1 sec timeout with mocked clock
-            max_retries=2
-        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                private_key=test_key,
+                dry_run=False,
+                tx_timeout=1,
+                max_retries=2,
+                state_dir=tmp_dir,
+            )
 
-        calldata = "0xd9d9c33c" + "00" * 64
-        receipt = bot.send_transaction(calldata, "initEpochSeed(0, 24)", "initEpochSeed(0, 24)")
+            calldata = "0xd9d9c33c" + "00" * 64
+            res = bot.send_transaction(calldata, "initEpochSeed(0, 24)", "initEpochSeed(0, 24)")
 
-        self.assertIsNotNone(receipt)
-        self.assertEqual(len(broadcasted_txs), 2)
+            self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+            self.assertTrue(bot.locked_for_manual_review)
+            self.assertEqual(bot.manual_review_context["reason_code"], "TYPE2_REPLACEMENT_DISABLED")
+            self.assertEqual(len(broadcasted_txs), 1)
 
-        # Decode raw transactions using rlp: [nonce, gasPrice, gas, to, value, data, v, r, s]
-        raw0 = bytes.fromhex(broadcasted_txs[0]["raw"].replace("0x", ""))
-        raw1 = bytes.fromhex(broadcasted_txs[1]["raw"].replace("0x", ""))
-        dec0 = rlp.decode(raw0)
-        dec1 = rlp.decode(raw1)
-
-        nonce0 = int.from_bytes(dec0[0], "big")
-        gas_price0 = int.from_bytes(dec0[1], "big")
-
-        nonce1 = int.from_bytes(dec1[0], "big")
-        gas_price1 = int.from_bytes(dec1[1], "big")
-
-        # NONCE MUST BE IDENTICAL
-        self.assertEqual(nonce0, 2)
-        self.assertEqual(nonce1, 2)
-        self.assertEqual(nonce0, nonce1)
-
-        # GAS PRICE MUST BE BUMPED BY AT LEAST 10%
-        self.assertGreater(gas_price1, gas_price0)
-        self.assertGreaterEqual(gas_price1, int(gas_price0 * 1.10))
+            raw0 = bytes.fromhex(broadcasted_txs[0]["raw"].replace("0x", ""))
+            self.assertEqual(raw0[0], 0x02)
+            dec0 = rlp.decode(raw0[1:])
+            chain_id0 = int.from_bytes(dec0[0], "big")
+            nonce0 = int.from_bytes(dec0[1], "big")
+            prio0 = int.from_bytes(dec0[2], "big")
+            max_fee0 = int.from_bytes(dec0[3], "big")
+            self.assertEqual(chain_id0, 97)
+            self.assertEqual(nonce0, 2)
+            self.assertEqual(prio0, 100_000_000)
+            self.assertEqual(max_fee0, 150_000_000)
 
 
 
@@ -366,6 +370,8 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
                 return "0x6080604052"
             elif method == "eth_gasPrice":
                 return "0x5f5e100"  # 0.1 gwei
+            elif method == "eth_maxPriorityFeePerGas":
+                return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 # Initial pending nonce is 10
                 return "0xa"
@@ -426,9 +432,10 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
         target_epochs = []
         for i, tx_info in enumerate(broadcasted_txs):
             raw_bytes = bytes.fromhex(tx_info["raw"].replace("0x", ""))
-            decoded = rlp.decode(raw_bytes)
-            nonce = int.from_bytes(decoded[0], "big")
-            calldata = decoded[5].hex()
+            self.assertEqual(raw_bytes[0], 0x02)
+            decoded = rlp.decode(raw_bytes[1:])
+            nonce = int.from_bytes(decoded[1], "big")
+            calldata = decoded[7].hex()
             nonces.append(nonce)
 
             self.assertTrue(calldata.startswith(SELECTOR_INIT_EPOCH_SEED))
@@ -534,6 +541,8 @@ class TestKeeperEpochSeedSequentialInit(unittest.TestCase):
             if method == "eth_getCode":
                 return "0x6080604052"
             elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
                 return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x0"
@@ -807,6 +816,8 @@ class TestKeeperExplicitRpcAndNoEnv(unittest.TestCase):
             elif method == "eth_chainId":
                 return "0x61"
             elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
                 return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x1"
@@ -2307,6 +2318,10 @@ class TestKeeperUncertainTransactionRecovery(unittest.TestCase):
                 return "0x6080604052"
             elif method == "eth_chainId":
                 return "0x61"
+            elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
+                return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x5"
             elif method == "eth_getTransactionReceipt":
@@ -2323,38 +2338,32 @@ class TestKeeperUncertainTransactionRecovery(unittest.TestCase):
             MagicMock(returncode=0, stdout=f"{hash1}\n", stderr="")
         ]
 
-        bot = KeeperBot(
-            rpc_url="http://mock-rpc",
-            miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
-            account="test-keystore-account",
-            password_file="fake-passwords/dev.pwd",
-            dry_run=False,
-            tx_timeout=1,
-            max_retries=1
-        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address="0x420382a0f874c1F120621f847d81581e8737504e",
+                account="test-keystore-account",
+                password_file="fake-passwords/dev.pwd",
+                dry_run=False,
+                tx_timeout=1,
+                max_retries=1,
+                state_dir=tmp_dir,
+            )
 
-        calldata = "0xdeadbeef"
-        res = bot.send_transaction(calldata, "test_speedup", preflight=False)
-        self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
-        self.assertEqual(mock_subproc.call_count, 3)
+            calldata = "0xdeadbeef"
+            res = bot.send_transaction(calldata, "test_speedup", preflight=False)
+            self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+            self.assertTrue(bot.locked_for_manual_review)
+            self.assertEqual(bot.manual_review_context["reason_code"], "TYPE2_REPLACEMENT_DISABLED")
+            self.assertEqual(mock_subproc.call_count, 2)
 
-        cmd_attempt0 = mock_subproc.call_args_list[1][0][0]
-        cmd_attempt1 = mock_subproc.call_args_list[2][0][0]
-
-        target_checksum = to_checksum_address("0x420382a0f874c1F120621f847d81581e8737504e")
-        self.assertEqual(cmd_attempt0[2], target_checksum)
-        self.assertEqual(cmd_attempt1[2], target_checksum)
-
-        self.assertEqual(cmd_attempt0[cmd_attempt0.index("--data") + 1], calldata)
-        self.assertEqual(cmd_attempt1[cmd_attempt1.index("--data") + 1], calldata)
-
-        self.assertEqual(cmd_attempt0[cmd_attempt0.index("--nonce") + 1], "5")
-        self.assertEqual(cmd_attempt1[cmd_attempt1.index("--nonce") + 1], "5")
-
-        gp0 = int(cmd_attempt0[cmd_attempt0.index("--gas-price") + 1])
-        gp1 = int(cmd_attempt1[cmd_attempt1.index("--gas-price") + 1])
-        self.assertGreater(gp1, gp0)
-        self.assertGreaterEqual(gp1, int(gp0 * 1.15))
+            cmd_attempt0 = mock_subproc.call_args_list[1][0][0]
+            target_checksum = to_checksum_address("0x420382a0f874c1F120621f847d81581e8737504e")
+            self.assertEqual(cmd_attempt0[2], target_checksum)
+            self.assertEqual(cmd_attempt0[cmd_attempt0.index("--data") + 1], calldata)
+            self.assertEqual(cmd_attempt0[cmd_attempt0.index("--nonce") + 1], "5")
+            self.assertEqual(cmd_attempt0[cmd_attempt0.index("--gas-price") + 1], "150000000")
+            self.assertEqual(cmd_attempt0[cmd_attempt0.index("--priority-gas-price") + 1], "100000000")
 
     @patch("script.keeper.rpc_call")
     @patch("subprocess.run")
@@ -2657,6 +2666,8 @@ class TestManualReviewLockAndDryRunFixes(unittest.TestCase):
                 return "0x61"
             elif method == "eth_gasPrice":
                 return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
+                return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x1"
             elif method == "eth_call":
@@ -2781,6 +2792,8 @@ class TestKeeperEpochSeedBatching(unittest.TestCase):
                 return "0x6080604052"
             elif method == "eth_gasPrice":
                 return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
+                return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x1"
             elif method == "eth_chainId":
@@ -2829,8 +2842,9 @@ class TestKeeperEpochSeedBatching(unittest.TestCase):
 
         self.assertEqual(len(broadcasted_txs), 1)
         raw_bytes = bytes.fromhex(broadcasted_txs[0]["raw"].replace("0x", ""))
-        decoded = rlp.decode(raw_bytes)
-        calldata = decoded[5].hex()
+        self.assertEqual(raw_bytes[0], 0x02)
+        decoded = rlp.decode(raw_bytes[1:])
+        calldata = decoded[7].hex()
         self.assertTrue(calldata.startswith(SELECTOR_INIT_EPOCH_SEED))
         target_epoch = int(calldata[8:72], 16)
         steps = int(calldata[72:136], 16)
@@ -2854,6 +2868,8 @@ class TestKeeperEpochSeedBatching(unittest.TestCase):
             if method == "eth_getCode":
                 return "0x6080604052"
             elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
                 return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return hex(10 + len(broadcasted_txs))
@@ -2914,8 +2930,9 @@ class TestKeeperEpochSeedBatching(unittest.TestCase):
 
         for tx_info in broadcasted_txs:
             raw_bytes = bytes.fromhex(tx_info["raw"].replace("0x", ""))
-            decoded = rlp.decode(raw_bytes)
-            calldata = decoded[5].hex()
+            self.assertEqual(raw_bytes[0], 0x02)
+            decoded = rlp.decode(raw_bytes[1:])
+            calldata = decoded[7].hex()
             self.assertTrue(calldata.startswith(SELECTOR_INIT_EPOCH_SEED))
             self.assertEqual(int(calldata[8:72], 16), 29)
             self.assertEqual(int(calldata[72:136], 16), 24)
@@ -2935,6 +2952,8 @@ class TestKeeperEpochSeedBatching(unittest.TestCase):
             if method == "eth_getCode":
                 return "0x6080604052"
             elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
                 return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x1"
@@ -3000,6 +3019,8 @@ class TestKeeperEpochSeedBatching(unittest.TestCase):
                 return "0x6080604052"
             elif method == "eth_gasPrice":
                 return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
+                return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x1"
             elif method == "eth_chainId":
@@ -3059,6 +3080,8 @@ class TestKeeperEpochSeedBatching(unittest.TestCase):
             elif method == "eth_chainId":
                 return "0x61"
             elif method == "eth_gasPrice":
+                return "0x5f5e100"
+            elif method == "eth_maxPriorityFeePerGas":
                 return "0x5f5e100"
             elif method == "eth_getTransactionCount":
                 return "0x1"
@@ -3375,6 +3398,7 @@ class TestKeeperPersistentStateAndLocking(unittest.TestCase):
         mock_rpc.side_effect = lambda url, method, params: (
             "0x6080604052" if method == "eth_getCode"
             else "0x61" if method == "eth_chainId"
+            else "0x5f5e100" if method in ("eth_gasPrice", "eth_maxPriorityFeePerGas")
             else "0x0" if method == "eth_call"
             else "0x5" if method == "eth_getTransactionCount"
             else None  # Receipt times out
@@ -3855,19 +3879,19 @@ class TestKeeperReconciliationAndFaultMitigations(unittest.TestCase):
     @patch("script.keeper.rpc_call")
     @patch("subprocess.run")
     def test_max_retries_total_attempt_count_semantics(self, mock_subproc, mock_rpc, mock_time):
-        """max_retries for 0, 1, 2 results in exactly max_retries + 1 total broadcast attempts."""
+        """K2: max_retries (0, 1, 2) executes initial type-2 broadcast and halts at 1 attempt on timeout (no legacy retry)."""
         miner = "0x420382a0f874c1F120621f847d81581e8737504e"
         sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
         mock_rpc.side_effect = lambda url, method, params: (
             "0x6080604052" if method == "eth_getCode"
             else "0x61" if method == "eth_chainId"
+            else "0x5f5e100" if method in ("eth_gasPrice", "eth_maxPriorityFeePerGas")
             else "0x0" if method == "eth_call"
             else "0x5" if method == "eth_getTransactionCount"
             else None  # Receipts always timeout to force all speed-up attempts
         )
 
         for max_retries in (0, 1, 2):
-            expected_attempts = max_retries + 1
             broadcast_count = [0]
             def subproc_run(cmd, *args, **kwargs):
                 if "send" in cmd:
@@ -3890,13 +3914,14 @@ class TestKeeperReconciliationAndFaultMitigations(unittest.TestCase):
                 )
                 res = bot.send_transaction("0x1234", "test_retries", preflight=False)
                 self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
-                self.assertEqual(broadcast_count[0], expected_attempts, f"max_retries={max_retries} must execute exactly {expected_attempts} attempts")
+                self.assertEqual(broadcast_count[0], 1, f"K2 must execute exactly 1 type-2 attempt when max_retries={max_retries}")
+                self.assertTrue(bot.locked_for_manual_review)
 
     @patch("script.keeper.time", new_callable=_FakeKeeperTime)
     @patch("script.keeper.rpc_call")
     @patch("subprocess.run")
     def test_multiple_replacement_hashes_retained_and_listed_in_context(self, mock_subproc, mock_rpc, mock_time):
-        """Multiple replacement hashes are tracked in tx_hashes list and listed in context upon exhaustion."""
+        """K2 halts after single broadcast on timeout while state manager preserves multi-hash tx_hashes lists in context."""
         miner = "0x420382a0f874c1F120621f847d81581e8737504e"
         sender = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
         hash0 = "0x" + "1" * 64
@@ -3906,6 +3931,7 @@ class TestKeeperReconciliationAndFaultMitigations(unittest.TestCase):
         mock_rpc.side_effect = lambda url, method, params: (
             "0x6080604052" if method == "eth_getCode"
             else "0x61" if method == "eth_chainId"
+            else "0x5f5e100" if method in ("eth_gasPrice", "eth_maxPriorityFeePerGas")
             else "0x0" if method == "eth_call"
             else "0x5" if method == "eth_getTransactionCount"
             else None
@@ -3913,8 +3939,6 @@ class TestKeeperReconciliationAndFaultMitigations(unittest.TestCase):
         mock_subproc.side_effect = [
             MagicMock(returncode=0, stdout=sender + chr(10), stderr=""),
             MagicMock(returncode=0, stdout=f"txHash: {hash0}" + chr(10), stderr=""),
-            MagicMock(returncode=0, stdout=f"txHash: {hash1}" + chr(10), stderr=""),
-            MagicMock(returncode=0, stdout=f"txHash: {hash2}" + chr(10), stderr="")
         ]
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3930,15 +3954,27 @@ class TestKeeperReconciliationAndFaultMitigations(unittest.TestCase):
             )
             res = bot.send_transaction("0x1234", "test_replacement_hashes", preflight=False)
             self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
-            self.assertEqual(bot.manual_review_context["tx_hash"], hash2)
-            self.assertEqual(bot.manual_review_context["tx_hashes"], [hash0, hash1, hash2])
+            self.assertEqual(bot.manual_review_context["tx_hash"], hash0)
+            self.assertEqual(bot.manual_review_context["tx_hashes"], [hash0])
+            self.assertEqual(bot.manual_review_context["reason_code"], "TYPE2_REPLACEMENT_DISABLED")
 
             sm = bot._ensure_state_manager()
             saved = sm.load_state()
             self.assertIsNotNone(saved)
             self.assertEqual(saved["status"], "MANUAL_REVIEW_LOCKED")
-            self.assertEqual(saved["tx_hash"], hash2)
-            self.assertEqual(saved["tx_hashes"], [hash0, hash1, hash2])
+            self.assertEqual(saved["tx_hash"], hash0)
+            self.assertEqual(saved["tx_hashes"], [hash0])
+
+            sm.record_manual_review_lock(
+                reason="multi-hash retention check",
+                nonce=5,
+                operation="test_replacement_hashes",
+                tx_hash=hash2,
+                tx_hashes=[hash0, hash1, hash2],
+            )
+            ctx = sm.build_context_from_state(sm.load_state())
+            self.assertEqual(ctx["tx_hash"], hash2)
+            self.assertEqual(ctx["tx_hashes"], [hash0, hash1, hash2])
 
     @patch("script.keeper.rpc_call")
     @patch("subprocess.run")
@@ -4853,3 +4889,422 @@ class TestKeeperExitCodePropagation(unittest.TestCase):
                  patch.object(KeeperBot, "send_transaction", return_value=dry_result) as mock_send:
                 self.assertEqual(main(), 0)
                 mock_send.assert_called_once()
+
+
+class TestKeeperEip1559K2(unittest.TestCase):
+    MINER = "0x420382a0f874c1F120621f847d81581e8737504e"
+    SENDER = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+
+    def test_keystore_and_private_key_type2_dual_fees_and_isolation(self):
+        from eth_account import Account
+        test_acct = Account.create()
+        test_key = test_acct.key.hex()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k2_secret.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            rpc_methods = []
+            captured_env = {}
+            captured_cmd = []
+            tx_hash_ks = "0x" + "a1" * 32
+
+            def rpc_ks(url, method, params):
+                rpc_methods.append(method)
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x7"
+                if method == "eth_estimateGas":
+                    return "0x30d40"  # 200,000
+                if method == "eth_getTransactionReceipt":
+                    return {"status": "0x1", "blockNumber": "0x10", "gasUsed": "0x15000"}
+                return "0x0"
+
+            def subproc_ks(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                captured_cmd.extend(cmd)
+                captured_env.update(kwargs.get("env") or {})
+                return MagicMock(returncode=0, stdout=f"txHash: {tx_hash_ks}\n", stderr="")
+
+            with patch.dict(os.environ, {"ETH_PRIVATE_KEY": "0xdead", "PRIVATE_KEY": "0xbeef"}), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_ks), \
+                 patch("subprocess.run", side_effect=subproc_ks):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k2-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    max_retries=3,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1",
+                    priority_fee_per_gas_gwei="0.2",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+                self.assertNotIn("eth_gasPrice", rpc_methods)
+                self.assertNotIn("eth_maxPriorityFeePerGas", rpc_methods)
+                self.assertEqual(captured_cmd[captured_cmd.index("--gas-price") + 1], "1000000000")
+                self.assertEqual(captured_cmd[captured_cmd.index("--priority-gas-price") + 1], "200000000")
+                self.assertEqual(captured_cmd[captured_cmd.index("--gas-limit") + 1], "260000")
+                self.assertEqual(captured_cmd[captured_cmd.index("--nonce") + 1], "7")
+                self.assertNotIn("ETH_PRIVATE_KEY", captured_env)
+                self.assertNotIn("PRIVATE_KEY", captured_env)
+
+                saved = bot._ensure_state_manager().load_state()
+                self.assertEqual(saved["status"], "CONFIRMED_SUCCESS")
+                self.assertEqual(saved["tx_type"], 2)
+                self.assertEqual(saved["max_fee_per_gas_wei"], 1_000_000_000)
+                self.assertEqual(saved["max_priority_fee_per_gas_wei"], 200_000_000)
+                self.assertEqual(saved["gas_limit"], 260_000)
+                self.assertEqual(saved["to"], to_checksum_address(self.MINER))
+                self.assertEqual(saved["value"], 0)
+                self.assertEqual(saved["calldata"], "0x93afb4c5")
+
+            with tempfile.TemporaryDirectory() as tmp_pk_dir:
+                raw_sent = []
+                tx_hash_pk = "0x" + "b2" * 32
+
+                def rpc_pk(url, method, params):
+                    if method == "eth_getCode":
+                        return "0x6080604052"
+                    if method == "eth_chainId":
+                        return "0x61"
+                    if method == "eth_getTransactionCount":
+                        return "0x9"
+                    if method == "eth_estimateGas":
+                        return "0x249f0"  # 150,000
+                    if method == "eth_sendRawTransaction":
+                        raw_sent.append(params[0])
+                        return tx_hash_pk
+                    if method == "eth_getTransactionReceipt":
+                        return {"status": "0x1", "blockNumber": "0x11", "gasUsed": "0x10000"}
+                    return "0x0"
+
+                with patch("script.keeper.rpc_call", side_effect=rpc_pk):
+                    bot_pk = KeeperBot(
+                        rpc_url="http://mock-rpc",
+                        miner_address=self.MINER,
+                        private_key=test_key,
+                        dry_run=False,
+                        max_retries=3,
+                        state_dir=tmp_pk_dir,
+                        max_fee_per_gas_gwei="1.5",
+                        priority_fee_per_gas_gwei="0.25",
+                    )
+                    res_pk = bot_pk.send_transaction("0xdeadbeef", "sync(2)", preflight=False)
+                    self.assertEqual(res_pk.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+                    raw_bytes = bytes.fromhex(raw_sent[0].replace("0x", ""))
+                    self.assertEqual(raw_bytes[0], 0x02)
+                    decoded = rlp.decode(raw_bytes[1:])
+                    self.assertEqual(int.from_bytes(decoded[0], "big"), 97)
+                    self.assertEqual(int.from_bytes(decoded[1], "big"), 9)
+                    self.assertEqual(int.from_bytes(decoded[2], "big"), 250_000_000)
+                    self.assertEqual(int.from_bytes(decoded[3], "big"), 1_500_000_000)
+                    self.assertEqual(int.from_bytes(decoded[4], "big"), 195_000)
+                    self.assertEqual(decoded[7].hex(), "deadbeef")
+                    saved_pk = bot_pk._ensure_state_manager().load_state()
+                    self.assertEqual(saved_pk["status"], "CONFIRMED_SUCCESS")
+                    self.assertEqual(saved_pk["tx_type"], 2)
+                    self.assertEqual(saved_pk["max_fee_per_gas_wei"], 1_500_000_000)
+                    self.assertEqual(saved_pk["max_priority_fee_per_gas_wei"], 250_000_000)
+                    self.assertEqual(saved_pk["gas_limit"], 195_000)
+                    self.assertEqual(saved_pk["calldata"], "0xdeadbeef")
+
+    def test_four_override_combinations_exact_rpc_calls_and_floor_warning(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            seen_a = []
+            def rpc_a(url, method, params):
+                seen_a.append(method)
+                if method == "eth_gasPrice":
+                    raise AssertionError("eth_gasPrice must not be queried when maxFee is explicit")
+                if method == "eth_maxPriorityFeePerGas":
+                    return hex(500_000_000)
+                if method == "eth_estimateGas":
+                    return hex(100_000)
+                if method == "eth_getTransactionCount":
+                    return "0x1"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_call":
+                    return "0x0"
+                return "0x6080604052"
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_a):
+                bot_a = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    keeper_address=self.SENDER,
+                    dry_run=True,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1",
+                )
+                seen_a.clear()
+                fee_a = bot_a.resolve_tx_fees()
+                self.assertEqual(fee_a["max_fee_per_gas_wei"], 1_000_000_000)
+                self.assertEqual(fee_a["priority_fee_per_gas_wei"], 500_000_000)
+                self.assertIsNone(fee_a["network_gas_price_wei"])
+                self.assertEqual(seen_a, ["eth_maxPriorityFeePerGas"])
+
+            def rpc_a_too_high(url, method, params):
+                if method == "eth_maxPriorityFeePerGas":
+                    return hex(2_000_000_000)
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                return "0x0"
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_a_too_high):
+                res_fail = bot_a.send_transaction("0x1234", "sync(1)", preflight=False)
+                self.assertEqual(res_fail.status, TxExecutionStatus.PREFLIGHT_FAILURE)
+
+            seen_b = []
+            def rpc_b(url, method, params):
+                seen_b.append(method)
+                if method == "eth_maxPriorityFeePerGas":
+                    raise AssertionError("eth_maxPriorityFeePerGas must not be queried when priorityFee is explicit")
+                if method == "eth_gasPrice":
+                    return hex(1_000_000_000)
+                if method == "eth_estimateGas":
+                    return hex(100_000)
+                if method == "eth_getTransactionCount":
+                    return "0x1"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_call":
+                    return "0x0"
+                return "0x6080604052"
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_b):
+                bot_b = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    keeper_address=self.SENDER,
+                    dry_run=True,
+                    state_dir=tmp_dir,
+                    priority_fee_per_gas_gwei="2",
+                )
+                logs_b = []
+                bot_b.log = lambda lvl, msg: logs_b.append((lvl, msg))
+                res_b = bot_b.send_transaction("0x1234", "sync(1)", preflight=False)
+                self.assertEqual(res_b.status, TxExecutionStatus.DRY_RUN)
+                self.assertIn("eth_gasPrice", seen_b)
+                self.assertNotIn("eth_maxPriorityFeePerGas", seen_b)
+                joined_b = "\n".join(f"{l}:{m}" for l, m in logs_b)
+                self.assertIn("raised automatic maxFeePerGas", joined_b)
+                self.assertIn("eth_maxPriorityFeePerGas=not queried (explicit override)", joined_b)
+                self.assertIn("Max Total Fee:   260000000000000 wei", joined_b)
+
+            seen_c = []
+            def rpc_c(url, method, params):
+                seen_c.append(method)
+                if method == "eth_gasPrice":
+                    return hex(10**28 + 1)
+                if method == "eth_maxPriorityFeePerGas":
+                    return hex(10**9)
+                return "0x6080604052"
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_c):
+                bot_c = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    keeper_address=self.SENDER,
+                    dry_run=True,
+                    gas_multiplier="1.0000000000000000000000000001",
+                    state_dir=tmp_dir,
+                )
+                seen_c.clear()
+                fee_c = bot_c.resolve_tx_fees()
+                self.assertEqual(fee_c["max_fee_per_gas_wei"], 10**28 + 2)
+                self.assertEqual(fee_c["priority_fee_per_gas_wei"], 10**9)
+                self.assertEqual(seen_c, ["eth_gasPrice", "eth_maxPriorityFeePerGas"])
+
+    def test_fee_rpc_failure_fails_closed_without_floor_fallback_or_send(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k2_rpc_fail.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            def rpc_fail(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_gasPrice":
+                    raise RuntimeError("upstream rpc down")
+                return "0x0"
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_fail), \
+                 patch("subprocess.run") as mock_subproc:
+                mock_subproc.return_value = MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k2-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    min_gas_price_gwei=0.1,
+                    state_dir=tmp_dir,
+                )
+                res = bot.send_transaction("0x1234", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.PREFLIGHT_FAILURE)
+                self.assertEqual(mock_subproc.call_count, 1)
+                self.assertIsNone(bot._ensure_state_manager().load_state())
+
+    def test_old_v1_state_compatibility_and_lock_preservation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            domain = StateDomain(97, self.MINER, self.SENDER)
+            sm = KeeperStateManager(tmp_dir, domain)
+
+            old_v1 = {
+                "version": 1,
+                "domain": domain.to_dict(),
+                "status": "MANUAL_REVIEW_LOCKED",
+                "operation": "sync(1)",
+                "nonce": 4,
+                "tx_hash": "0x" + "c" * 64,
+                "tx_hashes": ["0x" + "c" * 64],
+                "reason_code": "LEGACY_LOCK",
+                "updated_at": "2026-11-01T00:00:00+00:00",
+                "details": "legacy v1 lock",
+            }
+            with open(sm.get_state_path(), "w", encoding="utf-8") as f:
+                json.dump(old_v1, f)
+
+            loaded = sm.load_state()
+            self.assertEqual(loaded["status"], "MANUAL_REVIEW_LOCKED")
+            ctx = sm.build_context_from_state(loaded)
+            self.assertNotIn("max_fee_per_gas_wei", ctx)
+            self.assertNotIn("max_priority_fee_per_gas_wei", ctx)
+            self.assertNotIn("tx_type", ctx)
+
+            pw_path = os.path.join(tmp_dir, "k2_lock.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+            cli_args = [
+                "keeper.py", "--no-env", "--rpc-url", "http://127.0.0.1:8545",
+                "--miner-address", self.MINER, "--account", "k2-acct",
+                "--password-file", pw_path, "--state-dir", tmp_dir, "--once",
+            ]
+            with patch.object(sys, "argv", cli_args), \
+                 patch("script.keeper.rpc_call", side_effect=lambda u, m, p: "0x61" if m == "eth_chainId" else "0x6080604052"), \
+                 patch("subprocess.run", return_value=MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")) as mock_sub, \
+                 patch.object(KeeperBot, "get_epoch_state", return_value=(10, 9, 0xABCD)):
+                self.assertNotEqual(main(), 0)
+                self.assertEqual(mock_sub.call_count, 1)
+                self.assertEqual(sm.load_state()["status"], "MANUAL_REVIEW_LOCKED")
+
+            with tempfile.TemporaryDirectory() as tmp_crash:
+                sm_c = KeeperStateManager(tmp_crash, domain)
+                sm_c.acquire_lock()
+                try:
+                    sm_c.record_preparing_to_send(
+                        operation="initEpochSeed(1, 24)",
+                        epoch=1,
+                        nonce=12,
+                        tx_type=2,
+                        max_fee_per_gas_wei=2_000_000_000,
+                        max_priority_fee_per_gas_wei=300_000_000,
+                        gas_limit=210_000,
+                        to_address=to_checksum_address(self.MINER),
+                        value_wei=0,
+                        calldata="0xd9d9c33c",
+                    )
+                    recovered = sm_c.recover_crash_to_manual_review()
+                finally:
+                    sm_c.release_lock()
+                self.assertEqual(recovered["tx_type"], 2)
+                self.assertEqual(recovered["max_fee_per_gas_wei"], 2_000_000_000)
+                self.assertEqual(recovered["max_priority_fee_per_gas_wei"], 300_000_000)
+                self.assertEqual(recovered["gas_limit"], 210_000)
+                self.assertEqual(recovered["calldata"], "0xd9d9c33c")
+
+    def test_timeout_single_send_preserves_metadata_exits_nonzero_and_redacts_secrets(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "top_secret_pw_file.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+            tx_h = "0x" + "d4" * 32
+            send_cmds = []
+
+            def rpc_timeout(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x8"
+                if method == "eth_estimateGas":
+                    return hex(180_000)
+                if method == "eth_getTransactionReceipt":
+                    return None
+                return "0x0"
+
+            def subproc_timeout(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                send_cmds.append(cmd)
+                return MagicMock(returncode=0, stdout=f"txHash: {tx_h}\n", stderr="")
+
+            cli_args = [
+                "keeper.py", "--no-env", "--rpc-url", "http://127.0.0.1:8545",
+                "--miner-address", self.MINER, "--account", "k2-acct",
+                "--password-file", pw_path, "--state-dir", tmp_dir,
+                "--max-fee-per-gas-gwei", "1.2", "--priority-fee-per-gas-gwei", "0.3",
+                "--max-retries", "3", "--tx-timeout", "1", "--once",
+            ]
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            with patch.object(sys, "argv", cli_args), \
+                 patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_timeout), \
+                 patch("subprocess.run", side_effect=subproc_timeout), \
+                 patch.object(KeeperBot, "get_epoch_state", return_value=(10, 9, 0xABCD)), \
+                 redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                exit_code = main()
+
+            self.assertNotEqual(exit_code, 0)
+            self.assertEqual(len(send_cmds), 1)
+            sm = KeeperStateManager(tmp_dir, StateDomain(97, self.MINER, self.SENDER))
+            state = sm.load_state()
+            self.assertEqual(state["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(state["reason_code"], "TYPE2_REPLACEMENT_DISABLED")
+            self.assertEqual(state["tx_type"], 2)
+            self.assertEqual(state["max_fee_per_gas_wei"], 1_200_000_000)
+            self.assertEqual(state["max_priority_fee_per_gas_wei"], 300_000_000)
+            self.assertEqual(state["gas_limit"], 234_000)
+            self.assertEqual(state["tx_hash"], tx_h)
+            combined = stdout_buf.getvalue() + stderr_buf.getvalue()
+            self.assertNotIn("top_secret_pw_file.pwd", combined)
+            with open(sm.get_state_path(), "r", encoding="utf-8") as sf:
+                self.assertNotIn("top_secret_pw_file.pwd", sf.read())
+            with open(sm.get_audit_path(), "r", encoding="utf-8") as af:
+                self.assertNotIn("top_secret_pw_file.pwd", af.read())
+
+    def test_invalid_cli_fee_args_rejected_at_startup_without_rpc_or_send(self):
+        bad_cases = [
+            ["--max-fee-per-gas-gwei", "0.1", "--priority-fee-per-gas-gwei", "0.2"],
+            ["--max-fee-per-gas-gwei", "NaN"],
+            ["--gas-multiplier", "1e10000"],
+        ]
+        for extra in bad_cases:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                cli_args = [
+                    "keeper.py", "--no-env", "--rpc-url", "http://127.0.0.1:8545",
+                    "--miner-address", self.MINER, "--keeper-address", self.SENDER,
+                    "--state-dir", tmp_dir, "--dry-run", "--once",
+                ] + extra
+                with patch.object(sys, "argv", cli_args), \
+                     patch("script.keeper.rpc_call", side_effect=AssertionError("RPC must not be called on invalid CLI fee args")), \
+                     patch("subprocess.run", side_effect=AssertionError("subprocess must not run on invalid CLI fee args")):
+                    with self.assertRaises(SystemExit) as cm:
+                        main()
+                    self.assertNotEqual(cm.exception.code, 0)

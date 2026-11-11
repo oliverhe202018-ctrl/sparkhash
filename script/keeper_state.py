@@ -493,6 +493,14 @@ class KeeperStateManager:
         elif clean_hash != "Unknown" and clean_hash not in tx_hashes:
             tx_hashes.append(clean_hash)
 
+        preserved_meta = {}
+        for meta_key in ("tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata"):
+            if meta_key in state_data and state_data.get(meta_key) is not None:
+                val = state_data.get(meta_key)
+                preserved_meta[meta_key] = sanitize_state_value(val) if isinstance(val, str) else val
+        if "epoch" in state_data and state_data.get("epoch") is not None:
+            preserved_meta["epoch"] = state_data.get("epoch")
+
         updated_state = {
             "version": CURRENT_STATE_VERSION,
             "domain": self.domain.to_dict(),
@@ -507,8 +515,9 @@ class KeeperStateManager:
             "updated_at": now,
             "details": sanitize_state_value(details)
         }
+        updated_state.update(preserved_meta)
         atomic_write_json(self.get_state_path(), updated_state)
-        append_audit_log(self.get_audit_path(), {
+        audit_entry = {
             "action": "MANUAL_REVIEW_LOCKED",
             "timestamp": now,
             "domain": self.domain.to_dict(),
@@ -517,10 +526,27 @@ class KeeperStateManager:
             "tx_hash": clean_hash,
             "tx_hashes": tx_hashes,
             "reason_code": reason_code
-        })
+        }
+        for audit_key in ("tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit"):
+            if audit_key in preserved_meta:
+                audit_entry[audit_key] = preserved_meta[audit_key]
+        append_audit_log(self.get_audit_path(), audit_entry)
         return updated_state
 
-    def record_preparing_to_send(self, operation: str, epoch: Any, nonce: Any, details: Optional[str] = None):
+    def record_preparing_to_send(
+        self,
+        operation: str,
+        epoch: Any,
+        nonce: Any,
+        details: Optional[str] = None,
+        tx_type: Optional[int] = None,
+        max_fee_per_gas_wei: Optional[int] = None,
+        max_priority_fee_per_gas_wei: Optional[int] = None,
+        gas_limit: Optional[int] = None,
+        to_address: Optional[str] = None,
+        value_wei: Optional[int] = None,
+        calldata: Optional[str] = None,
+    ):
         """
         Records in-flight state immediately before signing or broadcast.
         If writing fails, caller must abort broadcast immediately.
@@ -543,6 +569,20 @@ class KeeperStateManager:
             "updated_at": now,
             "details": sanitize_state_value(details or "Preparing to sign and broadcast transaction")
         }
+        if tx_type is not None:
+            state_data["tx_type"] = int(tx_type)
+        if max_fee_per_gas_wei is not None:
+            state_data["max_fee_per_gas_wei"] = int(max_fee_per_gas_wei)
+        if max_priority_fee_per_gas_wei is not None:
+            state_data["max_priority_fee_per_gas_wei"] = int(max_priority_fee_per_gas_wei)
+        if gas_limit is not None:
+            state_data["gas_limit"] = int(gas_limit)
+        if to_address is not None:
+            state_data["to"] = sanitize_state_value(str(to_address))
+        if value_wei is not None:
+            state_data["value"] = int(value_wei)
+        if calldata is not None:
+            state_data["calldata"] = sanitize_state_value(str(calldata))
         atomic_write_json(self.get_state_path(), state_data)
 
     def record_broadcasted(self, tx_hash: str):
@@ -706,14 +746,24 @@ class KeeperStateManager:
         now = datetime.now(timezone.utc).isoformat()
         clean_hash = tx_hash if (tx_hash and re.match(r"^0x[0-9a-fA-F]{64}$", tx_hash)) else "Unknown"
 
+        normalized_nonce = int(nonce) if (nonce is not None and str(nonce).isdigit()) else (nonce if nonce is not None else "Unknown")
+        prev_state = None
+        try:
+            prev_state = self.load_state()
+        except Exception:
+            prev_state = None
+        preserved_meta = {}
+        if isinstance(prev_state, dict) and prev_state.get("status") in ("PREPARING_TO_SEND", "MANUAL_REVIEW_LOCKED"):
+            prev_nonce = prev_state.get("nonce")
+            if prev_nonce == normalized_nonce or prev_nonce in (None, "Unknown") or normalized_nonce == "Unknown":
+                for meta_key in ("epoch", "tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata"):
+                    if meta_key in prev_state and prev_state.get(meta_key) is not None:
+                        val = prev_state.get(meta_key)
+                        preserved_meta[meta_key] = sanitize_state_value(val) if isinstance(val, str) else val
+
         hashes = list(tx_hashes) if isinstance(tx_hashes, list) else []
-        if not hashes:
-            try:
-                prev_state = self.load_state()
-                if prev_state and isinstance(prev_state.get("tx_hashes"), list):
-                    hashes = list(prev_state["tx_hashes"])
-            except Exception:
-                pass
+        if not hashes and isinstance(prev_state, dict) and isinstance(prev_state.get("tx_hashes"), list):
+            hashes = list(prev_state["tx_hashes"])
         if clean_hash != "Unknown" and clean_hash not in hashes:
             hashes.append(clean_hash)
 
@@ -722,7 +772,7 @@ class KeeperStateManager:
             "domain": self.domain.to_dict(),
             "status": "MANUAL_REVIEW_LOCKED",
             "operation": sanitize_state_value(operation),
-            "nonce": int(nonce) if (nonce is not None and str(nonce).isdigit()) else (nonce if nonce is not None else "Unknown"),
+            "nonce": normalized_nonce,
             "tx_hash": clean_hash,
             "tx_hashes": hashes,
             "reason_code": reason_code or "MANUAL_REVIEW_LOCKED",
@@ -730,8 +780,9 @@ class KeeperStateManager:
             "updated_at": now,
             "details": sanitize_state_value(details or reason)
         }
+        state_data.update(preserved_meta)
         atomic_write_json(self.get_state_path(), state_data)
-        append_audit_log(self.get_audit_path(), {
+        audit_entry = {
             "action": "MANUAL_REVIEW_LOCKED",
             "timestamp": now,
             "domain": self.domain.to_dict(),
@@ -740,7 +791,11 @@ class KeeperStateManager:
             "tx_hash": clean_hash,
             "tx_hashes": hashes,
             "reason_code": state_data["reason_code"]
-        })
+        }
+        for audit_key in ("tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit"):
+            if audit_key in preserved_meta:
+                audit_entry[audit_key] = preserved_meta[audit_key]
+        append_audit_log(self.get_audit_path(), audit_entry)
 
     def manual_unlock(
         self,
@@ -830,7 +885,7 @@ class KeeperStateManager:
         hashes = state_data.get("tx_hashes")
         if not isinstance(hashes, list):
             hashes = [clean_hash] if clean_hash else []
-        return {
+        ctx = {
             "chain_id": domain.get("chain_id", "Unknown"),
             "signer_address": domain.get("sender_address", "Unknown"),
             "target_contract": domain.get("miner_address", "Unknown"),
@@ -841,3 +896,7 @@ class KeeperStateManager:
             "reason_code": state_data.get("reason_code"),
             "status": state_data.get("status")
         }
+        for meta_key in ("tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata"):
+            if meta_key in state_data and state_data.get(meta_key) is not None:
+                ctx[meta_key] = state_data.get(meta_key)
+        return ctx
