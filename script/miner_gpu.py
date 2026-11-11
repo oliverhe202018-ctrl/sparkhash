@@ -51,6 +51,13 @@ CAP = 6
 SELECTOR_INIT_EPOCH_SEED = "d9d9c33c"  # initEpochSeed(uint256,uint256)
 SELECTOR_VAULT = "fbfa77cf"  # vault()
 SELECTOR_STATUS = "645b8b1b"  # status(address)
+SELECTOR_EPOCH = "900cf0cf"  # epoch()
+SELECTOR_EPOCH_SEED = "4abccd28"  # epochSeed(uint256)
+SELECTOR_TARGET = "9811c7c1"  # target(uint256)
+SELECTOR_USED_MASK = "1107d89b"  # usedMask(uint256,address)
+SELECTOR_PAUSED = "5c975abb"  # paused()
+SELECTOR_LAST_SYNCED = "93afb4c5"  # lastSynced()
+SELECTOR_COUNTED = "834f9a82"  # counted(uint256,address)
 HEX_CHARACTERS = set("0123456789abcdefABCDEF")
 EVENT_EPOCH_SETTLED_TOPIC = "0xdd61069809ef8d608890acc089aa62bd79a1b97490fdb3b8c9c5b96caeeb45c5"
 EVENT_REWARD_CLAIMED_TOPIC = "0x812be816db82c66cd18ca8457005cd84689642d8ac4d38599cc6af444a2dc72a"
@@ -456,6 +463,54 @@ def encode_address(addr):
     return addr.lower().replace("0x", "").zfill(64)
 
 
+def backfill_epoch_seed(rpc_url, miner_contract, cur_epoch, private_key=None, max_steps=24):
+    """Sends initEpochSeed(cur_epoch, max_steps) backfill transaction when seed is 0 and --allow-backfill is enabled."""
+    calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(cur_epoch) + encode_uint256(max_steps)
+    if private_key:
+        try:
+            from eth_account import Account
+            clean_key = private_key.strip()
+            if clean_key.startswith("0x"):
+                clean_key = clean_key[2:]
+            account = Account.from_key(bytes.fromhex(clean_key))
+            sender = account.address
+            res_nonce = rpc_call(rpc_url, "eth_getTransactionCount", [sender, "latest"])
+            nonce = int(res_nonce, 16) if res_nonce else 0
+            res_gp = rpc_call(rpc_url, "eth_gasPrice", [])
+            gas_price = int(res_gp, 16) if res_gp else 1000000000
+            tx_dict = {
+                "nonce": nonce,
+                "gasPrice": gas_price,
+                "gas": 300000,
+                "to": miner_contract,
+                "value": 0,
+                "data": bytes.fromhex(calldata[2:]),
+                "chainId": REQUIRED_CHAIN_ID,
+            }
+            signed = account.sign_transaction(tx_dict)
+            tx_hash = rpc_call(rpc_url, "eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
+            print(f"[BACKFILL] Broadcasted initEpochSeed({cur_epoch}, {max_steps}) tx: {tx_hash}")
+            time.sleep(2)
+            return tx_hash
+        except Exception as exc:
+            safe_exc = format_exception_safe(
+                exc,
+                sensitive_values=_collect_sensitive_values(extra_secrets=[private_key]),
+            )
+            print(f"[BACKFILL] Failed to broadcast backfill tx: {safe_exc}")
+            return None
+    else:
+        try:
+            tx_obj = {"to": miner_contract, "data": calldata}
+            tx_hash = rpc_call(rpc_url, "eth_sendTransaction", [tx_obj])
+            print(f"[BACKFILL] Sent initEpochSeed tx via unlocked node: {tx_hash}")
+            time.sleep(1)
+            return tx_hash
+        except Exception:
+            print("[BACKFILL] No private key provided in MINER_PRIVATE_KEY or PRIVATE_KEY to sign backfill transaction.")
+            return None
+
+
 def get_miner_vault(rpc_url: str, miner_contract: str) -> str:
     """
     Queries vault() on the miner contract and strictly validates the returned address.
@@ -520,6 +575,49 @@ def get_stake_status(rpc_url: str, vault_contract: str, miner_addr: str) -> tupl
     active = (bool_val == 1)
     since = int(word1, 16)
     return (active, since)
+
+
+def get_contract_paused(rpc_url: str, contract_addr: str, contract_name: str) -> bool:
+    """
+    Queries paused() on a contract and strictly validates the returned ABI bool.
+    """
+    try:
+        res = eth_call(rpc_url, contract_addr, SELECTOR_PAUSED)
+    except Exception as e:
+        raise RuntimeError(f"RPC call failed while querying {contract_name}.paused(): {type(e).__name__}") from None
+
+    if not res or not isinstance(res, str):
+        raise RuntimeError(f"Query {contract_name}.paused() returned empty response from RPC")
+
+    raw = res[2:] if res.startswith("0x") else res
+    if not raw or len(raw) > 64 or any(c not in HEX_CHARACTERS for c in raw):
+        raise RuntimeError(f"Query {contract_name}.paused() returned invalid ABI response")
+
+    bool_val = int(raw, 16)
+    if bool_val not in (0, 1):
+        raise RuntimeError(
+            f"Query {contract_name}.paused() returned invalid ABI bool value (must be 0 or 1, got {bool_val})"
+        )
+    return bool_val == 1
+
+
+def get_uint_call(rpc_url: str, contract_addr: str, call_data: str, label: str) -> int:
+    """
+    Queries a uint-returning view function and validates the returned hex payload.
+    """
+    try:
+        res = eth_call(rpc_url, contract_addr, call_data)
+    except Exception as e:
+        raise RuntimeError(f"RPC call failed while querying {label}: {type(e).__name__}") from None
+
+    if not res or not isinstance(res, str):
+        raise RuntimeError(f"Query {label} returned empty response from RPC")
+
+    raw = res[2:] if res.startswith("0x") else res
+    if not raw or len(raw) > 64 or any(c not in HEX_CHARACTERS for c in raw):
+        raise RuntimeError(f"Query {label} returned invalid ABI uint response")
+
+    return int(raw, 16)
 
 
 def verify_stake(rpc_url: str, miner_contract: str, miner_addr: str, cur_epoch: int) -> tuple:
@@ -601,11 +699,15 @@ def mine(args):
     miner_contract = to_checksum_address(args.miner_contract)
 
     # 1. Resolve Epoch
+    onchain_epoch = None
+    if args.rpc:
+        onchain_epoch = get_uint_call(args.rpc, miner_contract, SELECTOR_EPOCH, "epoch()")
     if args.epoch is not None:
         cur_epoch = args.epoch
+    elif onchain_epoch is not None:
+        cur_epoch = onchain_epoch
     else:
-        res = eth_call(args.rpc, miner_contract, "900cf0cf")  # epoch()
-        cur_epoch = int(res, 16) if res else 0
+        raise RuntimeError("Cannot resolve epoch: --rpc is not set and --epoch was omitted.")
 
     print("=== PoolCoin GPU-Accelerated PoW Miner ===")
     print(f"Target Network:   BSC Testnet (Chain ID {chain_id})")
@@ -613,36 +715,72 @@ def mine(args):
     print(f"Miner Address:    {miner_addr}")
     print(f"Current Epoch:    {cur_epoch}")
 
-    # 2. Check StakeVault status if RPC available
-    if args.skip_stake_check:
+    # 2. Pre-mining contract state & StakeVault checks if RPC available
+    if args.rpc:
+        if get_contract_paused(args.rpc, miner_contract, "Miner"):
+            raise RuntimeError(f"Pre-check failed: Miner contract {miner_contract} is paused.")
+
+        vault_for_pause = get_miner_vault(args.rpc, miner_contract)
+        if get_contract_paused(args.rpc, vault_for_pause, "StakeVault"):
+            raise RuntimeError(f"Pre-check failed: StakeVault contract {vault_for_pause} is paused.")
+
+        last_synced = get_uint_call(args.rpc, miner_contract, SELECTOR_LAST_SYNCED, "lastSynced()")
+        if last_synced != onchain_epoch:
+            raise RuntimeError(
+                f"Pre-check failed: Miner lastSynced()={last_synced} != epoch()={onchain_epoch}; "
+                f"epoch sync is behind. Please run Keeper to sync before mining."
+            )
+
+        counted_data = SELECTOR_COUNTED + encode_uint256(cur_epoch) + encode_address(miner_addr)
+        counted_shares = get_uint_call(args.rpc, miner_contract, counted_data, f"counted({cur_epoch}, {miner_addr})")
+        if counted_shares >= CAP:
+            raise RuntimeError(
+                f"Pre-check failed: miner {miner_addr} has already reached share cap "
+                f"counted({cur_epoch})={counted_shares} >= CAP ({CAP})."
+            )
+
+        if getattr(args, "skip_stake_check", False):
+            print("[WARNING] --skip-stake-check specified: \u672a\u9a8c\u8bc1\u8d28\u62bc\u8d44\u683c (stake eligibility not verified).")
+        else:
+            vault_contract, active, since = verify_stake(args.rpc, miner_contract, miner_addr, cur_epoch)
+            print(f"StakeVault:       {vault_contract}")
+            print(f"Stake Status:     Active={active}, DepositEpoch={since}")
+    elif getattr(args, "skip_stake_check", False):
         print("[WARNING] --skip-stake-check specified: \u672a\u9a8c\u8bc1\u8d28\u62bc\u8d44\u683c (stake eligibility not verified).")
-    elif args.rpc:
-        vault_contract, active, since = verify_stake(args.rpc, miner_contract, miner_addr, cur_epoch)
-        print(f"StakeVault:       {vault_contract}")
-        print(f"Stake Status:     Active={active}, DepositEpoch={since}")
 
     # 3. Resolve epochSeed
     if args.seed:
         epoch_seed_int = int(args.seed, 16) if args.seed.startswith("0x") else int(args.seed)
-    else:
-        seed_data = "4abccd28" + encode_uint256(cur_epoch)  # epochSeed(uint256)
+    elif args.rpc:
+        seed_data = SELECTOR_EPOCH_SEED + encode_uint256(cur_epoch)  # epochSeed(uint256)
         res = eth_call(args.rpc, miner_contract, seed_data)
         epoch_seed_int = int(res, 16) if res else 0
+    else:
+        raise RuntimeError("Cannot resolve epochSeed: --rpc is not set and --seed was omitted.")
 
     if epoch_seed_int == 0:
-        print(f"[INFO] Epoch {cur_epoch} seed is 0x0 (not initialized). Discovered uninitialized seed.")
-        jitter = random.uniform(0.0, 3.0)
-        print(f"[JITTER] Applying {jitter:.2f}s random jitter before sending backfill transaction...")
-        time.sleep(jitter)
-        pk = getattr(args, "private_key", None) or os.environ.get("MINER_PRIVATE_KEY") or os.environ.get("PRIVATE_KEY")
-        backfill_epoch_seed(args.rpc, miner_contract, cur_epoch, private_key=pk, max_steps=getattr(args, "max_seed_steps", 24))
-        res = eth_call(args.rpc, miner_contract, seed_data)
-        epoch_seed_int = int(res, 16) if res else 0
+        if getattr(args, "allow_backfill", False) is True:
+            if not args.rpc:
+                raise RuntimeError("Cannot backfill epoch seed: --rpc is required when --allow-backfill is enabled.")
+            print(f"[INFO] Epoch {cur_epoch} seed is 0x0 (not initialized). Discovered uninitialized seed.")
+            jitter = random.uniform(0.0, 3.0)
+            print(f"[JITTER] Applying {jitter:.2f}s random jitter before sending backfill transaction...")
+            time.sleep(jitter)
+            pk = os.environ.get("MINER_PRIVATE_KEY") or os.environ.get("PRIVATE_KEY")
+            backfill_epoch_seed(args.rpc, miner_contract, cur_epoch, private_key=pk, max_steps=getattr(args, "max_seed_steps", 24))
+            seed_data = SELECTOR_EPOCH_SEED + encode_uint256(cur_epoch)
+            res = eth_call(args.rpc, miner_contract, seed_data)
+            epoch_seed_int = int(res, 16) if res else 0
+        else:
+            raise RuntimeError(
+                f"Epoch seed for epoch {cur_epoch} is 0x0 (not initialized)! "
+                f"Please run Keeper to initialize epoch seeds before mining (or pass --allow-backfill to send initEpochSeed)."
+            )
 
     if epoch_seed_int == 0:
         raise RuntimeError(
             f"Epoch seed for epoch {cur_epoch} is 0x0 (not initialized)! "
-            f"Backfill transaction was not completed or failed. Wait for Keeper or call initEpochSeed({cur_epoch}, 24)."
+            f"Backfill transaction was not completed or failed. Please run Keeper or call initEpochSeed({cur_epoch}, 24)."
         )
     epoch_seed_bytes = epoch_seed_int.to_bytes(32, "big")
     print(f"Epoch Seed:       0x{epoch_seed_bytes.hex()}")
@@ -650,14 +788,26 @@ def mine(args):
     # 4. Resolve Target & Difficulty
     if args.target:
         target_int = int(args.target, 16) if args.target.startswith("0x") else int(args.target)
+        if target_int <= 0:
+            raise ValueError(f"Explicit --target must be > 0, got {target_int}")
         diff_bits = 256 - target_int.bit_length()
-    elif args.difficulty_bits:
+    elif getattr(args, "difficulty_bits", None) is not None:
         diff_bits = args.difficulty_bits
-        target_int = 1 << (256 - diff_bits)
+        if diff_bits < 0 or diff_bits > 256:
+            raise ValueError(f"Invalid difficulty_bits={diff_bits}; must be 0..256")
+        target_int = (1 << (256 - diff_bits)) if diff_bits > 0 else ((1 << 256) - 1)
     else:
-        target_data = "9811c7c1" + encode_uint256(cur_epoch)  # target(uint256)
-        res = eth_call(args.rpc, miner_contract, target_data)
-        target_int = int(res, 16) if (res and int(res, 16) > 0) else (1 << (256 - DEFAULT_DIFFICULTY_BITS))
+        if not args.rpc:
+            raise RuntimeError(
+                "Cannot query on-chain target(epoch): --rpc is not set and neither --target nor --difficulty-bits was specified."
+            )
+        target_data = SELECTOR_TARGET + encode_uint256(cur_epoch)  # target(uint256)
+        target_int = get_uint_call(args.rpc, miner_contract, target_data, f"target({cur_epoch})")
+        if target_int == 0:
+            raise RuntimeError(
+                f"On-chain target({cur_epoch}) is 0 (epoch not initialized/synced or invalid target); "
+                f"refusing fallback to default 32-bit target (1<<224)."
+            )
         diff_bits = 256 - target_int.bit_length()
 
     target_bytes = target_int.to_bytes(32, "big")
@@ -670,20 +820,25 @@ def mine(args):
     if args.k is not None:
         k = args.k
     else:
-        mask_data = "1107d89b" + encode_uint256(cur_epoch) + encode_address(miner_addr)
-        res = eth_call(args.rpc, miner_contract, mask_data)
-        used_mask = int(res, 16) if res else 0
+        if not args.rpc:
+            raise RuntimeError("Cannot query usedMask: --rpc is not set and --k was omitted.")
+        mask_data = SELECTOR_USED_MASK + encode_uint256(cur_epoch) + encode_address(miner_addr)
+        used_mask = get_uint_call(args.rpc, miner_contract, mask_data, f"usedMask({cur_epoch}, {miner_addr})")
         k = None
         for cand_k in range(CAP):
             if (used_mask & (1 << cand_k)) == 0:
                 k = cand_k
                 break
         if k is None:
-            raise RuntimeError(f"Miner address {miner_addr} has exhausted all 15 shares for epoch {cur_epoch}!")
+            raise RuntimeError(f"Miner address {miner_addr} has exhausted all {CAP} shares for epoch {cur_epoch}!")
         print(f"Selected Share k: {k} (usedMask: 0x{used_mask:04x})")
 
     if k < 0 or k >= CAP:
-        raise ValueError(f"Invalid share index k={k}; must be 0 <= k < 6")
+        raise ValueError(f"Invalid share index k={k}; must be 0 <= k < {CAP}")
+
+    out_file = args.out or f"share_{miner_addr[:8]}_epoch{cur_epoch}_k{k}.json"
+    if os.path.exists(out_file):
+        raise FileExistsError(f"Output file already exists (refusing to overwrite): {out_file}")
 
     sub_bytes = compute_sub_hash(epoch_seed_bytes, miner_addr, k, miner_contract, chain_id)
     sub_lanes = struct.unpack("<4Q", sub_bytes)
@@ -824,8 +979,7 @@ def mine(args):
         "averageHashrate": round(avg_rate, 2),
     }
 
-    out_file = args.out or f"share_{miner_addr[:8]}_epoch{cur_epoch}_k{k}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
+    with open(out_file, "x", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2)
     print(f"Share successfully saved to: {out_file}")
     print("\nNext step: Run submission simulation with:")
@@ -839,13 +993,13 @@ def main():
     parser.add_argument("--k", type=int, default=None, help="Share index 0..5 (auto-selected if omitted)")
     parser.add_argument("--rpc", type=str, default=DEFAULT_RPC_URL, help="BSC Testnet RPC URL")
     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="Miner proxy contract address")
-    parser.add_argument("--difficulty-bits", type=int, default=DEFAULT_DIFFICULTY_BITS, help="Difficulty in leading zero bits (default: 32)")
+    parser.add_argument("--difficulty-bits", type=int, default=None, help="Explicit local difficulty override in leading zero bits (queries on-chain target(epoch) if omitted)")
     parser.add_argument("--target", type=str, default=None, help="Explicit target override (hex or int)")
     parser.add_argument("--seed", type=str, default=None, help="Explicit epochSeed override (hex or int)")
     parser.add_argument("--start-nonce", type=int, default=0, help="Starting nonce offset")
     parser.add_argument("--skip-stake-check", action="store_true", help="Skip StakeVault stake check")
+    parser.add_argument("--allow-backfill", action="store_true", help="Allow sending initEpochSeed backfill tx via env private key when seed is 0")
     parser.add_argument("--out", type=str, default=None, help="Output JSON file path")
-    parser.add_argument("--private-key", type=str, default=None, help="Private key for seed backfill transaction if seed is 0")
     parser.add_argument("--max-seed-steps", type=int, default=24, help="Max seed steps for backfill (default: 24)")
 
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Nonces per GPU batch (default: 16M)")

@@ -186,6 +186,12 @@ class TestStage3SafeOutput(unittest.TestCase):
                 data = payload["params"][0]["data"]
                 if data == "0x900cf0cf":
                     result = _abi_word_uint(TEST_EPOCH)
+                elif data == "0x5c975abb":
+                    result = _abi_word_uint(0)
+                elif data == "0x93afb4c5":
+                    result = _abi_word_uint(TEST_EPOCH)
+                elif data.startswith("0x834f9a82"):
+                    result = _abi_word_uint(0)
                 elif data.startswith("0x" + miner.SELECTOR_VAULT):
                     result = _abi_addr(TEST_VAULT)
                 elif data.startswith("0x" + miner.SELECTOR_STATUS):
@@ -251,7 +257,7 @@ class TestStage3SafeOutput(unittest.TestCase):
     def test_miner_gpu_rpc_and_opencl_failures_do_not_leak_secrets(self):
         leak_msg = _build_combined_leak_message()
         env = self._secret_env()
-        argv = ["miner_gpu.py", "--miner", TEST_MINER, "--rpc", TOKEN_URL, "--private-key", PK_HEX]
+        argv = ["miner_gpu.py", "--miner", TEST_MINER, "--rpc", TOKEN_URL]
         fake_devices = [{"device_obj": MagicMock(), "name": "MockGPU", "backend": "MockOpenCL"}]
 
         with patch.object(miner_gpu, "HAS_PYOPENCL", True),              patch.object(miner_gpu, "HAS_NUMPY", True),              patch.object(miner_gpu, "detect_devices", return_value=fake_devices):
@@ -306,6 +312,12 @@ class TestStage3SafeOutput(unittest.TestCase):
                 data = payload["params"][0]["data"]
                 if data == "0x900cf0cf":
                     result = _abi_word_uint(TEST_EPOCH)
+                elif data == "0x5c975abb":
+                    result = _abi_word_uint(0)
+                elif data == "0x93afb4c5":
+                    result = _abi_word_uint(TEST_EPOCH)
+                elif data.startswith("0x834f9a82"):
+                    result = _abi_word_uint(0)
                 elif data.startswith("0x" + miner_gpu.SELECTOR_VAULT):
                     result = _abi_addr(TEST_VAULT)
                 elif data.startswith("0x" + miner_gpu.SELECTOR_STATUS):

@@ -1,4 +1,5 @@
-import os, sys, unittest
+import os, sys, json, tempfile, unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,20 +28,93 @@ class TestMinerSeedBackfillAndJitter(unittest.TestCase):
             self.assertEqual(len(txs_sent), 1)
 
     def test_miner_discovers_zero_seed_applies_jitter(self):
-        args = MagicMock()
-        args.miner = "0x1111111111111111111111111111111111111111"
-        args.epoch = 5
-        args.seed = None
-        args.skip_stake_check = True
-        args.rpc = "http://mock-rpc"
-        args.miner_contract = "0x420382a0f874c1F120621f847d81581e8737504e"
-        args.private_key = None
-        with patch("script.miner.rpc_call", return_value="0x61"), patch("script.miner.eth_call", return_value="0x0"), patch("time.sleep") as mock_sleep, patch("random.uniform", return_value=2.45) as mock_random, patch("script.miner.backfill_epoch_seed") as mock_backfill:
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner.SELECTOR_EPOCH:
+                return "0x5"
+            if data == miner.SELECTOR_PAUSED:
+                return "0x0"
+            if data == miner.SELECTOR_VAULT:
+                return "0x" + "0" * 24 + "2222222222222222222222222222222222222222"
+            if data == miner.SELECTOR_LAST_SYNCED:
+                return "0x5"
+            if data.startswith(miner.SELECTOR_COUNTED):
+                return "0x0"
+            if data.startswith(miner.SELECTOR_EPOCH_SEED):
+                return "0x0"
+            return "0x0"
+
+        args = SimpleNamespace(
+            miner="0x1111111111111111111111111111111111111111",
+            epoch=5,
+            seed=None,
+            skip_stake_check=True,
+            allow_backfill=True,
+            rpc="http://mock-rpc",
+            miner_contract="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key=None,
+            target=None,
+            difficulty_bits=None,
+            k=0,
+            out=None,
+            threads=1,
+            start_nonce=0,
+        )
+        with patch("script.miner.rpc_call", return_value="0x61"), \
+             patch("script.miner.eth_call", side_effect=mock_eth_call), \
+             patch("time.sleep") as mock_sleep, \
+             patch("random.uniform", return_value=2.45) as mock_random, \
+             patch("script.miner.backfill_epoch_seed") as mock_backfill:
             with self.assertRaises(RuntimeError):
                 miner.mine(args)
             mock_random.assert_called_with(0.0, 3.0)
             mock_sleep.assert_any_call(2.45)
             mock_backfill.assert_called_once()
+
+    def test_miner_zero_seed_without_allow_backfill_does_not_send(self):
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner.SELECTOR_EPOCH:
+                return "0x5"
+            if data == miner.SELECTOR_PAUSED:
+                return "0x0"
+            if data == miner.SELECTOR_VAULT:
+                return "0x" + "0" * 24 + "2222222222222222222222222222222222222222"
+            if data == miner.SELECTOR_LAST_SYNCED:
+                return "0x5"
+            if data.startswith(miner.SELECTOR_COUNTED):
+                return "0x0"
+            if data.startswith(miner.SELECTOR_EPOCH_SEED):
+                return "0x0"
+            return "0x0"
+
+        args = SimpleNamespace(
+            miner="0x1111111111111111111111111111111111111111",
+            epoch=5,
+            seed=None,
+            skip_stake_check=True,
+            allow_backfill=False,
+            rpc="http://mock-rpc",
+            miner_contract="0x420382a0f874c1F120621f847d81581e8737504e",
+            private_key=None,
+            target=None,
+            difficulty_bits=None,
+            k=0,
+            out=None,
+            threads=1,
+            start_nonce=0,
+        )
+        pk_dummy = "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d"
+        with patch.dict(os.environ, {"MINER_PRIVATE_KEY": pk_dummy, "PRIVATE_KEY": pk_dummy}, clear=False), \
+             patch("script.miner.verify_chain_id", return_value=97), \
+             patch("script.miner.eth_call", side_effect=mock_eth_call), \
+             patch("script.miner.rpc_call") as mock_rpc, \
+             patch("script.miner.backfill_epoch_seed") as mock_backfill, \
+             patch("time.sleep") as mock_sleep:
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.mine(args)
+            self.assertIn("Keeper", str(ctx.exception))
+            mock_backfill.assert_not_called()
+            mock_rpc.assert_not_called()
+            mock_sleep.assert_not_called()
 
     def test_claim_script_has_event_constants(self):
         self.assertEqual(claim.SELECTOR_INIT_EPOCH_SEED, "0xd9d9c33c")
@@ -241,6 +315,19 @@ class TestMinerDynamicVaultAndStakeEligibility(unittest.TestCase):
 
     def test_mine_lifecycle_aborts_on_failed_stake_check(self):
         """5. mine() lifecycle invokes verify_stake using passed args.miner_contract and terminates on failure."""
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner.SELECTOR_EPOCH:
+                return "0x1"
+            if data == miner.SELECTOR_PAUSED:
+                return "0x0"
+            if data == miner.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_NON_DEFAULT)
+            if data == miner.SELECTOR_LAST_SYNCED:
+                return "0x1"
+            if data.startswith(miner.SELECTOR_COUNTED):
+                return "0x0"
+            return "0x0"
+
         args = MagicMock()
         args.miner = self.MINER_ADDR
         args.miner_contract = self.MINER_PROXY_CUSTOM
@@ -249,6 +336,7 @@ class TestMinerDynamicVaultAndStakeEligibility(unittest.TestCase):
         args.skip_stake_check = False
 
         with patch("script.miner.verify_chain_id", return_value=97), \
+             patch("script.miner.eth_call", side_effect=mock_eth_call), \
              patch("script.miner.verify_stake", side_effect=RuntimeError("Stake check failed: no stake")) as mock_vs:
             with self.assertRaises(RuntimeError) as ctx:
                 miner.mine(args)
@@ -257,6 +345,19 @@ class TestMinerDynamicVaultAndStakeEligibility(unittest.TestCase):
 
     def test_mine_lifecycle_skips_stake_check_when_flag_set(self):
         """6. mine() lifecycle skips verify_stake when skip_stake_check is True."""
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner.SELECTOR_EPOCH:
+                return "0x1"
+            if data == miner.SELECTOR_PAUSED:
+                return "0x0"
+            if data == miner.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_NON_DEFAULT)
+            if data == miner.SELECTOR_LAST_SYNCED:
+                return "0x1"
+            if data.startswith(miner.SELECTOR_COUNTED):
+                return "0x0"
+            return "0x0"
+
         class DummyArgs:
             miner = self.MINER_ADDR
             miner_contract = self.MINER_PROXY_CUSTOM
@@ -273,6 +374,7 @@ class TestMinerDynamicVaultAndStakeEligibility(unittest.TestCase):
             threads = 1
 
         with patch("script.miner.verify_chain_id", return_value=97), \
+             patch("script.miner.eth_call", side_effect=mock_eth_call), \
              patch("script.miner.verify_stake") as mock_vs, \
              patch("script.miner.mp.Process", side_effect=KeyboardInterrupt):
             try:
@@ -280,6 +382,168 @@ class TestMinerDynamicVaultAndStakeEligibility(unittest.TestCase):
             except KeyboardInterrupt:
                 pass
             mock_vs.assert_not_called()
+
+
+class TestMinerPrechecksTargetAndSafeOut(unittest.TestCase):
+    MINER_ADDR = "0x2e9e19f7F1D3a2b01ba5BbA7c37E58398568d82c"
+    MINER_CONTRACT = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
+    VAULT_CONTRACT = "0x40b92431de886Ea46117407c8f7123a31FB3F744"
+    TEST_SEED = "0x" + "ab" * 32
+
+    def _make_args(self, **overrides):
+        base = dict(
+            miner=self.MINER_ADDR,
+            miner_contract=self.MINER_CONTRACT,
+            rpc="http://mock-rpc",
+            epoch=None,
+            k=0,
+            seed=None,
+            target=None,
+            difficulty_bits=None,
+            start_nonce=0,
+            skip_stake_check=False,
+            allow_backfill=False,
+            out=None,
+            threads=1,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _make_eth_call(self, *, miner_paused=0, vault_paused=0, onchain_epoch=10, last_synced=10,
+                       counted=0, seed=None, target=None, used_mask=0, stake_active=True, stake_since=1):
+        seed_hex = seed if seed is not None else self.TEST_SEED
+        target_hex = target if target is not None else hex(1 << 223)
+
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner.SELECTOR_EPOCH:
+                return hex(onchain_epoch)
+            if data == miner.SELECTOR_PAUSED:
+                if to.lower() == self.MINER_CONTRACT.lower():
+                    return hex(miner_paused)
+                return hex(vault_paused)
+            if data == miner.SELECTOR_VAULT:
+                return "0x" + "0" * 24 + self.VAULT_CONTRACT[2:].lower()
+            if data == miner.SELECTOR_LAST_SYNCED:
+                return hex(last_synced)
+            if data.startswith(miner.SELECTOR_COUNTED):
+                return hex(counted)
+            if data.startswith(miner.SELECTOR_STATUS):
+                return ("1" if stake_active else "0").zfill(64) + hex(stake_since)[2:].zfill(64)
+            if data.startswith(miner.SELECTOR_EPOCH_SEED):
+                return seed_hex
+            if data.startswith(miner.SELECTOR_TARGET):
+                return target_hex
+            if data.startswith(miner.SELECTOR_USED_MASK):
+                return hex(used_mask)
+            raise AssertionError(f"Unexpected eth_call: to={to}, data={data}")
+
+        return mock_eth_call
+
+    def test_onchain_target_zero_exits_without_fallback(self):
+        args = self._make_args()
+        with patch("script.miner.verify_chain_id", return_value=97), \
+             patch("script.miner.eth_call", side_effect=self._make_eth_call(target="0x0")), \
+             patch("script.miner.mp.Process") as mock_proc:
+            with self.assertRaises(RuntimeError) as ctx:
+                miner.mine(args)
+            self.assertIn("target", str(ctx.exception).lower())
+            mock_proc.assert_not_called()
+
+    def test_default_reads_onchain_target_and_explicit_difficulty_bits_works(self):
+        with patch.object(sys, "argv", ["miner.py", "--miner", self.MINER_ADDR]):
+            with patch("script.miner.mine") as mock_mine:
+                miner.main()
+                parsed_args = mock_mine.call_args[0][0]
+                self.assertIsNone(parsed_args.difficulty_bits)
+                self.assertFalse(parsed_args.allow_backfill)
+
+        captured = {}
+        def stop_proc(*p_args, **p_kwargs):
+            captured["target_bytes"] = p_kwargs["args"][4]
+            raise KeyboardInterrupt()
+
+        with patch("script.miner.verify_chain_id", return_value=97), \
+             patch("script.miner.eth_call", side_effect=self._make_eth_call(target=hex(1 << 223))), \
+             patch("script.miner.mp.Process", side_effect=stop_proc):
+            with self.assertRaises(KeyboardInterrupt):
+                miner.mine(self._make_args())
+            self.assertEqual(captured["target_bytes"], (1 << 223).to_bytes(32, "big"))
+
+        captured.clear()
+        with patch("script.miner.verify_chain_id", return_value=97), \
+             patch("script.miner.eth_call", side_effect=self._make_eth_call(target="0x0")), \
+             patch("script.miner.mp.Process", side_effect=stop_proc):
+            with self.assertRaises(KeyboardInterrupt):
+                miner.mine(self._make_args(difficulty_bits=20))
+            self.assertEqual(captured["target_bytes"], (1 << 236).to_bytes(32, "big"))
+
+    def test_prechecks_block_paused_lag_counted_and_cap6(self):
+        for kwargs, expected_msg in [
+            ({"miner_paused": 1}, "Miner contract"),
+            ({"vault_paused": 1}, "StakeVault contract"),
+            ({"onchain_epoch": 12, "last_synced": 10}, "lastSynced()=10 != epoch()=12"),
+            ({"counted": 6}, "CAP (6)"),
+            ({"used_mask": 0x3F}, "exhausted all 6 shares"),
+        ]:
+            use_k = None if "used_mask" in kwargs else 0
+            args = self._make_args(k=use_k)
+            with patch("script.miner.verify_chain_id", return_value=97), \
+                 patch("script.miner.eth_call", side_effect=self._make_eth_call(**kwargs)), \
+                 patch("script.miner.mp.Process") as mock_proc:
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner.mine(args)
+                self.assertIn(expected_msg, str(ctx.exception))
+                mock_proc.assert_not_called()
+
+    def test_out_existing_file_refuses_overwrite_with_exclusive_x(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "existing_share.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write('{"keep": true}')
+            args = self._make_args(out=out_path)
+            with patch("script.miner.verify_chain_id", return_value=97), \
+                 patch("script.miner.eth_call", side_effect=self._make_eth_call()), \
+                 patch("script.miner.mp.Process") as mock_proc:
+                with self.assertRaises(FileExistsError):
+                    miner.mine(args)
+                mock_proc.assert_not_called()
+            with open(out_path, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}')
+
+            class _Q:
+                def __init__(self, vals):
+                    self._vals = list(vals)
+                def get(self):
+                    return self._vals.pop(0)
+                def empty(self):
+                    return len(self._vals) == 0
+                def get_nowait(self):
+                    return self._vals.pop(0)
+
+            sub_bytes = miner.compute_sub_hash(bytes.fromhex(self.TEST_SEED[2:]), self.MINER_ADDR, 0, self.MINER_CONTRACT, 97)
+            easy_target = 1 << 252
+            valid_nonce = next(
+                n for n in range(1000) if miner.verify_share_local(sub_bytes, n, easy_target)[0]
+            )
+            valid_hash_hex = miner.verify_share_local(sub_bytes, valid_nonce, easy_target)[1].hex()
+            race_path = os.path.join(tmpdir, "race_share.json")
+            race_args = self._make_args(out=race_path, target=hex(easy_target))
+
+            def create_during_mining(*p_args, **p_kwargs):
+                with open(race_path, "w", encoding="utf-8") as rf:
+                    rf.write("do-not-overwrite")
+                return MagicMock()
+
+            with patch("script.miner.verify_chain_id", return_value=97), \
+                 patch("script.miner.eth_call", side_effect=self._make_eth_call()), \
+                 patch.object(miner.mp, "Event", return_value=MagicMock()), \
+                 patch.object(miner.mp, "Queue", side_effect=[_Q([(valid_nonce, valid_hash_hex)]), _Q([1])]), \
+                 patch.object(miner.mp, "Process", side_effect=create_during_mining), \
+                 patch.object(miner.threading, "Thread", return_value=MagicMock()):
+                with self.assertRaises(FileExistsError):
+                    miner.mine(race_args)
+            with open(race_path, "r", encoding="utf-8") as rf:
+                self.assertEqual(rf.read(), "do-not-overwrite")
 
 if __name__ == "__main__":
     unittest.main()

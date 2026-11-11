@@ -343,6 +343,14 @@ class TestDynamicVaultAndStakeEligibility(unittest.TestCase):
     def test_not_staked_fails_before_gpu(self):
         """C. Not staked: active=false raises error and exits before GPU starts."""
         def mock_eth_call(rpc_url, to, data):
+            if data == miner_gpu.SELECTOR_EPOCH:
+                return "0x" + (1).to_bytes(32, "big").hex()
+            if data == miner_gpu.SELECTOR_PAUSED:
+                return "0x" + "0" * 64
+            if data == miner_gpu.SELECTOR_LAST_SYNCED:
+                return "0x" + (1).to_bytes(32, "big").hex()
+            if data.startswith(miner_gpu.SELECTOR_COUNTED):
+                return "0x" + "0" * 64
             if data == miner_gpu.SELECTOR_VAULT:
                 return self._encode_address_ret(self.VAULT_B)
             if data.startswith(miner_gpu.SELECTOR_STATUS):
@@ -394,6 +402,14 @@ class TestDynamicVaultAndStakeEligibility(unittest.TestCase):
     def test_cooldown_warmup_rule(self):
         """D. Cooldown/warmup: depositEpoch=1, epoch=1 fails before GPU; epoch=2 passes."""
         def mock_eth_call(rpc_url, to, data):
+            if data == miner_gpu.SELECTOR_EPOCH:
+                return "0x" + (1).to_bytes(32, "big").hex()
+            if data == miner_gpu.SELECTOR_PAUSED:
+                return "0x" + "0" * 64
+            if data == miner_gpu.SELECTOR_LAST_SYNCED:
+                return "0x" + (1).to_bytes(32, "big").hex()
+            if data.startswith(miner_gpu.SELECTOR_COUNTED):
+                return "0x" + "0" * 64
             if data == miner_gpu.SELECTOR_VAULT:
                 return self._encode_address_ret(self.VAULT_B)
             if data.startswith(miner_gpu.SELECTOR_STATUS):
@@ -599,6 +615,16 @@ class TestDynamicVaultAndStakeEligibility(unittest.TestCase):
         calls = []
         def mock_eth_call(rpc_url, to, data):
             calls.append((to, data))
+            if data == miner_gpu.SELECTOR_EPOCH:
+                return "0x" + (1).to_bytes(32, "big").hex()
+            if data == miner_gpu.SELECTOR_PAUSED:
+                return "0x" + "0" * 64
+            if data == miner_gpu.SELECTOR_VAULT:
+                return self._encode_address_ret(self.VAULT_B)
+            if data == miner_gpu.SELECTOR_LAST_SYNCED:
+                return "0x" + (1).to_bytes(32, "big").hex()
+            if data.startswith(miner_gpu.SELECTOR_COUNTED):
+                return "0x" + "0" * 64
             return "0x1"
 
         class DummyArgs:
@@ -639,7 +665,6 @@ class TestDynamicVaultAndStakeEligibility(unittest.TestCase):
         self.assertIn("未验证质押资格", output)
         self.assertNotIn("Stake Status:     Active=True", output)
         for to, data in calls:
-            self.assertNotEqual(data, miner_gpu.SELECTOR_VAULT)
             self.assertFalse(data.startswith(miner_gpu.SELECTOR_STATUS))
 
     def test_offline_mode_without_rpc(self):
@@ -698,3 +723,201 @@ class TestDynamicVaultAndStakeEligibility(unittest.TestCase):
                 miner_gpu.get_stake_status(sensitive_rpc, self.VAULT_B, self.MINER_ADDR)
             self.assertNotIn("password_secret", str(ctx2.exception))
             self.assertNotIn(sensitive_rpc, str(ctx2.exception))
+
+
+class TestMinerGpuPrechecksAndSecurity(unittest.TestCase):
+    MINER_ADDR = "0x2e9e19f7F1D3a2b01ba5BbA7c37E58398568d82c"
+    MINER_CONTRACT = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
+    VAULT_CONTRACT = "0x40b92431de886Ea46117407c8f7123a31FB3F744"
+    TEST_SEED = "0x" + "cd" * 32
+
+    def _make_args(self, **overrides):
+        from types import SimpleNamespace
+        base = dict(
+            miner=self.MINER_ADDR,
+            miner_contract=self.MINER_CONTRACT,
+            rpc="http://mock-rpc",
+            epoch=None,
+            k=0,
+            seed=None,
+            target=None,
+            difficulty_bits=None,
+            start_nonce=0,
+            skip_stake_check=False,
+            allow_backfill=False,
+            max_seed_steps=24,
+            out=None,
+            batch_size=1024,
+            device_idx=0,
+            threads=1,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _make_eth_call(self, *, miner_paused=0, vault_paused=0, onchain_epoch=10, last_synced=10,
+                       counted=0, seed=None, target=None, used_mask=0, stake_active=True, stake_since=1):
+        seed_hex = seed if seed is not None else self.TEST_SEED
+        target_hex = target if target is not None else hex(1 << 223)
+
+        def mock_eth_call(rpc_url, to, data):
+            if data == miner_gpu.SELECTOR_EPOCH:
+                return hex(onchain_epoch)
+            if data == miner_gpu.SELECTOR_PAUSED:
+                if to.lower() == self.MINER_CONTRACT.lower():
+                    return hex(miner_paused)
+                return hex(vault_paused)
+            if data == miner_gpu.SELECTOR_VAULT:
+                return "0x" + "0" * 24 + self.VAULT_CONTRACT[2:].lower()
+            if data == miner_gpu.SELECTOR_LAST_SYNCED:
+                return hex(last_synced)
+            if data.startswith(miner_gpu.SELECTOR_COUNTED):
+                return hex(counted)
+            if data.startswith(miner_gpu.SELECTOR_STATUS):
+                return ("1" if stake_active else "0").zfill(64) + hex(stake_since)[2:].zfill(64)
+            if data.startswith(miner_gpu.SELECTOR_EPOCH_SEED):
+                return seed_hex
+            if data.startswith(miner_gpu.SELECTOR_TARGET):
+                return target_hex
+            if data.startswith(miner_gpu.SELECTOR_USED_MASK):
+                return hex(used_mask)
+            raise AssertionError(f"Unexpected eth_call: to={to}, data={data}")
+
+        return mock_eth_call
+
+    def test_zero_seed_without_allow_backfill_no_send_no_name_error(self):
+        mock_cl = MagicMock()
+        pk_dummy = "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d"
+        with patch.dict(os.environ, {"MINER_PRIVATE_KEY": pk_dummy, "PRIVATE_KEY": pk_dummy}, clear=False), \
+             patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+             patch.object(miner_gpu, "HAS_NUMPY", True), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call(seed="0x0")), \
+             patch("script.miner_gpu.rpc_call") as mock_rpc, \
+             patch("script.miner_gpu.cl", mock_cl, create=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner_gpu.mine(self._make_args(allow_backfill=False))
+            self.assertIn("Keeper", str(ctx.exception))
+            mock_rpc.assert_not_called()
+            mock_cl.Context.assert_not_called()
+
+    def test_zero_seed_with_allow_backfill_calls_defined_backfill_function(self):
+        txs_sent = []
+
+        def mock_rpc_call(rpc_url, method, params):
+            if method == "eth_getTransactionCount":
+                return "0x2"
+            if method == "eth_gasPrice":
+                return "0x5f5e100"
+            if method == "eth_sendRawTransaction":
+                txs_sent.append(params[0])
+                return "0xhash_gpu_bf"
+            raise AssertionError(f"Unexpected rpc_call: {method}")
+
+        pk_dummy = "0x4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d"
+        mock_cl = MagicMock()
+        with patch.dict(os.environ, {"MINER_PRIVATE_KEY": pk_dummy}, clear=False), \
+             patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+             patch.object(miner_gpu, "HAS_NUMPY", True), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call(seed="0x0")), \
+             patch("script.miner_gpu.rpc_call", side_effect=mock_rpc_call), \
+             patch("time.sleep"), \
+             patch("random.uniform", return_value=1.25), \
+             patch("script.miner_gpu.cl", mock_cl, create=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner_gpu.mine(self._make_args(allow_backfill=True))
+            self.assertIn("not initialized", str(ctx.exception))
+            self.assertEqual(len(txs_sent), 1)
+
+    def test_onchain_target_zero_exits_and_difficulty_bits_defaults_to_none(self):
+        with patch.object(sys, "argv", ["miner_gpu.py", "--miner", self.MINER_ADDR]):
+            with patch("script.miner_gpu.mine") as mock_mine:
+                miner_gpu.main()
+                parsed_args = mock_mine.call_args[0][0]
+                self.assertIsNone(parsed_args.difficulty_bits)
+                self.assertFalse(parsed_args.allow_backfill)
+
+        mock_cl = MagicMock()
+        with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+             patch.object(miner_gpu, "HAS_NUMPY", True), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call(target="0x0")), \
+             patch("script.miner_gpu.cl", mock_cl, create=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                miner_gpu.mine(self._make_args())
+            self.assertIn("target", str(ctx.exception).lower())
+            mock_cl.Context.assert_not_called()
+
+        mock_cl.Context.side_effect = MiningStoppedAtGpuBoundary("GPU boundary")
+        f = io.StringIO()
+        with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+             patch.object(miner_gpu, "HAS_NUMPY", True), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call(target=hex(1 << 223))), \
+             patch("script.miner_gpu.cl", mock_cl, create=True), \
+             redirect_stdout(f):
+            with self.assertRaises(MiningStoppedAtGpuBoundary):
+                miner_gpu.mine(self._make_args())
+            self.assertIn("Target Difficulty: 32 bits", f.getvalue())
+
+        f2 = io.StringIO()
+        with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+             patch.object(miner_gpu, "HAS_NUMPY", True), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call(target="0x0")), \
+             patch("script.miner_gpu.cl", mock_cl, create=True), \
+             redirect_stdout(f2):
+            with self.assertRaises(MiningStoppedAtGpuBoundary):
+                miner_gpu.mine(self._make_args(difficulty_bits=20))
+            self.assertIn("Target Difficulty: 20 bits", f2.getvalue())
+
+    def test_prechecks_block_paused_lag_counted_and_cap6(self):
+        mock_cl = MagicMock()
+        for kwargs, expected_msg in [
+            ({"miner_paused": 1}, "Miner contract"),
+            ({"vault_paused": 1}, "StakeVault contract"),
+            ({"onchain_epoch": 12, "last_synced": 10}, "lastSynced()=10 != epoch()=12"),
+            ({"counted": 6}, "CAP (6)"),
+            ({"used_mask": 0x3F}, "exhausted all 6 shares"),
+        ]:
+            use_k = None if "used_mask" in kwargs else 0
+            with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+                 patch.object(miner_gpu, "HAS_NUMPY", True), \
+                 patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+                 patch("script.miner_gpu.verify_chain_id", return_value=97), \
+                 patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call(**kwargs)), \
+                 patch("script.miner_gpu.cl", mock_cl, create=True):
+                with self.assertRaises(RuntimeError) as ctx:
+                    miner_gpu.mine(self._make_args(k=use_k))
+                self.assertIn(expected_msg, str(ctx.exception))
+                mock_cl.Context.assert_not_called()
+
+    def test_out_existing_file_refuses_overwrite_and_private_key_flag_removed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "existing_gpu.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write('{"keep_gpu": true}')
+            mock_cl = MagicMock()
+            with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+                 patch.object(miner_gpu, "HAS_NUMPY", True), \
+                 patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+                 patch("script.miner_gpu.verify_chain_id", return_value=97), \
+                 patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call()), \
+                 patch("script.miner_gpu.cl", mock_cl, create=True):
+                with self.assertRaises(FileExistsError):
+                    miner_gpu.mine(self._make_args(out=out_path))
+                mock_cl.Context.assert_not_called()
+            with open(out_path, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep_gpu": true}')
+
+        with patch.object(sys, "argv", ["miner_gpu.py", "--miner", self.MINER_ADDR, "--private-key", "0x" + "11" * 32]):
+            with patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit) as sysex:
+                    miner_gpu.main()
+                self.assertEqual(sysex.exception.code, 2)
