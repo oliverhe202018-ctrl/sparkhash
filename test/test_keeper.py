@@ -5308,3 +5308,869 @@ class TestKeeperEip1559K2(unittest.TestCase):
                     with self.assertRaises(SystemExit) as cm:
                         main()
                     self.assertNotEqual(cm.exception.code, 0)
+
+
+class TestKeeperEip1559K3(unittest.TestCase):
+    MINER = "0x420382a0f874c1F120621f847d81581e8737504e"
+    SENDER = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+
+    def test_bump_fee_exact_integer_ceil_and_edge_cases(self):
+        from script.keeper import bump_fee_exact
+        self.assertEqual(bump_fee_exact(0, 15), 1)
+        self.assertEqual(bump_fee_exact(1, 15), 2)
+        self.assertEqual(bump_fee_exact(100, 15), 115)
+        self.assertEqual(bump_fee_exact(101, 15), 117)
+        huge = 10**50
+        expected = (huge * 115 + 99) // 100
+        self.assertEqual(bump_fee_exact(huge, 15), expected)
+        with self.assertRaises(ValueError):
+            bump_fee_exact(-1, 15)
+        with self.assertRaises(ValueError):
+            bump_fee_exact(100, 0)
+        with self.assertRaises(ValueError):
+            bump_fee_exact(100, -10)
+    def test_same_nonce_and_identity_preservation_across_replacements(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            tx_hashes = ["0x" + "11" * 32, "0x" + "22" * 32, "0x" + "33" * 32]
+            send_calls = []
+
+            def rpc_mock(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x7"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                if method == "eth_maxPriorityFeePerGas" or method == "eth_gasPrice":
+                    return None
+                if method == "eth_getTransactionReceipt":
+                    if len(send_calls) >= 3 and params[0] == tx_hashes[2]:
+                        return {"status": "0x1", "blockNumber": "0x20", "gasUsed": "0x30d40"}
+                    return None
+                if method == "eth_getTransactionByHash":
+                    return {
+                        "type": "0x2",
+                        "from": self.SENDER,
+                        "to": self.MINER,
+                        "nonce": "0x7",
+                        "input": "0x93afb4c5",
+                        "value": "0x0",
+                        "chainId": "0x61",
+                        "maxFeePerGas": hex(1_000_000_000),
+                        "maxPriorityFeePerGas": hex(200_000_000)
+                    }
+                return "0x0"
+
+            def subproc_mock(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                idx = len(send_calls)
+                send_calls.append(cmd)
+                h = tx_hashes[min(idx, len(tx_hashes) - 1)]
+                return MagicMock(returncode=0, stdout=f"txHash: {h}\n", stderr="")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_mock), \
+                 patch("subprocess.run", side_effect=subproc_mock):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                    replacement_max_priority_fee_gwei="0.5",
+                    replacement_fee_bump_percent=15,
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+
+            self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+            self.assertEqual(len(send_calls), 3)
+
+            for cmd in send_calls:
+                self.assertIn("--account", cmd)
+                self.assertEqual(cmd[cmd.index("--account") + 1], "k3-acct")
+                self.assertIn("--nonce", cmd)
+                self.assertEqual(cmd[cmd.index("--nonce") + 1], "7")
+# Value is 0 by default
+                self.assertEqual(cmd[cmd.index("send") + 1], to_checksum_address(self.MINER))
+                self.assertIn("--data", cmd)
+                self.assertEqual(cmd[cmd.index("--data") + 1], "0x93afb4c5")
+
+            fee1 = int(send_calls[0][send_calls[0].index("--gas-price") + 1])
+            fee2 = int(send_calls[1][send_calls[1].index("--gas-price") + 1])
+            fee3 = int(send_calls[2][send_calls[2].index("--gas-price") + 1])
+            self.assertGreater(fee2, fee1)
+            self.assertGreater(fee3, fee2)
+
+            prio1 = int(send_calls[0][send_calls[0].index("--priority-gas-price") + 1])
+            prio2 = int(send_calls[1][send_calls[1].index("--priority-gas-price") + 1])
+            prio3 = int(send_calls[2][send_calls[2].index("--priority-gas-price") + 1])
+            self.assertGreater(prio2, prio1)
+            self.assertGreater(prio3, prio2)
+    def test_replacement_ceilings_and_budget_and_max_retries(self):
+        # 1. Default disabled
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            def rpc_dummy(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x7"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                return None
+
+            def subproc_dummy(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                return MagicMock(returncode=0, stdout="txHash: 0x1111111111111111111111111111111111111111111111111111111111111111\n", stderr="")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_dummy), \
+                 patch("subprocess.run", side_effect=subproc_dummy):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+                sm = bot._ensure_state_manager()
+                st = sm.load_state()
+                self.assertEqual(st["status"], "MANUAL_REVIEW_LOCKED")
+                self.assertEqual(st["reason_code"], "TYPE2_REPLACEMENT_DISABLED")
+
+        # 2. Max fee ceiling exceeded
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_dummy), \
+                 patch("subprocess.run", side_effect=subproc_dummy):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="1.05",
+                    replacement_fee_bump_percent=15,
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["reason_code"], "REPLACEMENT_CEILING_EXCEEDED")
+
+        # 3. Max priority fee ceiling exceeded
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_dummy), \
+                 patch("subprocess.run", side_effect=subproc_dummy):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                    replacement_max_priority_fee_gwei="0.21",
+                    replacement_fee_bump_percent=15,
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["reason_code"], "REPLACEMENT_CEILING_EXCEEDED")
+
+        # 4. Total budget exceeded
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_dummy), \
+                 patch("subprocess.run", side_effect=subproc_dummy):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                    replacement_max_total_budget_wei=270_000_000_000_000,
+                    replacement_fee_bump_percent=15,
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["reason_code"], "REPLACEMENT_BUDGET_EXCEEDED")
+
+        # 5. Max retries exhausted
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_dummy), \
+                 patch("subprocess.run", side_effect=subproc_dummy):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=1,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                    replacement_fee_bump_percent=15,
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.PENDING_UNCONFIRMED)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["reason_code"], "MAX_RETRIES_EXCEEDED")
+    def test_pre_replacement_reconcile_receipt_checks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            tx_hash1 = "0x" + "aa" * 32
+            send_count = [0]
+
+            def rpc_success(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x5"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                if method == "eth_getTransactionReceipt":
+                    if send_count[0] == 1:
+                        return {"status": "0x1", "blockNumber": "0x15", "gasUsed": "0x25000"}
+                    return None
+                return None
+
+            def subproc_success(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                send_count[0] += 1
+                return MagicMock(returncode=0, stdout=f"txHash: {tx_hash1}\n", stderr="")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_success), \
+                 patch("subprocess.run", side_effect=subproc_success):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_SUCCESS)
+                self.assertEqual(send_count[0], 1)
+                self.assertEqual(bot.current_nonce, 6)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["status"], "CONFIRMED_SUCCESS")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            send_count[0] = 0
+
+            def rpc_revert(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x5"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                if method == "eth_getTransactionReceipt":
+                    if send_count[0] == 1:
+                        return {"status": "0x0", "blockNumber": "0x15", "gasUsed": "0x25000"}
+                    return None
+                return None
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_revert), \
+                 patch("subprocess.run", side_effect=subproc_success):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.CONFIRMED_REVERT)
+                self.assertEqual(send_count[0], 1)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["status"], "CONFIRMED_REVERT")
+
+    def test_onchain_identity_conflict_and_missing_state_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            def rpc_legacy_type(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x5"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                if method == "eth_getTransactionByHash":
+                    return {"type": "0x0", "from": self.SENDER, "to": self.MINER, "nonce": "0x5"}
+                return None
+
+            def subproc_dummy(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                return MagicMock(returncode=0, stdout="txHash: 0x9999999999999999999999999999999999999999999999999999999999999999\n", stderr="")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_legacy_type), \
+                 patch("subprocess.run", side_effect=subproc_dummy):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["reason_code"], "REPLACEMENT_IDENTITY_CONFLICT")
+
+            with tempfile.TemporaryDirectory() as tmp_dir2:
+                sm = KeeperStateManager(tmp_dir2, StateDomain(97, self.MINER, self.SENDER))
+                sm.record_preparing_to_send("sync()", 1, 5, "legacy unpopulated state")
+                def rpc_missing_tx(url, method, params):
+                    if method == "eth_getCode":
+                        return "0x6080604052"
+                    if method == "eth_chainId":
+                        return "0x61"
+                    if method == "eth_getTransactionCount":
+                        return "0x5"
+                    return None
+
+                with patch("script.keeper.rpc_call", side_effect=rpc_missing_tx),                      patch("subprocess.run", side_effect=subproc_dummy):
+                    bot2 = KeeperBot(
+                        rpc_url="http://mock-rpc",
+                        miner_address=self.MINER,
+                        account="k3-acct",
+                        password_file=pw_path,
+                        dry_run=False,
+                        tx_timeout=1,
+                        max_retries=2,
+                        state_dir=tmp_dir2,
+                        max_fee_per_gas_gwei="1.0",
+                        priority_fee_per_gas_gwei="0.2",
+                        replacement_max_fee_gwei="3.0",
+                    )
+                    recon = bot2.reconcile_pre_replacement(
+                        func_name="sync",
+                        target_addr=self.MINER,
+                        calldata="0x93afb4c5",
+                        nonce=5,
+                        gas_limit=200_000,
+                        current_max_fee=1_000_000_000,
+                        current_priority_fee=200_000_000,
+                        active_tx_hash="0x" + "88" * 32,
+                        broadcasted_hashes=["0x" + "88" * 32]
+                    )
+                    self.assertEqual(recon["action"], "STOP_LOCK")
+                    self.assertEqual(recon["reason_code"], "STATE_RECONSTRUCTION_INCOMPLETE")
+    def test_nonce_consumed_unattributed_stops_and_locks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            sent_flag = [False]
+            def rpc_nonce_consumed(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    if sent_flag[0]:
+                        return "0x9"
+                    return "0x7"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                if method == "eth_getTransactionReceipt":
+                    return None
+                return None
+
+            def subproc_dummy(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                sent_flag[0] = True
+                return MagicMock(returncode=0, stdout="txHash: 0x7777777777777777777777777777777777777777777777777777777777777777\n", stderr="")
+
+            with patch("script.keeper.time", new_callable=_FakeKeeperTime), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_nonce_consumed), \
+                 patch("subprocess.run", side_effect=subproc_dummy):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    tx_timeout=1,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["status"], "MANUAL_REVIEW_LOCKED")
+                self.assertEqual(st["reason_code"], "NONCE_CONSUMED_UNATTRIBUTED")
+                self.assertEqual(bot.current_nonce, 7)
+
+    def test_error_classification_replacement_underpriced_and_nonce_too_low(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            def rpc_mock(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x7"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                return None
+
+            def subproc_underpriced(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                return MagicMock(returncode=1, stdout="", stderr="error: replacement transaction underpriced")
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_mock), \
+                 patch("subprocess.run", side_effect=subproc_underpriced):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    max_retries=0,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["reason_code"], "REPLACEMENT_UNDERPRICED_FAILED")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            def subproc_nonce_too_low(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                return MagicMock(returncode=1, stdout="", stderr="error: nonce too low")
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_mock), \
+                 patch("subprocess.run", side_effect=subproc_nonce_too_low):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    max_retries=1,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["reason_code"], "NONCE_TOO_LOW_UNRECONCILED")
+    def test_timeout_without_txhash_single_send(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            def rpc_mock(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x7"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                return None
+
+            def subproc_timeout(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_mock), \
+                 patch("subprocess.run", side_effect=subproc_timeout):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    max_retries=2,
+                    state_dir=tmp_dir,
+                    max_fee_per_gas_gwei="1.0",
+                    priority_fee_per_gas_gwei="0.2",
+                    replacement_max_fee_gwei="3.0",
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+                st = bot._ensure_state_manager().load_state()
+                self.assertEqual(st["status"], "MANUAL_REVIEW_LOCKED")
+                self.assertEqual(st["reason_code"], "UNCERTAIN_BROADCAST_RESULT")
+                self.assertIn(st["tx_hash"], (None, "Unknown"))
+
+    def test_crash_recovery_preserves_attempts_and_tx_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            domain = StateDomain(97, self.MINER, self.SENDER)
+            sm = KeeperStateManager(tmp_dir, domain)
+            self.assertTrue(sm.acquire_lock())
+            try:
+                sm.record_preparing_to_send(
+                    operation="sync()",
+                    epoch=10,
+                    nonce=4,
+                    details="Attempt 2 in-flight",
+                    tx_type=2,
+                    max_fee_per_gas_wei=1_500_000_000,
+                    max_priority_fee_per_gas_wei=300_000_000,
+                    gas_limit=220_000,
+                    to_address=to_checksum_address(self.MINER),
+                    value_wei=0,
+                    calldata="0x93afb4c5",
+                    tx_hashes=["0x1111111111111111111111111111111111111111111111111111111111111111", "0x2222222222222222222222222222222222222222222222222222222222222222"],
+                    attempt=2,
+                )
+                recovered = sm.recover_crash_to_manual_review()
+            finally:
+                sm.release_lock()
+
+            self.assertEqual(recovered["status"], "MANUAL_REVIEW_LOCKED")
+            self.assertEqual(recovered["reason_code"], "CRASH_BEFORE_CONFIRMATION")
+            self.assertEqual(recovered["attempt"], 2)
+            self.assertEqual(len(recovered["tx_hashes"]), 2)
+            self.assertEqual(recovered["tx_type"], 2)
+            self.assertEqual(recovered["max_fee_per_gas_wei"], 1_500_000_000)
+            self.assertEqual(recovered["max_priority_fee_per_gas_wei"], 300_000_000)
+            self.assertEqual(recovered["gas_limit"], 220_000)
+            self.assertEqual(recovered["calldata"], "0x93afb4c5")
+
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            def rpc_mock(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                return None
+
+            def subproc_mock(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                return MagicMock(returncode=0, stdout="txHash: 0x3333333333333333333333333333333333333333333333333333333333333333\n", stderr="")
+
+            with patch("script.keeper.rpc_call", side_effect=rpc_mock), \
+                 patch("subprocess.run", side_effect=subproc_mock):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    password_file=pw_path,
+                    dry_run=False,
+                    state_dir=tmp_dir,
+                )
+                res = bot.send_transaction("0x93afb4c5", "sync(1)", preflight=False)
+                self.assertEqual(res.status, TxExecutionStatus.UNCERTAIN)
+                self.assertTrue(bot.locked_for_manual_review)
+                st_final = sm.load_state()
+                self.assertEqual(st_final["status"], "MANUAL_REVIEW_LOCKED")
+
+    def test_k1_exit_code_and_k2_compatibility(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pw_path = os.path.join(tmp_dir, "k3_pw.pwd")
+            with open(pw_path, "w", encoding="utf-8") as f:
+                f.write("dummy-pass")
+
+            def rpc_mock(url, method, params):
+                if method == "eth_getCode":
+                    return "0x6080604052"
+                if method == "eth_chainId":
+                    return "0x61"
+                if method == "eth_getTransactionCount":
+                    return "0x7"
+                if method == "eth_estimateGas":
+                    return hex(200_000)
+                return None
+
+            def subproc_mock(cmd, *args, **kwargs):
+                if "address" in cmd:
+                    return MagicMock(returncode=0, stdout=self.SENDER + "\n", stderr="")
+                return MagicMock(returncode=1, stdout="", stderr="error: execution reverted")
+
+            cli_args = [
+                "keeper.py", "--no-env", "--rpc-url", "http://127.0.0.1:8545",
+                "--miner-address", self.MINER, "--account", "k3-acct",
+                "--password-file", pw_path, "--state-dir", tmp_dir,
+                "--max-fee-per-gas-gwei", "1.5", "--priority-fee-per-gas-gwei", "0.3",
+                "--replacement-max-fee-per-gas-gwei", "3.0",
+                "--once",
+            ]
+            with patch.object(sys, "argv", cli_args), \
+                 patch("script.keeper.rpc_call", side_effect=rpc_mock), \
+                 patch("subprocess.run", side_effect=subproc_mock), \
+                 patch.object(KeeperBot, "get_epoch_state", return_value=(10, 9, 0xABCD)):
+                exit_code = main()
+            self.assertNotEqual(exit_code, 0)
+
+    def test_reconcile_replacement_identity_missing_fields_and_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch("script.keeper.rpc_call", return_value="0x6080604052"):
+                bot = KeeperBot(
+                    rpc_url="http://mock-rpc",
+                    miner_address=self.MINER,
+                    account="k3-acct",
+                    dry_run=True,
+                    keeper_address=self.SENDER,
+                    replacement_max_fee_gwei="3.0",
+                )
+            bot._chain_id = 97
+
+            valid_tx = {
+                "type": "0x2",
+                "from": self.SENDER,
+                "to": self.MINER,
+                "nonce": "0x5",
+                "input": "0x93afb4c5",
+                "value": "0x0",
+                "chainId": "0x61",
+                "maxFeePerGas": "0x3b9aca00",
+                "maxPriorityFeePerGas": "0x7735940",
+            }
+
+            def make_rpc(tx_dict):
+                def _rpc(url, method, params):
+                    if method == "eth_getTransactionReceipt":
+                        return None
+                    if method == "eth_getTransactionByHash":
+                        return tx_dict
+                    if method == "eth_getTransactionCount":
+                        return "0x5"
+                    return None
+                return _rpc
+
+            # Missing type
+            bad = dict(valid_tx)
+            del bad["type"]
+            with patch("script.keeper.rpc_call", side_effect=make_rpc(bad)):
+                recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+                self.assertEqual(recon["action"], "STOP_LOCK")
+                self.assertEqual(recon["reason_code"], "REPLACEMENT_IDENTITY_CONFLICT")
+
+            # Missing from
+            bad = dict(valid_tx)
+            del bad["from"]
+            with patch("script.keeper.rpc_call", side_effect=make_rpc(bad)):
+                recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+                self.assertEqual(recon["action"], "STOP_LOCK")
+                self.assertEqual(recon["reason_code"], "REPLACEMENT_IDENTITY_CONFLICT")
+
+            # Missing to
+            bad = dict(valid_tx)
+            del bad["to"]
+            with patch("script.keeper.rpc_call", side_effect=make_rpc(bad)):
+                recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+                self.assertEqual(recon["action"], "STOP_LOCK")
+                self.assertEqual(recon["reason_code"], "REPLACEMENT_IDENTITY_CONFLICT")
+
+            # Missing nonce
+            bad = dict(valid_tx)
+            del bad["nonce"]
+            with patch("script.keeper.rpc_call", side_effect=make_rpc(bad)):
+                recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+                self.assertEqual(recon["action"], "STOP_LOCK")
+                self.assertEqual(recon["reason_code"], "REPLACEMENT_IDENTITY_CONFLICT")
+
+            # Missing input/data
+            bad = dict(valid_tx)
+            del bad["input"]
+            with patch("script.keeper.rpc_call", side_effect=make_rpc(bad)):
+                recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+                self.assertEqual(recon["action"], "STOP_LOCK")
+                self.assertEqual(recon["reason_code"], "REPLACEMENT_IDENTITY_CONFLICT")
+
+            # Non-zero value
+            bad = dict(valid_tx, value="0x1")
+            with patch("script.keeper.rpc_call", side_effect=make_rpc(bad)):
+                recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+                self.assertEqual(recon["action"], "STOP_LOCK")
+                self.assertEqual(recon["reason_code"], "REPLACEMENT_IDENTITY_CONFLICT")
+
+            # Mismatched chainId
+            bad = dict(valid_tx, chainId="0x1")
+            with patch("script.keeper.rpc_call", side_effect=make_rpc(bad)):
+                recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+                self.assertEqual(recon["action"], "STOP_LOCK")
+                self.assertEqual(recon["reason_code"], "REPLACEMENT_IDENTITY_CONFLICT")
+
+    def test_reconcile_rpc_failures_and_nonce_anomalies_halt_safely(self):
+        with patch("script.keeper.rpc_call", return_value="0x6080604052"):
+            bot = KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=self.MINER,
+                account="k3-acct",
+                dry_run=True,
+                keeper_address=self.SENDER,
+                replacement_max_fee_gwei="3.0",
+            )
+        bot._chain_id = 97
+
+        # RPC error on receipt query
+        def rpc_receipt_err(url, method, params):
+            if method == "eth_getTransactionReceipt":
+                raise RuntimeError("RPC 503 Service Unavailable")
+            return None
+        with patch("script.keeper.rpc_call", side_effect=rpc_receipt_err):
+            recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+            self.assertEqual(recon["action"], "STOP_LOCK")
+            self.assertEqual(recon["reason_code"], "RECONCILIATION_RPC_FAILURE")
+
+        # RPC error on getTransactionByHash
+        def rpc_tx_err(url, method, params):
+            if method == "eth_getTransactionReceipt":
+                return None
+            if method == "eth_getTransactionByHash":
+                raise RuntimeError("RPC Connection Timeout")
+            return None
+        with patch("script.keeper.rpc_call", side_effect=rpc_tx_err):
+            recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, ["0x11"*32])
+            self.assertEqual(recon["action"], "STOP_LOCK")
+            self.assertEqual(recon["reason_code"], "RECONCILIATION_RPC_FAILURE")
+
+        # Contradictory nonce readings (latest > pending)
+        valid_tx = {
+            "type": "0x2",
+            "from": self.SENDER,
+            "to": self.MINER,
+            "nonce": "0x5",
+            "input": "0x93afb4c5",
+            "value": "0x0",
+            "chainId": "0x61",
+        }
+        def rpc_contradictory_nonce(url, method, params):
+            if method == "eth_getTransactionReceipt":
+                return None
+            if method == "eth_getTransactionByHash":
+                return valid_tx
+            if method == "eth_getTransactionCount":
+                if params[1] == "latest":
+                    return "0xa"
+                if params[1] == "pending":
+                    return "0x8"
+            return None
+        with patch("script.keeper.rpc_call", side_effect=rpc_contradictory_nonce):
+            recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, [])
+            self.assertEqual(recon["action"], "STOP_LOCK")
+            self.assertEqual(recon["reason_code"], "NONCE_READING_ANOMALY")

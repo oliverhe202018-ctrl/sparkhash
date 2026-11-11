@@ -54,6 +54,128 @@ except ImportError:
         validate_gas_limit,
     )
 
+
+class ReplacementError(Exception):
+    """Base exception for EIP-1559 replacement errors."""
+    pass
+
+class ReplacementCeilingNotConfiguredError(ReplacementError):
+    pass
+
+class ReplacementCeilingExceededError(ReplacementError):
+    pass
+
+class ReplacementBudgetExceededError(ReplacementError):
+    pass
+
+class ReplacementConflictError(ReplacementError):
+    pass
+
+UINT256_MAX = (1 << 256) - 1
+
+def bump_fee_exact(old_fee_wei: int, bump_percent: int = 15) -> int:
+    """
+    Computes exact integer ceil bump for EIP-1559 fees.
+    Ensures strictly bumped > old_fee_wei, covering old_fee_wei in (0, 1).
+    Does NOT use float.
+    """
+    if old_fee_wei < 0:
+        raise ValueError(f"Fee cannot be negative: {old_fee_wei}")
+    if bump_percent <= 0:
+        raise ValueError(f"Bump percent must be a positive integer: {bump_percent}")
+    if old_fee_wei == 0:
+        return 1
+    bumped = (old_fee_wei * (100 + bump_percent) + 99) // 100
+    if bumped <= old_fee_wei:
+        bumped = old_fee_wei + 1
+    return bumped
+
+def validate_replacement_config(
+    max_fee_per_gas_gwei: Optional[Any],
+    priority_fee_per_gas_gwei: Optional[Any],
+    replacement_max_fee_gwei: Optional[Any],
+    replacement_max_priority_fee_gwei: Optional[Any],
+    replacement_bump_percent: Any = 15,
+    replacement_max_total_budget_wei: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Validates replacement ceilings and bump parameters at startup.
+    Distinguishes initial fee, user explicit hard ceilings, and replacement ceilings.
+    """
+    cfg: Dict[str, Any] = {
+        "replacement_enabled": False,
+        "replacement_max_fee_wei": None,
+        "replacement_max_priority_fee_wei": None,
+        "replacement_bump_percent": 15,
+        "replacement_max_total_budget_wei": None,
+    }
+
+    if replacement_bump_percent is not None:
+        try:
+            pct = int(replacement_bump_percent)
+            if pct <= 0:
+                raise ValueError("Must be positive")
+            cfg["replacement_bump_percent"] = pct
+        except Exception as e:
+            raise ValueError(f"Invalid replacement fee bump percent: {format_exception_safe(e)}")
+
+    if replacement_max_total_budget_wei is not None and str(replacement_max_total_budget_wei).strip() != "":
+        try:
+            budget = int(replacement_max_total_budget_wei)
+            if budget <= 0:
+                raise ValueError("Must be positive")
+            if budget > UINT256_MAX:
+                raise ValueError("Exceeds uint256 max")
+            cfg["replacement_max_total_budget_wei"] = budget
+        except Exception as e:
+            raise ValueError(f"Invalid max replacement total budget: {format_exception_safe(e)}")
+
+    if replacement_max_fee_gwei is not None and str(replacement_max_fee_gwei).strip() != "":
+        try:
+            d_max = Decimal(str(replacement_max_fee_gwei).strip())
+            if d_max <= 0:
+                raise ValueError("Must be positive")
+            max_wei = int(d_max * Decimal(10**9))
+            if max_wei > UINT256_MAX:
+                raise ValueError("Exceeds uint256 max")
+            cfg["replacement_max_fee_wei"] = max_wei
+            cfg["replacement_enabled"] = True
+        except Exception as e:
+            raise ValueError(f"Invalid replacement max fee per gas: {format_exception_safe(e)}")
+
+        if max_fee_per_gas_gwei is not None and str(max_fee_per_gas_gwei).strip() != "":
+            try:
+                init_max_wei = int(Decimal(str(max_fee_per_gas_gwei).strip()) * Decimal(10**9))
+                if cfg["replacement_max_fee_wei"] < init_max_wei:
+                    raise ValueError(
+                        f"Replacement max fee ceiling ({replacement_max_fee_gwei} gwei) cannot be lower than "
+                        f"initial max fee ({max_fee_per_gas_gwei} gwei)"
+                    )
+            except Exception as e:
+                raise ValueError(format_exception_safe(e))
+
+    if replacement_max_priority_fee_gwei is not None and str(replacement_max_priority_fee_gwei).strip() != "":
+        try:
+            d_prio = Decimal(str(replacement_max_priority_fee_gwei).strip())
+            if d_prio <= 0:
+                raise ValueError("Must be positive")
+            prio_wei = int(d_prio * Decimal(10**9))
+            if prio_wei > UINT256_MAX:
+                raise ValueError("Exceeds uint256 max")
+            cfg["replacement_max_priority_fee_wei"] = prio_wei
+        except Exception as e:
+            raise ValueError(f"Invalid replacement max priority fee: {format_exception_safe(e)}")
+
+        if cfg["replacement_max_fee_wei"] is not None and cfg["replacement_max_priority_fee_wei"] > cfg["replacement_max_fee_wei"]:
+            raise ValueError(
+                f"Replacement max priority fee ceiling ({replacement_max_priority_fee_gwei} gwei) cannot exceed "
+                f"replacement max fee ceiling ({replacement_max_fee_gwei} gwei)"
+            )
+    elif cfg["replacement_max_fee_wei"] is not None:
+        cfg["replacement_max_priority_fee_wei"] = cfg["replacement_max_fee_wei"]
+
+    return cfg
+
 # Contract function selectors (verified against MinerV1 compiled ABI)
 SELECTOR_EPOCH = "900cf0cf"          # epoch() -> uint256
 SELECTOR_LAST_SYNCED = "93afb4c5"    # lastSynced() -> uint256
@@ -620,7 +742,9 @@ class KeeperBot:
                  dry_run=True, poll_interval=15, min_gas_price_gwei=DEFAULT_MIN_GAS_PRICE_GWEI,
                  gas_multiplier=DEFAULT_GAS_MULTIPLIER, tx_timeout=DEFAULT_TX_TIMEOUT,
                  max_retries=DEFAULT_MAX_RETRIES, max_seed_steps=MAX_SEED_STEPS,
-                 state_dir=None, max_fee_per_gas_gwei=None, priority_fee_per_gas_gwei=None):
+                 state_dir=None, max_fee_per_gas_gwei=None, priority_fee_per_gas_gwei=None,
+                 replacement_max_fee_gwei=None, replacement_max_priority_fee_gwei=None,
+                 replacement_fee_bump_percent=None, replacement_max_total_budget_wei=None):
         self.rpc_url = rpc_url
         self.miner = miner_address.strip().lower() if miner_address and isinstance(miner_address, str) else (miner_address or "")
         self.dry_run = dry_run
@@ -698,6 +822,22 @@ class KeeperBot:
             self.gas_multiplier = parsed_fee_cfg["effective_multiplier"]
             self.max_fee_per_gas_gwei = max_fee_per_gas_gwei
             self.priority_fee_per_gas_gwei = priority_fee_per_gas_gwei
+
+            rep_cfg = validate_replacement_config(
+                max_fee_per_gas_gwei=max_fee_per_gas_gwei,
+                priority_fee_per_gas_gwei=priority_fee_per_gas_gwei,
+                replacement_max_fee_gwei=replacement_max_fee_gwei,
+                replacement_max_priority_fee_gwei=replacement_max_priority_fee_gwei,
+                replacement_bump_percent=replacement_fee_bump_percent if replacement_fee_bump_percent is not None else 15,
+                replacement_max_total_budget_wei=replacement_max_total_budget_wei,
+            )
+            self.replacement_enabled = rep_cfg["replacement_enabled"]
+            self.replacement_max_fee_gwei = replacement_max_fee_gwei
+            self.replacement_max_fee_wei = rep_cfg["replacement_max_fee_wei"]
+            self.replacement_max_priority_fee_gwei = replacement_max_priority_fee_gwei
+            self.replacement_max_priority_fee_wei = rep_cfg["replacement_max_priority_fee_wei"]
+            self.replacement_bump_percent = rep_cfg["replacement_bump_percent"]
+            self.replacement_max_total_budget_wei = rep_cfg["replacement_max_total_budget_wei"]
         except Exception as e:
             self.alert(f"Startup check failed: {format_exception_safe(e)}")
             sys.exit(1)
@@ -1137,6 +1277,375 @@ class KeeperBot:
         self.log(level, f"  Gas Limit:       {gas_limit}")
         self.log(level, f"  Max Total Fee:   {max_total_fee_wei} wei")
 
+    def get_current_fee_estimates(self) -> Tuple[Optional[int], Optional[int]]:
+        """Fetches latest network fee estimates from RPC (base fee / priority fee)."""
+        market_base = None
+        market_prio = None
+        try:
+            res_p = rpc_call(self.rpc_url, "eth_maxPriorityFeePerGas")
+            if res_p is not None:
+                market_prio = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
+        except Exception:
+            pass
+        try:
+            res_b = rpc_call(self.rpc_url, "eth_gasPrice")
+            if res_b is not None:
+                market_base = int(res_b, 16) if isinstance(res_b, str) and res_b.startswith("0x") else int(res_b)
+        except Exception:
+            pass
+        return (market_base, market_prio)
+
+    def calculate_replacement_fees(
+        self,
+        old_max_fee_wei: int,
+        old_priority_fee_wei: int,
+        gas_limit: int,
+    ) -> Tuple[int, int]:
+        """
+        Computes bumped EIP-1559 fees for replacement with strict integer ceil bump.
+        Enforces:
+        - strictly bumped > old for both fees (covers 0 and 1 wei)
+        - maxFee >= priorityFee
+        - pure integer arithmetic, no float
+        - bounds within explicit replacement ceilings and budget
+        """
+        if not getattr(self, "replacement_enabled", False) or self.replacement_max_fee_wei is None:
+            raise ReplacementCeilingNotConfiguredError(
+                "Automatic replacement disabled: No explicit replacement max fee ceiling configured"
+            )
+
+        pct = getattr(self, "replacement_bump_percent", 15)
+        new_max_fee = bump_fee_exact(old_max_fee_wei, pct)
+        new_priority_fee = bump_fee_exact(old_priority_fee_wei, pct)
+
+        market_base, market_prio = self.get_current_fee_estimates()
+        if market_prio is not None and market_prio > new_priority_fee:
+            new_priority_fee = market_prio
+        if market_base is not None:
+            market_max = market_base * 2 + new_priority_fee
+            if market_max > new_max_fee:
+                new_max_fee = market_max
+
+        if new_max_fee < new_priority_fee:
+            new_max_fee = new_priority_fee
+
+        if new_max_fee <= old_max_fee_wei:
+            new_max_fee = old_max_fee_wei + 1
+            if new_max_fee < new_priority_fee:
+                new_max_fee = new_priority_fee
+
+        if new_priority_fee <= old_priority_fee_wei:
+            new_priority_fee = old_priority_fee_wei + 1
+            if new_max_fee < new_priority_fee:
+                new_max_fee = new_priority_fee
+
+        if new_max_fee > UINT256_MAX or new_priority_fee > UINT256_MAX:
+            raise ValueError(f"Computed replacement fees exceed uint256 max: max={new_max_fee}, prio={new_priority_fee}")
+
+        if self.replacement_max_priority_fee_wei is not None and new_priority_fee > self.replacement_max_priority_fee_wei:
+            raise ReplacementCeilingExceededError(
+                f"Computed replacement priority fee ({new_priority_fee} wei) exceeds explicit ceiling ({self.replacement_max_priority_fee_wei} wei)"
+            )
+
+        if new_max_fee > self.replacement_max_fee_wei:
+            raise ReplacementCeilingExceededError(
+                f"Computed replacement max fee ({new_max_fee} wei) exceeds explicit ceiling ({self.replacement_max_fee_wei} wei)"
+            )
+
+        if self.replacement_max_total_budget_wei is not None and gas_limit is not None:
+            total_fee = new_max_fee * gas_limit
+            if total_fee > self.replacement_max_total_budget_wei:
+                raise ReplacementBudgetExceededError(
+                    f"Computed replacement total fee ({total_fee} wei) exceeds total budget ({self.replacement_max_total_budget_wei} wei)"
+                )
+
+        return (new_max_fee, new_priority_fee)
+
+    def reconcile_pre_replacement(
+        self,
+        func_name: str,
+        target_addr: str,
+        calldata: str,
+        nonce: int,
+        gas_limit: int,
+        current_max_fee: int,
+        current_priority_fee: int,
+        active_tx_hash: Optional[str],
+        broadcasted_hashes: list,
+    ) -> Dict[str, Any]:
+        """
+        Reconciles known broadcasted transactions before replacement:
+        - checks receipts of all broadcasted tx_hashes
+        - queries RPC for in-flight transaction fields and verifies identity
+        - verifies state completeness if RPC is missing
+        - checks on-chain latest/pending nonces
+        - calculates strictly bumped fees bounded by ceilings
+        """
+        # 1. Check receipts
+        for h in broadcasted_hashes:
+            try:
+                rec = rpc_call(self.rpc_url, "eth_getTransactionReceipt", [h])
+            except Exception as e:
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "RECONCILIATION_RPC_FAILURE",
+                    "reason": f"RPC failure querying receipt for {h}: {format_exception_safe(e)}"
+                }
+            if rec and isinstance(rec, dict) and rec.get("blockNumber"):
+                blk = int(rec.get("blockNumber", "0x0"), 16) if isinstance(rec.get("blockNumber"), str) else rec.get("blockNumber")
+                used = int(rec.get("gasUsed", "0x0"), 16) if isinstance(rec.get("gasUsed"), str) else rec.get("gasUsed")
+                st = rec.get("status")
+                is_success = st in ("0x1", 1, True)
+                return {
+                    "action": "CONFIRMED_RECEIPT",
+                    "tx_hash": h,
+                    "receipt": rec,
+                    "block_number": blk,
+                    "gas_used": used,
+                    "is_success": is_success,
+                }
+
+        # 2. Inspect on-chain tx
+        last_hash = active_tx_hash or (broadcasted_hashes[-1] if broadcasted_hashes else None)
+        tx_obj = None
+        if last_hash and last_hash != "Unknown":
+            try:
+                tx_obj = rpc_call(self.rpc_url, "eth_getTransactionByHash", [last_hash])
+            except Exception as e:
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "RECONCILIATION_RPC_FAILURE",
+                    "reason": f"RPC failure querying transaction {last_hash} before replacement: {format_exception_safe(e)}"
+                }
+
+        base_max_fee = current_max_fee
+        base_priority_fee = current_priority_fee
+
+        if tx_obj and isinstance(tx_obj, dict):
+            tx_type = tx_obj.get("type")
+            if tx_type is None:
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": "On-chain transaction missing type field"
+                }
+            type_val = int(tx_type, 16) if isinstance(tx_type, str) else tx_type
+            if type_val not in (2, "0x2", "2"):
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": f"On-chain transaction type {type_val} is not EIP-1559 type-2"
+                }
+
+            raw_from = tx_obj.get("from")
+            if not raw_from or str(raw_from).strip() == "":
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": "On-chain transaction missing from field"
+                }
+            tx_from = str(raw_from).lower()
+            if tx_from != self.keeper_address.lower():
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": f"On-chain sender {tx_from} does not match keeper {self.keeper_address}"
+                }
+
+            raw_to = tx_obj.get("to")
+            if not raw_to or str(raw_to).strip() == "":
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": "On-chain transaction missing to field"
+                }
+            tx_to = str(raw_to).lower()
+            if tx_to != target_addr.lower():
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": f"On-chain target {tx_to} does not match expected {target_addr}"
+                }
+
+            raw_nonce = tx_obj.get("nonce")
+            if raw_nonce is None:
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": "On-chain transaction missing nonce field"
+                }
+            tx_nonce = int(raw_nonce, 16) if isinstance(raw_nonce, str) else raw_nonce
+            if tx_nonce != nonce:
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": f"On-chain nonce {tx_nonce} does not match attempted nonce {nonce}"
+                }
+
+            raw_input = tx_obj.get("input") if tx_obj.get("input") is not None else tx_obj.get("data")
+            if raw_input is None:
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": "On-chain transaction missing input/data field"
+                }
+            tx_input = str(raw_input).lower()
+            if tx_input != calldata.lower():
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                    "reason": f"On-chain calldata does not match {func_name} calldata"
+                }
+
+            raw_value = tx_obj.get("value")
+            if raw_value is not None:
+                tx_value = int(raw_value, 16) if isinstance(raw_value, str) else raw_value
+                if tx_value != 0:
+                    return {
+                        "action": "STOP_LOCK",
+                        "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                        "reason": f"On-chain transaction value {tx_value} is not 0"
+                    }
+
+            raw_cid = tx_obj.get("chainId")
+            if raw_cid is not None:
+                tx_cid = int(raw_cid, 16) if isinstance(raw_cid, str) else raw_cid
+                expected_cid = self.get_chain_id()
+                if tx_cid != expected_cid:
+                    return {
+                        "action": "STOP_LOCK",
+                        "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                        "reason": f"On-chain chainId {tx_cid} does not match expected {expected_cid}"
+                    }
+
+            onchain_max = tx_obj.get("maxFeePerGas")
+            onchain_prio = tx_obj.get("maxPriorityFeePerGas")
+            if onchain_max is not None:
+                try:
+                    val = int(onchain_max, 16) if isinstance(onchain_max, str) else int(onchain_max)
+                    base_max_fee = max(base_max_fee, val)
+                except Exception:
+                    pass
+            if onchain_prio is not None:
+                try:
+                    pval = int(onchain_prio, 16) if isinstance(onchain_prio, str) else int(onchain_prio)
+                    base_priority_fee = max(base_priority_fee, pval)
+                except Exception:
+                    pass
+        else:
+            sm = getattr(self, "state_manager", None) or self._ensure_state_manager()
+            st_data = sm.load_state() if sm else None
+            if st_data:
+                has_to = st_data.get("to")
+                has_data = st_data.get("calldata")
+                has_fee = st_data.get("max_fee_per_gas_wei") is not None
+                if not (has_to and has_data and has_fee):
+                    return {
+                        "action": "STOP_LOCK",
+                        "reason_code": "STATE_RECONSTRUCTION_INCOMPLETE",
+                        "reason": "Previous transaction fields missing from local state and unrecoverable from RPC; halting replacement for safety."
+                    }
+                st_to = str(has_to).lower()
+                if st_to != target_addr.lower():
+                    return {
+                        "action": "STOP_LOCK",
+                        "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                        "reason": f"State target {st_to} does not match expected {target_addr}"
+                    }
+                st_calldata = str(has_data).lower()
+                if st_calldata != calldata.lower():
+                    return {
+                        "action": "STOP_LOCK",
+                        "reason_code": "REPLACEMENT_IDENTITY_CONFLICT",
+                        "reason": f"State calldata does not match {func_name} calldata"
+                    }
+                base_max_fee = max(base_max_fee, int(st_data.get("max_fee_per_gas_wei", 0)))
+                base_priority_fee = max(base_priority_fee, int(st_data.get("max_priority_fee_per_gas_wei", 0)))
+            else:
+                return {
+                    "action": "STOP_LOCK",
+                    "reason_code": "STATE_RECONSTRUCTION_INCOMPLETE",
+                    "reason": "Previous transaction unrecoverable from RPC and local state unavailable; halting replacement for safety."
+                }
+
+        # 3. Check latest/pending nonce
+        try:
+            res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
+            latest_nonce = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
+            res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
+            pending_nonce = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
+        except Exception as e:
+            return {
+                "action": "STOP_LOCK",
+                "reason_code": "RECONCILIATION_RPC_FAILURE",
+                "reason": f"RPC failure querying transaction count: {format_exception_safe(e)}"
+            }
+
+        if latest_nonce < 0 or pending_nonce < 0:
+            return {
+                "action": "STOP_LOCK",
+                "reason_code": "NONCE_READING_ANOMALY",
+                "reason": f"Negative nonce reading: latest={latest_nonce}, pending={pending_nonce}"
+            }
+
+        if latest_nonce > pending_nonce:
+            return {
+                "action": "STOP_LOCK",
+                "reason_code": "NONCE_READING_ANOMALY",
+                "reason": f"Contradictory nonce readings: latest ({latest_nonce}) > pending ({pending_nonce})"
+            }
+
+        if latest_nonce > nonce:
+            for h in broadcasted_hashes:
+                try:
+                    rec = rpc_call(self.rpc_url, "eth_getTransactionReceipt", [h])
+                except Exception as e:
+                    return {
+                        "action": "STOP_LOCK",
+                        "reason_code": "RECONCILIATION_RPC_FAILURE",
+                        "reason": f"RPC failure querying receipt for {h}: {format_exception_safe(e)}"
+                    }
+                if rec and isinstance(rec, dict) and rec.get("blockNumber"):
+                    blk = int(rec.get("blockNumber", "0x0"), 16) if isinstance(rec.get("blockNumber"), str) else rec.get("blockNumber")
+                    used = int(rec.get("gasUsed", "0x0"), 16) if isinstance(rec.get("gasUsed"), str) else rec.get("gasUsed")
+                    st = rec.get("status")
+                    is_success = st in ("0x1", 1, True)
+                    return {
+                        "action": "CONFIRMED_RECEIPT",
+                        "tx_hash": h,
+                        "receipt": rec,
+                        "block_number": blk,
+                        "gas_used": used,
+                        "is_success": is_success,
+                    }
+            return {
+                "action": "STOP_LOCK",
+                "reason_code": "NONCE_CONSUMED_UNATTRIBUTED",
+                "reason": f"Nonce {nonce} already consumed on-chain (latest={latest_nonce}) but none of known hashes {broadcasted_hashes} confirmed."
+            }
+
+        # 4. Calculate replacement fees
+        try:
+            new_max, new_prio = self.calculate_replacement_fees(
+                old_max_fee_wei=base_max_fee,
+                old_priority_fee_wei=base_priority_fee,
+                gas_limit=gas_limit
+            )
+            return {
+                "action": "PROCEED",
+                "max_fee_wei": new_max,
+                "priority_fee_wei": new_prio
+            }
+        except ReplacementCeilingNotConfiguredError as e:
+            return {"action": "STOP_LOCK", "reason_code": "TYPE2_REPLACEMENT_DISABLED", "reason": str(e)}
+        except ReplacementCeilingExceededError as e:
+            return {"action": "STOP_LOCK", "reason_code": "REPLACEMENT_CEILING_EXCEEDED", "reason": str(e)}
+        except ReplacementBudgetExceededError as e:
+            return {"action": "STOP_LOCK", "reason_code": "REPLACEMENT_BUDGET_EXCEEDED", "reason": str(e)}
+        except Exception as e:
+            return {"action": "STOP_LOCK", "reason_code": "REPLACEMENT_FEE_CALCULATION_ERROR", "reason": str(e)}
+
+
     def get_nonce(self):
         """Fetches pending nonce for keeper account; enforces strict checks in live mode."""
         if self.dry_run:
@@ -1224,6 +1733,15 @@ class KeeperBot:
             return max(int(est * 1.3), 80000)
         except Exception:
             return default_gas
+
+    def get_transaction_receipt(self, tx_hash: str):
+        try:
+            res = rpc_call(self.rpc_url, "eth_getTransactionReceipt", [tx_hash])
+            if res and isinstance(res, dict) and res.get("blockNumber"):
+                return res
+            return None
+        except Exception:
+            return None
 
     def wait_for_receipt(self, tx_hash, timeout_secs):
         """Polls for transaction receipt up to timeout_secs."""
@@ -1378,6 +1896,7 @@ class KeeperBot:
                 return status in (1, "0x1", "1") or status is True
             return self.is_receipt_successful(receipt)
         return False
+
 
     def send_transaction(self, calldata, desc, func_name=None, preflight=True):
         if func_name is None:
@@ -1549,129 +2068,24 @@ class KeeperBot:
             target_addr = to_checksum_address(self.miner)
             self.log("INFO", f"Prepared type-2 {func_name} (nonce {nonce}):")
             self._log_eip1559_fee_summary("INFO", fee_info, gas_limit)
-            active_tx_hash = None
-            broadcasted_hashes = []
-
-            def _check_all_known_receipts():
-                for h in broadcasted_hashes:
-                    self.log("INFO", f"Checking receipt for broadcasted txHash {h}...")
-                    receipt = self.wait_for_receipt(h, min(self.tx_timeout, 15))
-                    if receipt:
-                        st_r = receipt.get("status")
-                        blk = int(receipt.get("blockNumber", "0x0"), 16)
-                        used = int(receipt.get("gasUsed", "0x0"), 16)
-                        if st_r in ("0x1", 1, True):
-                            self.log("SUCCESS", f"Transaction {h} CONFIRMED in block {blk}! Gas used: {used}")
-                            self.current_nonce = nonce + 1
-                            if sm:
-                                try:
-                                    sm.record_confirmed_success(tx_hash=h, block_number=blk, gas_used=used)
-                                except Exception as sm_e:
-                                    err_str = format_exception_safe(sm_e)
-                                    self.alert(f"Transaction confirmed on-chain but failed to save CONFIRMED_SUCCESS state: {err_str}")
-                                    self.lock_for_manual_review(
-                                        reason=f"Tx confirmed on-chain ({h}) but failed to write state ({err_str})",
-                                        nonce=nonce,
-                                        func_name=func_name,
-                                        tx_hash=h,
-                                        reason_code="STATE_WRITE_FAILURE",
-                                        tx_hashes=broadcasted_hashes
-                                    )
-                                    return TxResult(
-                                        status=TxExecutionStatus.UNCERTAIN,
-                                        tx_hash=h,
-                                        nonce=nonce,
-                                        error=err_str,
-                                        context=self.manual_review_context
-                                    )
-                            return TxResult(
-                                status=TxExecutionStatus.CONFIRMED_SUCCESS,
-                                tx_hash=h,
-                                receipt=receipt,
-                                nonce=nonce
-                            )
-                        else:
-                            self.alert(f"Transaction {h} REVERTED in block {blk}!")
-                            self.current_nonce = nonce + 1
-                            if sm:
-                                try:
-                                    sm.record_confirmed_revert(tx_hash=h, block_number=blk, gas_used=used, revert_reason="revert")
-                                except Exception as sm_e:
-                                    err_str = format_exception_safe(sm_e)
-                                    self.alert(f"Transaction reverted on-chain but failed to save CONFIRMED_REVERT state: {err_str}")
-                                    self.lock_for_manual_review(
-                                        reason=f"Tx reverted on-chain ({h}) but failed to write state ({err_str})",
-                                        nonce=nonce,
-                                        func_name=func_name,
-                                        tx_hash=h,
-                                        reason_code="STATE_WRITE_FAILURE",
-                                        tx_hashes=broadcasted_hashes
-                                    )
-                                    return TxResult(
-                                        status=TxExecutionStatus.UNCERTAIN,
-                                        tx_hash=h,
-                                        nonce=nonce,
-                                        error=f"Tx reverted on-chain but failed to write state: {err_str}",
-                                        context=self.manual_review_context
-                                    )
-                            return TxResult(
-                                status=TxExecutionStatus.CONFIRMED_REVERT,
-                                tx_hash=h,
-                                receipt=receipt,
-                                nonce=nonce
-                            )
-                return None
-
-            if not self.dry_run and sm:
-                try:
-                    sm.record_preparing_to_send(
-                        operation=func_name,
-                        epoch=getattr(self, "current_epoch", "Unknown"),
-                        nonce=nonce,
-                        details=f"Broadcasting type-2 {func_name} with nonce {nonce}",
-                        tx_type=2,
-                        max_fee_per_gas_wei=max_fee_wei,
-                        max_priority_fee_per_gas_wei=priority_fee_wei,
-                        gas_limit=gas_limit,
-                        to_address=target_addr,
-                        value_wei=0,
-                        calldata=calldata,
-                    )
-                except Exception as e:
-                    err_str = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file] if self.password_file else None)
-                    self.alert(f"Transaction broadcast ABORTED: Failed to write in-flight state before sending: {err_str}")
-                    self.lock_for_manual_review(
-                        reason=f"Failed to persist in-flight state ({err_str})",
-                        nonce=nonce,
-                        func_name=func_name,
-                        reason_code="STATE_WRITE_FAILURE"
-                    )
-                    return TxResult(
-                        status=TxExecutionStatus.UNCERTAIN,
-                        nonce=nonce,
-                        error=f"Failed to persist in-flight state: {err_str}",
-                        context=self.manual_review_context
-                    )
 
             if self.account:
                 cast_bin = shutil.which("cast") or "cast"
                 isolated_env = get_isolated_cast_env()
 
-                for attempt in range(1):
+                def _cast_broadcast(attempt, cur_max_fee, cur_prio_fee):
                     cmd = [
                         cast_bin, "send", target_addr,
                         "--data", calldata,
                         "--account", self.account,
                         "--password-file", self.password_file,
                         "--rpc-url", self.rpc_url,
-                        "--gas-price", str(max_fee_wei),
-                        "--priority-gas-price", str(priority_fee_wei),
+                        "--gas-price", str(cur_max_fee),
+                        "--priority-gas-price", str(cur_prio_fee),
                         "--gas-limit", str(gas_limit),
                         "--nonce", str(nonce),
                         "--async"
                     ]
-
-                    tx_hash = None
                     try:
                         proc = subprocess.run(
                             cmd,
@@ -1683,232 +2097,30 @@ class KeeperBot:
                             env=isolated_env
                         )
                     except subprocess.TimeoutExpired:
-                        err_str = f"cast send subprocess timed out after {self.tx_timeout}s"
-                        self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
-                        if broadcasted_hashes:
-                            rec_res = _check_all_known_receipts()
-                            if rec_res:
-                                return rec_res
-                        self.lock_for_manual_review(
-                            reason=f"cast send timed out during execution ({err_str})",
-                            nonce=nonce,
-                            func_name=func_name,
-                            tx_hash=active_tx_hash,
-                            tx_hashes=broadcasted_hashes
-                        )
-                        return TxResult(
-                            status=TxExecutionStatus.UNCERTAIN,
-                            tx_hash=active_tx_hash,
-                            nonce=nonce,
-                            error=err_str,
-                            context=self.manual_review_context
-                        )
+                        return (None, f"cast send subprocess timed out after {self.tx_timeout}s", True)
                     except Exception as e:
-                        err_str = sanitize_text(format_exception_safe(e), sensitive_values=[self.password_file])
-                        self.alert(f"cast send execution failed on attempt {attempt}: {err_str}")
-                        if broadcasted_hashes:
-                            rec_res = _check_all_known_receipts()
-                            if rec_res:
-                                return rec_res
-                        self.lock_for_manual_review(
-                            reason=f"cast send execution exception ({err_str})",
-                            nonce=nonce,
-                            func_name=func_name,
-                            tx_hash=active_tx_hash,
-                            tx_hashes=broadcasted_hashes
-                        )
-                        return TxResult(
-                            status=TxExecutionStatus.UNCERTAIN,
-                            tx_hash=active_tx_hash,
-                            nonce=nonce,
-                            error=err_str,
-                            context=self.manual_review_context
-                        )
+                        return (None, format_exception_safe(e), False)
 
                     out = proc.stdout or ""
                     err = proc.stderr or ""
                     if proc.returncode != 0:
-                        err_str = sanitize_text(f"{err}\n{out}".strip(), sensitive_values=[self.password_file])
-                        is_nonce_err = "nonce too low" in err_str.lower() or "already known" in err_str.lower()
-                        if is_nonce_err:
-                            diag_latest = None
-                            diag_pending = None
-                            try:
-                                res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
-                                diag_latest = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
-                                res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
-                                diag_pending = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
-                            except Exception as diag_e:
-                                self.log("WARN", f"Failed to fetch diagnostic nonces: {format_exception_safe(diag_e)}")
-                            self.log("WARN", f"RPC response: {err_str} (Diagnostic nonces: latest={diag_latest}, pending={diag_pending}, attempted_nonce={nonce})")
-                        else:
-                            self.alert(f"cast send failed on attempt {attempt} (code {proc.returncode}): {err_str}")
-
-                        if broadcasted_hashes:
-                            rec_res = _check_all_known_receipts()
-                            if rec_res:
-                                return rec_res
-
-                        self.lock_for_manual_review(
-                            reason=f"cast send failed on attempt {attempt} (code {proc.returncode}): {err_str}",
-                            nonce=nonce,
-                            func_name=func_name,
-                            tx_hash=active_tx_hash,
-                            tx_hashes=broadcasted_hashes
-                        )
-                        return TxResult(
-                            status=TxExecutionStatus.UNCERTAIN,
-                            tx_hash=active_tx_hash,
-                            nonce=nonce,
-                            error=err_str,
-                            context=self.manual_review_context
-                        )
-
+                        return (None, f"{err}\n{out}".strip(), False)
                     m = re.search(r"0x[0-9a-fA-F]{64}", out)
                     if not m:
-                        err_str = sanitize_text(out, sensitive_values=[self.password_file])
-                        self.alert(f"cast send succeeded (code 0) but no valid txHash found in output: {err_str}")
-                        if broadcasted_hashes:
-                            rec_res = _check_all_known_receipts()
-                            if rec_res:
-                                return rec_res
-                        self.lock_for_manual_review(
-                            reason=f"cast send succeeded on attempt {attempt} but output missing valid txHash",
-                            nonce=nonce,
-                            func_name=func_name,
-                            tx_hash=active_tx_hash,
-                            tx_hashes=broadcasted_hashes
-                        )
-                        return TxResult(
-                            status=TxExecutionStatus.UNCERTAIN,
-                            tx_hash=active_tx_hash,
-                            nonce=nonce,
-                            error="Missing txHash in cast send output",
-                            context=self.manual_review_context
-                        )
+                        return (None, f"cast send succeeded (code 0) but no valid txHash found in output: {out}", False)
+                    return (m.group(0), None, False)
 
-                    tx_hash = m.group(0)
-                    active_tx_hash = tx_hash
-                    if tx_hash not in broadcasted_hashes:
-                        broadcasted_hashes.append(tx_hash)
-                    if sm:
-                        try:
-                            sm.record_broadcasted(tx_hash)
-                        except Exception as sm_e:
-                            err_str = format_exception_safe(sm_e)
-                            self.alert(f"Failed to record broadcasted txHash {tx_hash} to state file: {err_str}")
-                            self.lock_for_manual_review(
-                                reason=f"Broadcasted txHash {tx_hash} could not be persisted to state ({err_str})",
-                                nonce=nonce,
-                                func_name=func_name,
-                                tx_hash=tx_hash,
-                                reason_code="STATE_WRITE_FAILURE"
-                            )
-                            return TxResult(
-                                status=TxExecutionStatus.UNCERTAIN,
-                                tx_hash=tx_hash,
-                                nonce=nonce,
-                                error=err_str,
-                                context=self.manual_review_context
-                            )
-                    self.log("TX", f"Broadcasted type-2 {func_name} txHash={tx_hash} (nonce={nonce}, maxFee={max_fee_wei} wei, priorityFee={priority_fee_wei} wei, attempt={attempt})")
-
-                    receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
-                    if receipt:
-                        status = receipt.get("status")
-                        blk = int(receipt.get("blockNumber", "0x0"), 16)
-                        used = int(receipt.get("gasUsed", "0x0"), 16)
-                        if status in ("0x1", 1, True):
-                            self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
-                            self.current_nonce = nonce + 1
-                            if sm:
-                                try:
-                                    sm.record_confirmed_success(tx_hash=tx_hash, block_number=blk, gas_used=used)
-                                except Exception as sm_e:
-                                    err_str = format_exception_safe(sm_e)
-                                    self.alert(f"Transaction confirmed on-chain but failed to save CONFIRMED_SUCCESS state: {err_str}")
-                                    self.lock_for_manual_review(
-                                        reason=f"Tx confirmed on-chain ({tx_hash}) but failed to write state ({err_str})",
-                                        nonce=nonce,
-                                        func_name=func_name,
-                                        tx_hash=tx_hash,
-                                        reason_code="STATE_WRITE_FAILURE"
-                                    )
-                                    return TxResult(
-                                        status=TxExecutionStatus.UNCERTAIN,
-                                        tx_hash=tx_hash,
-                                        nonce=nonce,
-                                        error=err_str,
-                                        context=self.manual_review_context
-                                    )
-                            return TxResult(
-                                status=TxExecutionStatus.CONFIRMED_SUCCESS,
-                                tx_hash=tx_hash,
-                                receipt=receipt,
-                                nonce=nonce
-                            )
-                        else:
-                            self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
-                            self.current_nonce = nonce + 1
-                            if sm:
-                                try:
-                                    sm.record_confirmed_revert(tx_hash=tx_hash, block_number=blk, gas_used=used, revert_reason="revert")
-                                except Exception as sm_e:
-                                    err_str = format_exception_safe(sm_e)
-                                    self.alert(f"Transaction reverted on-chain but failed to save CONFIRMED_REVERT state: {err_str}")
-                                    self.lock_for_manual_review(
-                                        reason=f"Tx reverted on-chain ({tx_hash}) but failed to write state ({err_str})",
-                                        nonce=nonce,
-                                        func_name=func_name,
-                                        tx_hash=tx_hash,
-                                        reason_code="STATE_WRITE_FAILURE",
-                                        tx_hashes=broadcasted_hashes
-                                    )
-                                    return TxResult(
-                                        status=TxExecutionStatus.UNCERTAIN,
-                                        tx_hash=tx_hash,
-                                        nonce=nonce,
-                                        error=f"Tx reverted on-chain but failed to write state: {err_str}",
-                                        context=self.manual_review_context
-                                    )
-                            return TxResult(
-                                status=TxExecutionStatus.CONFIRMED_REVERT,
-                                tx_hash=tx_hash,
-                                receipt=receipt,
-                                nonce=nonce
-                            )
-
-                    self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
-                    if attempt < self.max_retries:
-                        self.alert(
-                            f"Type-2 replacement halted for {func_name} (nonce {nonce}, tx {tx_hash}): "
-                            "legacy single-gasPrice replacement is disabled for EIP-1559 type-2 transactions; manual review required (K3 pending)."
-                        )
-
-                if broadcasted_hashes:
-                    rec_res = _check_all_known_receipts()
-                    if rec_res:
-                        return rec_res
-                lock_reason = (
-                    f"Type-2 transaction unconfirmed after {self.tx_timeout}s; legacy single-gasPrice replacement disabled in K2 (manual review required)"
-                    if self.max_retries > 0
-                    else f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted"
-                )
-                lock_code = "TYPE2_REPLACEMENT_DISABLED" if self.max_retries > 0 else None
-                self.lock_for_manual_review(
-                    reason=lock_reason,
-                    nonce=nonce,
+                return self._execute_type2_broadcast_with_replacement(
                     func_name=func_name,
-                    tx_hash=active_tx_hash,
-                    reason_code=lock_code,
-                    tx_hashes=broadcasted_hashes
-                )
-                return TxResult(
-                    status=TxExecutionStatus.PENDING_UNCONFIRMED,
-                    tx_hash=active_tx_hash,
+                    target_addr=target_addr,
+                    calldata=calldata,
                     nonce=nonce,
-                    error=lock_reason,
-                    context=self.manual_review_context
+                    gas_limit=gas_limit,
+                    initial_max_fee_wei=max_fee_wei,
+                    initial_priority_fee_wei=priority_fee_wei,
+                    broadcast_fn=_cast_broadcast,
+                    sensitive_password_file=self.password_file,
+                    sm=sm
                 )
 
             if not self.private_key:
@@ -1931,237 +2143,527 @@ class KeeperBot:
 
             chain_id = self.get_chain_id()
 
-            for attempt in range(1):
+            def _raw_broadcast(attempt, cur_max_fee, cur_prio_fee):
                 tx_dict = {
                     "type": 2,
                     "to": target_addr,
                     "value": 0,
                     "gas": gas_limit,
-                    "maxFeePerGas": max_fee_wei,
-                    "maxPriorityFeePerGas": priority_fee_wei,
+                    "maxFeePerGas": cur_max_fee,
+                    "maxPriorityFeePerGas": cur_prio_fee,
                     "nonce": nonce,
                     "chainId": chain_id,
                     "data": calldata
                 }
-
                 try:
                     signed = Account.sign_transaction(tx_dict, self.private_key)
                     raw_bytes = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
                     raw_hex = "0x" + raw_bytes.hex()
                 except Exception as e:
-                    err_str = format_exception_safe(e)
-                    self.alert(f"Failed to sign transaction on attempt {attempt}: {err_str}")
-                    if broadcasted_hashes:
-                        rec_res = _check_all_known_receipts()
-                        if rec_res:
-                            return rec_res
-                    self.lock_for_manual_review(
-                        reason=f"Failed to sign transaction ({err_str})",
-                        nonce=nonce,
-                        func_name=func_name,
-                        tx_hash=active_tx_hash,
-                        tx_hashes=broadcasted_hashes
-                    )
-                    return TxResult(
-                        status=TxExecutionStatus.UNCERTAIN,
-                        tx_hash=active_tx_hash,
-                        nonce=nonce,
-                        error=err_str,
-                        context=self.manual_review_context
-                    )
-
-                tx_hash = None
+                    return (None, f"Failed to sign transaction: {format_exception_safe(e)}", False)
                 try:
-                    res = rpc_call(self.rpc_url, "eth_sendRawTransaction", [raw_hex])
-                    if isinstance(res, str) and re.match(r"^0x[0-9a-fA-F]{64}$", res):
-                        tx_hash = res
-                    else:
-                        self.alert(f"eth_sendRawTransaction returned non-hash response: {res}")
+                    h = rpc_call(self.rpc_url, "eth_sendRawTransaction", [raw_hex])
+                    if not h or not isinstance(h, str) or not re.match(r"^0x[0-9a-fA-F]{64}$", h):
+                        return (None, f"Malformed or missing txHash from eth_sendRawTransaction: {h}", False)
+                    return (h, None, False)
                 except Exception as e:
-                    err_str = format_exception_safe(e)
-                    is_nonce_err = "nonce too low" in err_str.lower() or "already known" in err_str.lower()
-                    if is_nonce_err:
-                        diag_latest = None
-                        diag_pending = None
-                        try:
-                            res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
-                            diag_latest = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
-                            res_p = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "pending"])
-                            diag_pending = int(res_p, 16) if isinstance(res_p, str) and res_p.startswith("0x") else int(res_p)
-                        except Exception as diag_e:
-                            self.log("WARN", f"Failed to fetch diagnostic nonces: {format_exception_safe(diag_e)}")
-                        self.log("WARN", f"RPC response: {err_str} (Diagnostic nonces: latest={diag_latest}, pending={diag_pending}, attempted_nonce={nonce})")
-                    else:
-                        self.alert(f"eth_sendRawTransaction failed on attempt {attempt}: {err_str}")
+                    return (None, format_exception_safe(e), False)
 
-                    if broadcasted_hashes:
-                        rec_res = _check_all_known_receipts()
-                        if rec_res:
-                            return rec_res
+            return self._execute_type2_broadcast_with_replacement(
+                func_name=func_name,
+                target_addr=target_addr,
+                calldata=calldata,
+                nonce=nonce,
+                gas_limit=gas_limit,
+                initial_max_fee_wei=max_fee_wei,
+                initial_priority_fee_wei=priority_fee_wei,
+                broadcast_fn=_raw_broadcast,
+                sensitive_password_file=None,
+                sm=sm
+            )
 
-                    self.lock_for_manual_review(
-                        reason=f"eth_sendRawTransaction failed on attempt {attempt}: {err_str}",
-                        nonce=nonce,
-                        func_name=func_name,
-                        tx_hash=active_tx_hash,
-                        tx_hashes=broadcasted_hashes
-                    )
-                    return TxResult(
-                        status=TxExecutionStatus.UNCERTAIN,
-                        tx_hash=active_tx_hash,
-                        nonce=nonce,
-                        error=err_str,
-                        context=self.manual_review_context
-                    )
+        finally:
+            if not self.dry_run and sm and getattr(self, "_domain_lock_acquired", False):
+                sm.release_lock()
+                self._domain_lock_acquired = False
 
-                if not tx_hash:
-                    if broadcasted_hashes:
-                        rec_res = _check_all_known_receipts()
-                        if rec_res:
-                            return rec_res
-                    self.lock_for_manual_review(
-                        reason="eth_sendRawTransaction did not return a valid txHash",
-                        nonce=nonce,
-                        func_name=func_name,
-                        tx_hash=active_tx_hash,
-                        tx_hashes=broadcasted_hashes
-                    )
-                    return TxResult(
-                        status=TxExecutionStatus.UNCERTAIN,
-                        tx_hash=active_tx_hash,
-                        nonce=nonce,
-                        error="Missing valid txHash from eth_sendRawTransaction",
-                        context=self.manual_review_context
-                    )
 
-                active_tx_hash = tx_hash
-                if tx_hash not in broadcasted_hashes:
-                    broadcasted_hashes.append(tx_hash)
-                if sm:
-                    try:
-                        sm.record_broadcasted(tx_hash)
-                    except Exception as sm_e:
-                        err_str = format_exception_safe(sm_e)
-                        self.alert(f"Failed to record broadcasted txHash {tx_hash} to state file: {err_str}")
-                        self.lock_for_manual_review(
-                            reason=f"Broadcasted txHash {tx_hash} could not be persisted to state ({err_str})",
-                            nonce=nonce,
-                            func_name=func_name,
-                            tx_hash=tx_hash,
-                            reason_code="STATE_WRITE_FAILURE"
-                        )
-                        return TxResult(
-                            status=TxExecutionStatus.UNCERTAIN,
-                            tx_hash=tx_hash,
-                            nonce=nonce,
-                            error=err_str,
-                            context=self.manual_review_context
-                        )
-                self.log("TX", f"Broadcasted type-2 {func_name} txHash={tx_hash} (nonce={nonce}, maxFee={max_fee_wei} wei, priorityFee={priority_fee_wei} wei, attempt={attempt})")
 
-                # Wait for receipt
-                receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
+
+    def _execute_type2_broadcast_with_replacement(
+        self,
+        func_name: str,
+        target_addr: str,
+        calldata: str,
+        nonce: int,
+        gas_limit: int,
+        initial_max_fee_wei: int,
+        initial_priority_fee_wei: int,
+        broadcast_fn,
+        sensitive_password_file: Optional[str] = None,
+        sm: Optional[Any] = None,
+    ) -> TxResult:
+        if sm is None:
+            sm = getattr(self, "state_manager", None) or self._ensure_state_manager()
+        active_tx_hash = None
+        broadcasted_hashes = []
+        max_fee_wei = initial_max_fee_wei
+        priority_fee_wei = initial_priority_fee_wei
+
+        def _check_all_known_receipts():
+            for h in broadcasted_hashes:
+                self.log("INFO", f"Checking receipt for broadcasted txHash {h}...")
+                receipt = self.wait_for_receipt(h, min(self.tx_timeout, 15))
                 if receipt:
-                    status = receipt.get("status")
-                    blk = int(receipt.get("blockNumber", "0x0"), 16)
-                    used = int(receipt.get("gasUsed", "0x0"), 16)
-                    if status in ("0x1", 1, True):
-                        self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
+                    st_r = receipt.get("status")
+                    blk = int(receipt.get("blockNumber", "0x0"), 16) if isinstance(receipt.get("blockNumber"), str) else receipt.get("blockNumber")
+                    used = int(receipt.get("gasUsed", "0x0"), 16) if isinstance(receipt.get("gasUsed"), str) else receipt.get("gasUsed")
+                    if st_r in ("0x1", 1, True):
+                        self.log("SUCCESS", f"Transaction {h} CONFIRMED in block {blk}! Gas used: {used}")
                         self.current_nonce = nonce + 1
                         if sm:
                             try:
-                                sm.record_confirmed_success(tx_hash=tx_hash, block_number=blk, gas_used=used)
+                                sm.record_confirmed_success(tx_hash=h, block_number=blk, gas_used=used)
                             except Exception as sm_e:
                                 err_str = format_exception_safe(sm_e)
                                 self.alert(f"Transaction confirmed on-chain but failed to save CONFIRMED_SUCCESS state: {err_str}")
                                 self.lock_for_manual_review(
-                                    reason=f"Tx confirmed on-chain ({tx_hash}) but failed to write state ({err_str})",
+                                    reason=f"Tx confirmed on-chain ({h}) but failed to write state ({err_str})",
                                     nonce=nonce,
                                     func_name=func_name,
-                                    tx_hash=tx_hash,
-                                    reason_code="STATE_WRITE_FAILURE"
-                                )
-                                return TxResult(
-                                    status=TxExecutionStatus.UNCERTAIN,
-                                    tx_hash=tx_hash,
-                                    nonce=nonce,
-                                    error=err_str,
-                                    context=self.manual_review_context
-                                )
-                        return TxResult(
-                            status=TxExecutionStatus.CONFIRMED_SUCCESS,
-                            tx_hash=tx_hash,
-                            receipt=receipt,
-                            nonce=nonce
-                        )
-                    else:
-                        self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
-                        self.current_nonce = nonce + 1
-                        if sm:
-                            try:
-                                sm.record_confirmed_revert(tx_hash=tx_hash, block_number=blk, gas_used=used, revert_reason="revert")
-                            except Exception as sm_e:
-                                err_str = format_exception_safe(sm_e)
-                                self.alert(f"Transaction reverted on-chain but failed to save CONFIRMED_REVERT state: {err_str}")
-                                self.lock_for_manual_review(
-                                    reason=f"Tx reverted on-chain ({tx_hash}) but failed to write state ({err_str})",
-                                    nonce=nonce,
-                                    func_name=func_name,
-                                    tx_hash=tx_hash,
+                                    tx_hash=h,
                                     reason_code="STATE_WRITE_FAILURE",
                                     tx_hashes=broadcasted_hashes
                                 )
                                 return TxResult(
                                     status=TxExecutionStatus.UNCERTAIN,
-                                    tx_hash=tx_hash,
+                                    tx_hash=h,
+                                    nonce=nonce,
+                                    error=f"Tx confirmed on-chain but failed to write state: {err_str}",
+                                    context=self.manual_review_context
+                                )
+                        return TxResult(
+                            status=TxExecutionStatus.CONFIRMED_SUCCESS,
+                            tx_hash=h,
+                            receipt=receipt,
+                            nonce=nonce
+                        )
+                    else:
+                        self.alert(f"Transaction {h} REVERTED in block {blk}!")
+                        self.current_nonce = nonce + 1
+                        if sm:
+                            try:
+                                sm.record_confirmed_revert(tx_hash=h, block_number=blk, gas_used=used, revert_reason="revert")
+                            except Exception as sm_e:
+                                err_str = format_exception_safe(sm_e)
+                                self.alert(f"Transaction reverted on-chain but failed to save CONFIRMED_REVERT state: {err_str}")
+                                self.lock_for_manual_review(
+                                    reason=f"Tx reverted on-chain ({h}) but failed to write state ({err_str})",
+                                    nonce=nonce,
+                                    func_name=func_name,
+                                    tx_hash=h,
+                                    reason_code="STATE_WRITE_FAILURE",
+                                    tx_hashes=broadcasted_hashes
+                                )
+                                return TxResult(
+                                    status=TxExecutionStatus.UNCERTAIN,
+                                    tx_hash=h,
                                     nonce=nonce,
                                     error=f"Tx reverted on-chain but failed to write state: {err_str}",
                                     context=self.manual_review_context
                                 )
                         return TxResult(
                             status=TxExecutionStatus.CONFIRMED_REVERT,
-                            tx_hash=tx_hash,
+                            tx_hash=h,
                             receipt=receipt,
                             nonce=nonce
                         )
+            return None
 
-                self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
-                if attempt < self.max_retries:
-                    self.alert(
-                        f"Type-2 replacement halted for {func_name} (nonce {nonce}, tx {tx_hash}): "
-                        "legacy single-gasPrice replacement is disabled for EIP-1559 type-2 transactions; manual review required (K3 pending)."
+        total_attempts = 1 + max(0, self.max_retries)
+        for attempt in range(1, total_attempts + 1):
+            if not self.dry_run and sm:
+                try:
+                    sm.record_preparing_to_send(
+                        operation=func_name,
+                        epoch=getattr(self, "current_epoch", "Unknown"),
+                        nonce=nonce,
+                        details=f"Broadcasting type-2 {func_name} with nonce {nonce} (attempt {attempt})",
+                        tx_type=2,
+                        max_fee_per_gas_wei=max_fee_wei,
+                        max_priority_fee_per_gas_wei=priority_fee_wei,
+                        gas_limit=gas_limit,
+                        to_address=target_addr,
+                        value_wei=0,
+                        calldata=calldata,
+                        tx_hashes=broadcasted_hashes,
+                        attempt=attempt,
+                    )
+                except Exception as e:
+                    err_str = sanitize_text(format_exception_safe(e), sensitive_values=[sensitive_password_file] if sensitive_password_file else None)
+                    self.alert(f"Transaction broadcast ABORTED: Failed to write in-flight state before sending: {err_str}")
+                    self.lock_for_manual_review(
+                        reason=f"Failed to persist in-flight state ({err_str})",
+                        nonce=nonce,
+                        func_name=func_name,
+                        reason_code="STATE_WRITE_FAILURE",
+                        tx_hashes=broadcasted_hashes
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        nonce=nonce,
+                        error=f"Failed to persist in-flight state: {err_str}",
+                        context=self.manual_review_context
                     )
 
-            if broadcasted_hashes:
-                rec_res = _check_all_known_receipts()
-                if rec_res:
-                    return rec_res
-            lock_reason = (
-                f"Type-2 transaction unconfirmed after {self.tx_timeout}s; legacy single-gasPrice replacement disabled in K2 (manual review required)"
-                if self.max_retries > 0
-                else f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted"
-            )
-            lock_code = "TYPE2_REPLACEMENT_DISABLED" if self.max_retries > 0 else None
-            self.lock_for_manual_review(
-                reason=lock_reason,
-                nonce=nonce,
-                func_name=func_name,
-                tx_hash=active_tx_hash,
-                reason_code=lock_code,
-                tx_hashes=broadcasted_hashes
-            )
-            return TxResult(
-                status=TxExecutionStatus.PENDING_UNCONFIRMED,
-                tx_hash=active_tx_hash,
-                nonce=nonce,
-                error=lock_reason,
-                context=self.manual_review_context
-            )
-        finally:
-            if not self.dry_run and sm and getattr(self, "_domain_lock_acquired", False):
-                sm.release_lock()
-                self._domain_lock_acquired = False
+            tx_hash, raw_err, is_timeout = broadcast_fn(attempt, max_fee_wei, priority_fee_wei)
 
+            if raw_err:
+                err_str = sanitize_text(raw_err, sensitive_values=[sensitive_password_file] if sensitive_password_file else None)
+                if is_timeout:
+                    self.alert(f"Broadcast timed out on attempt {attempt}: {err_str}")
+                    if broadcasted_hashes:
+                        rec_res = _check_all_known_receipts()
+                        if rec_res:
+                            return rec_res
+                    self.lock_for_manual_review(
+                        reason=f"Broadcast timed out during execution ({err_str})",
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=active_tx_hash,
+                        reason_code="UNCERTAIN_BROADCAST_RESULT",
+                        tx_hashes=broadcasted_hashes
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=active_tx_hash,
+                        nonce=nonce,
+                        error=err_str,
+                        context=self.manual_review_context
+                    )
+
+                is_underpriced = "replacement underpriced" in err_str.lower() or "replacement transaction underpriced" in err_str.lower()
+                is_nonce_err = "nonce too low" in err_str.lower() or "already known" in err_str.lower()
+
+                if is_underpriced:
+                    if broadcasted_hashes:
+                        rec_res = _check_all_known_receipts()
+                        if rec_res:
+                            return rec_res
+                    self.log("WARN", f"Broadcast rejected: replacement underpriced on attempt {attempt}: {err_str}")
+                    if attempt >= total_attempts:
+                        self.lock_for_manual_review(
+                            reason=f"Replacement underpriced on attempt {attempt} and retries exhausted ({err_str})",
+                            nonce=nonce,
+                            func_name=func_name,
+                            tx_hash=active_tx_hash,
+                            reason_code="REPLACEMENT_UNDERPRICED_FAILED",
+                            tx_hashes=broadcasted_hashes
+                        )
+                        return TxResult(
+                            status=TxExecutionStatus.UNCERTAIN,
+                            tx_hash=active_tx_hash,
+                            nonce=nonce,
+                            error=err_str,
+                            context=self.manual_review_context
+                        )
+                    recon = self.reconcile_pre_replacement(
+                        func_name=func_name,
+                        target_addr=target_addr,
+                        calldata=calldata,
+                        nonce=nonce,
+                        gas_limit=gas_limit,
+                        current_max_fee=max_fee_wei,
+                        current_priority_fee=priority_fee_wei,
+                        active_tx_hash=active_tx_hash,
+                        broadcasted_hashes=broadcasted_hashes
+                    )
+                    if recon["action"] == "CONFIRMED_RECEIPT":
+                        h = recon["tx_hash"]
+                        rec = recon["receipt"]
+                        blk = recon["block_number"]
+                        used = recon["gas_used"]
+                        if recon["is_success"]:
+                            self.log("SUCCESS", f"Transaction {h} CONFIRMED in block {blk}! Gas used: {used}")
+                            self.current_nonce = nonce + 1
+                            if sm:
+                                sm.record_confirmed_success(tx_hash=h, block_number=blk, gas_used=used)
+                            return TxResult(status=TxExecutionStatus.CONFIRMED_SUCCESS, tx_hash=h, receipt=rec, nonce=nonce)
+                        else:
+                            self.alert(f"Transaction {h} REVERTED in block {blk}!")
+                            self.current_nonce = nonce + 1
+                            if sm:
+                                sm.record_confirmed_revert(tx_hash=h, block_number=blk, gas_used=used, revert_reason="revert")
+                            return TxResult(status=TxExecutionStatus.CONFIRMED_REVERT, tx_hash=h, receipt=rec, nonce=nonce)
+                    elif recon["action"] == "STOP_LOCK":
+                        self.lock_for_manual_review(
+                            reason=recon["reason"],
+                            nonce=nonce,
+                            func_name=func_name,
+                            tx_hash=active_tx_hash,
+                            reason_code=recon["reason_code"],
+                            tx_hashes=broadcasted_hashes
+                        )
+                        return TxResult(
+                            status=TxExecutionStatus.PENDING_UNCONFIRMED if ("CEILING" in recon["reason_code"] or "BUDGET" in recon["reason_code"] or "DISABLED" in recon["reason_code"]) else TxExecutionStatus.UNCERTAIN,
+                            tx_hash=active_tx_hash,
+                            nonce=nonce,
+                            error=recon["reason"],
+                            context=self.manual_review_context
+                        )
+                    elif recon["action"] == "PROCEED":
+                        max_fee_wei = recon["max_fee_wei"]
+                        priority_fee_wei = recon["priority_fee_wei"]
+                        continue
+
+                elif is_nonce_err:
+                    if broadcasted_hashes:
+                        rec_res = _check_all_known_receipts()
+                        if rec_res:
+                            return rec_res
+                    diag_latest = None
+                    try:
+                        res_l = rpc_call(self.rpc_url, "eth_getTransactionCount", [self.keeper_address, "latest"])
+                        diag_latest = int(res_l, 16) if isinstance(res_l, str) and res_l.startswith("0x") else int(res_l)
+                    except Exception:
+                        pass
+                    if diag_latest is not None and diag_latest > nonce:
+                        lock_code = "NONCE_CONSUMED_UNATTRIBUTED"
+                        lock_reason = f"Nonce {nonce} consumed on-chain (latest={diag_latest}) but receipt unattributed after {err_str}"
+                    else:
+                        lock_code = "NONCE_TOO_LOW_UNRECONCILED"
+                        lock_reason = f"RPC reported nonce too low on attempt {attempt}: {err_str}"
+                    self.lock_for_manual_review(
+                        reason=lock_reason,
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=active_tx_hash,
+                        reason_code=lock_code,
+                        tx_hashes=broadcasted_hashes
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=active_tx_hash,
+                        nonce=nonce,
+                        error=err_str,
+                        context=self.manual_review_context
+                    )
+
+                else:
+                    if broadcasted_hashes:
+                        rec_res = _check_all_known_receipts()
+                        if rec_res:
+                            return rec_res
+                    self.lock_for_manual_review(
+                        reason=f"Broadcast failed on attempt {attempt}: {err_str}",
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=active_tx_hash,
+                        reason_code=None,
+                        tx_hashes=broadcasted_hashes
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=active_tx_hash,
+                        nonce=nonce,
+                        error=err_str,
+                        context=self.manual_review_context
+                    )
+
+            # Broadcast succeeded
+            active_tx_hash = tx_hash
+            if tx_hash not in broadcasted_hashes:
+                broadcasted_hashes.append(tx_hash)
+            if sm:
+                try:
+                    sm.record_broadcasted(tx_hash)
+                except Exception as sm_e:
+                    err_str = format_exception_safe(sm_e)
+                    self.alert(f"Failed to record broadcasted txHash {tx_hash} to state file: {err_str}")
+                    self.lock_for_manual_review(
+                        reason=f"Broadcasted txHash {tx_hash} could not be persisted to state ({err_str})",
+                        nonce=nonce,
+                        func_name=func_name,
+                        tx_hash=tx_hash,
+                        reason_code="STATE_WRITE_FAILURE",
+                        tx_hashes=broadcasted_hashes
+                    )
+                    return TxResult(
+                        status=TxExecutionStatus.UNCERTAIN,
+                        tx_hash=tx_hash,
+                        nonce=nonce,
+                        error=err_str,
+                        context=self.manual_review_context
+                    )
+            self.log("TX", f"Broadcasted type-2 {func_name} txHash={tx_hash} (nonce={nonce}, maxFee={max_fee_wei} wei, priorityFee={priority_fee_wei} wei, attempt={attempt})")
+
+            receipt = self.wait_for_receipt(tx_hash, self.tx_timeout)
+            if receipt:
+                st_r = receipt.get("status")
+                blk = int(receipt.get("blockNumber", "0x0"), 16) if isinstance(receipt.get("blockNumber"), str) else receipt.get("blockNumber")
+                used = int(receipt.get("gasUsed", "0x0"), 16) if isinstance(receipt.get("gasUsed"), str) else receipt.get("gasUsed")
+                if st_r in ("0x1", 1, True):
+                    self.log("SUCCESS", f"Transaction {tx_hash} CONFIRMED in block {blk}! Gas used: {used}")
+                    self.current_nonce = nonce + 1
+                    if sm:
+                        try:
+                            sm.record_confirmed_success(tx_hash=tx_hash, block_number=blk, gas_used=used)
+                        except Exception as sm_e:
+                            err_str = format_exception_safe(sm_e)
+                            self.alert(f"Transaction confirmed on-chain but failed to save CONFIRMED_SUCCESS state: {err_str}")
+                            self.lock_for_manual_review(
+                                reason=f"Tx confirmed on-chain ({tx_hash}) but failed to write state ({err_str})",
+                                nonce=nonce,
+                                func_name=func_name,
+                                tx_hash=tx_hash,
+                                reason_code="STATE_WRITE_FAILURE",
+                                tx_hashes=broadcasted_hashes
+                            )
+                            return TxResult(
+                                status=TxExecutionStatus.UNCERTAIN,
+                                tx_hash=tx_hash,
+                                nonce=nonce,
+                                error=f"Tx confirmed on-chain but failed to write state: {err_str}",
+                                context=self.manual_review_context
+                            )
+                    return TxResult(
+                        status=TxExecutionStatus.CONFIRMED_SUCCESS,
+                        tx_hash=tx_hash,
+                        receipt=receipt,
+                        nonce=nonce
+                    )
+                else:
+                    self.alert(f"Transaction {tx_hash} REVERTED in block {blk}!")
+                    self.current_nonce = nonce + 1
+                    if sm:
+                        try:
+                            sm.record_confirmed_revert(tx_hash=tx_hash, block_number=blk, gas_used=used, revert_reason="revert")
+                        except Exception as sm_e:
+                            err_str = format_exception_safe(sm_e)
+                            self.alert(f"Transaction reverted on-chain but failed to save CONFIRMED_REVERT state: {err_str}")
+                            self.lock_for_manual_review(
+                                reason=f"Tx reverted on-chain ({tx_hash}) but failed to write state ({err_str})",
+                                nonce=nonce,
+                                func_name=func_name,
+                                tx_hash=tx_hash,
+                                reason_code="STATE_WRITE_FAILURE",
+                                tx_hashes=broadcasted_hashes
+                            )
+                            return TxResult(
+                                status=TxExecutionStatus.UNCERTAIN,
+                                tx_hash=tx_hash,
+                                nonce=nonce,
+                                error=f"Tx reverted on-chain but failed to write state: {err_str}",
+                                context=self.manual_review_context
+                            )
+                    return TxResult(
+                        status=TxExecutionStatus.CONFIRMED_REVERT,
+                        tx_hash=tx_hash,
+                        receipt=receipt,
+                        nonce=nonce
+                    )
+
+            self.log("TIMEOUT", f"Transaction {tx_hash} not confirmed within {self.tx_timeout}s.")
+            if attempt >= total_attempts:
+                if broadcasted_hashes:
+                    rec_res = _check_all_known_receipts()
+                    if rec_res:
+                        return rec_res
+                lock_reason = (
+                    f"Transaction unconfirmed after all {self.max_retries} speed-up attempts exhausted"
+                    if self.max_retries > 0
+                    else f"Transaction unconfirmed after {self.tx_timeout}s"
+                )
+                lock_code = "MAX_RETRIES_EXCEEDED" if self.max_retries > 0 else None
+                self.lock_for_manual_review(
+                    reason=lock_reason,
+                    nonce=nonce,
+                    func_name=func_name,
+                    tx_hash=active_tx_hash,
+                    reason_code=lock_code,
+                    tx_hashes=broadcasted_hashes
+                )
+                return TxResult(
+                    status=TxExecutionStatus.PENDING_UNCONFIRMED,
+                    tx_hash=active_tx_hash,
+                    nonce=nonce,
+                    error=lock_reason,
+                    context=self.manual_review_context
+                )
+
+            if not getattr(self, "replacement_enabled", False) or self.replacement_max_fee_wei is None:
+                if broadcasted_hashes:
+                    rec_res = _check_all_known_receipts()
+                    if rec_res:
+                        return rec_res
+                lock_reason = (
+                    f"Type-2 transaction unconfirmed after {self.tx_timeout}s; legacy single-gasPrice replacement disabled in K2 (manual review required)"
+                )
+                self.lock_for_manual_review(
+                    reason=lock_reason,
+                    nonce=nonce,
+                    func_name=func_name,
+                    tx_hash=active_tx_hash,
+                    reason_code="TYPE2_REPLACEMENT_DISABLED",
+                    tx_hashes=broadcasted_hashes
+                )
+                return TxResult(
+                    status=TxExecutionStatus.PENDING_UNCONFIRMED,
+                    tx_hash=active_tx_hash,
+                    nonce=nonce,
+                    error=lock_reason,
+                    context=self.manual_review_context
+                )
+
+            recon = self.reconcile_pre_replacement(
+                func_name=func_name,
+                target_addr=target_addr,
+                calldata=calldata,
+                nonce=nonce,
+                gas_limit=gas_limit,
+                current_max_fee=max_fee_wei,
+                current_priority_fee=priority_fee_wei,
+                active_tx_hash=active_tx_hash,
+                broadcasted_hashes=broadcasted_hashes
+            )
+            if recon["action"] == "CONFIRMED_RECEIPT":
+                h = recon["tx_hash"]
+                rec = recon["receipt"]
+                blk = recon["block_number"]
+                used = recon["gas_used"]
+                if recon["is_success"]:
+                    self.log("SUCCESS", f"Transaction {h} CONFIRMED in block {blk}! Gas used: {used}")
+                    self.current_nonce = nonce + 1
+                    if sm:
+                        sm.record_confirmed_success(tx_hash=h, block_number=blk, gas_used=used)
+                    return TxResult(status=TxExecutionStatus.CONFIRMED_SUCCESS, tx_hash=h, receipt=rec, nonce=nonce)
+                else:
+                    self.alert(f"Transaction {h} REVERTED in block {blk}!")
+                    self.current_nonce = nonce + 1
+                    if sm:
+                        sm.record_confirmed_revert(tx_hash=h, block_number=blk, gas_used=used, revert_reason="revert")
+                    return TxResult(status=TxExecutionStatus.CONFIRMED_REVERT, tx_hash=h, receipt=rec, nonce=nonce)
+            elif recon["action"] == "STOP_LOCK":
+                self.lock_for_manual_review(
+                    reason=recon["reason"],
+                    nonce=nonce,
+                    func_name=func_name,
+                    tx_hash=active_tx_hash,
+                    reason_code=recon["reason_code"],
+                    tx_hashes=broadcasted_hashes
+                )
+                return TxResult(
+                    status=TxExecutionStatus.PENDING_UNCONFIRMED if ("CEILING" in recon["reason_code"] or "BUDGET" in recon["reason_code"] or "DISABLED" in recon["reason_code"]) else TxExecutionStatus.UNCERTAIN,
+                    tx_hash=active_tx_hash,
+                    nonce=nonce,
+                    error=recon["reason"],
+                    context=self.manual_review_context
+                )
+            elif recon["action"] == "PROCEED":
+                max_fee_wei = recon["max_fee_wei"]
+                priority_fee_wei = recon["priority_fee_wei"]
+                self.log("RETRY", f"Speeding up type-2 {func_name} (attempt {attempt+1}/{total_attempts}) with nonce={nonce}, bumped maxFee={max_fee_wei} wei, priorityFee={priority_fee_wei} wei")
+                continue
 
     def handle_epoch_seed(self, cur_epoch, seed):
         if seed != 0:
@@ -2367,6 +2869,10 @@ def main():
     parser.add_argument("--gas-multiplier", type=str, default=None, help="Gas price multiplier (default: 1.5)")
     parser.add_argument("--max-fee-per-gas-gwei", type=str, default=None, help="Explicit EIP-1559 maxFeePerGas in gwei")
     parser.add_argument("--priority-fee-per-gas-gwei", type=str, default=None, help="Explicit EIP-1559 maxPriorityFeePerGas in gwei")
+    parser.add_argument("--replacement-max-fee-per-gas-gwei", type=str, default=None, help="Explicit maximum maxFeePerGas in gwei allowed during automatic EIP-1559 replacement (required to enable replacement)")
+    parser.add_argument("--replacement-max-priority-fee-per-gas-gwei", type=str, default=None, help="Explicit maximum maxPriorityFeePerGas in gwei allowed during automatic EIP-1559 replacement")
+    parser.add_argument("--replacement-fee-bump-percent", type=int, default=None, help="Percentage bump for EIP-1559 replacement fees (default: 15)")
+    parser.add_argument("--max-replacement-total-budget-wei", type=str, default=None, help="Explicit maximum total fee budget in wei for replacement (gas_limit * maxFeePerGas)")
     parser.add_argument("--tx-timeout", type=int, default=None, help="Tx confirmation timeout in seconds before speedup (default: 60)")
     parser.add_argument("--max-retries", type=int, default=None, help="Max replacement retries with identical nonce (default: 3)")
     parser.add_argument("--max-seed-steps", type=int, default=None, help=f"Max uninitialized epochs to process per initEpochSeed transaction (default: {MAX_SEED_STEPS}, max: {MAX_SEED_STEPS})")
@@ -2496,6 +3002,26 @@ def main():
         raw_priority_fee = get_cfg("KEEPER_PRIORITY_FEE_PER_GAS_GWEI")
         priority_fee_gwei = raw_priority_fee if (raw_priority_fee is not None and str(raw_priority_fee).strip() != "") else None
 
+    if args.replacement_max_fee_per_gas_gwei is not None:
+        replacement_max_fee_gwei = args.replacement_max_fee_per_gas_gwei
+    else:
+        raw_rep_max = get_cfg("KEEPER_REPLACEMENT_MAX_FEE_PER_GAS_GWEI")
+        replacement_max_fee_gwei = raw_rep_max if (raw_rep_max is not None and str(raw_rep_max).strip() != "") else None
+
+    if args.replacement_max_priority_fee_per_gas_gwei is not None:
+        replacement_max_priority_fee_gwei = args.replacement_max_priority_fee_per_gas_gwei
+    else:
+        raw_rep_prio = get_cfg("KEEPER_REPLACEMENT_MAX_PRIORITY_FEE_PER_GAS_GWEI")
+        replacement_max_priority_fee_gwei = raw_rep_prio if (raw_rep_prio is not None and str(raw_rep_prio).strip() != "") else None
+
+    raw_bump_pct = args.replacement_fee_bump_percent if args.replacement_fee_bump_percent is not None else get_cfg("KEEPER_REPLACEMENT_FEE_BUMP_PERCENT")
+    bump_percent = parse_numeric(raw_bump_pct, int, "--replacement-fee-bump-percent / KEEPER_REPLACEMENT_FEE_BUMP_PERCENT")
+    if bump_percent is None:
+        bump_percent = 15
+
+    raw_total_budget = args.max_replacement_total_budget_wei if args.max_replacement_total_budget_wei is not None else get_cfg("KEEPER_MAX_REPLACEMENT_TOTAL_BUDGET_WEI")
+    total_budget_wei = parse_numeric(raw_total_budget, int, "--max-replacement-total-budget-wei / KEEPER_MAX_REPLACEMENT_TOTAL_BUDGET_WEI")
+
     raw_timeout = args.tx_timeout if args.tx_timeout is not None else get_cfg("KEEPER_TX_TIMEOUT")
     timeout = parse_numeric(raw_timeout, int, "--tx-timeout / KEEPER_TX_TIMEOUT")
     if timeout is None:
@@ -2533,6 +3059,10 @@ def main():
         state_dir=args.state_dir,
         max_fee_per_gas_gwei=max_fee_gwei,
         priority_fee_per_gas_gwei=priority_fee_gwei,
+        replacement_max_fee_gwei=replacement_max_fee_gwei,
+        replacement_max_priority_fee_gwei=replacement_max_priority_fee_gwei,
+        replacement_fee_bump_percent=bump_percent,
+        replacement_max_total_budget_wei=total_budget_wei,
     )
 
     if args.check_lock:

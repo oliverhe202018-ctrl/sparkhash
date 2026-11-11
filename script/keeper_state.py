@@ -494,7 +494,7 @@ class KeeperStateManager:
             tx_hashes.append(clean_hash)
 
         preserved_meta = {}
-        for meta_key in ("tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata"):
+        for meta_key in ("tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata", "attempt"):
             if meta_key in state_data and state_data.get(meta_key) is not None:
                 val = state_data.get(meta_key)
                 preserved_meta[meta_key] = sanitize_state_value(val) if isinstance(val, str) else val
@@ -546,6 +546,8 @@ class KeeperStateManager:
         to_address: Optional[str] = None,
         value_wei: Optional[int] = None,
         calldata: Optional[str] = None,
+        tx_hashes: Optional[List[str]] = None,
+        attempt: Optional[int] = None,
     ):
         """
         Records in-flight state immediately before signing or broadcast.
@@ -555,15 +557,29 @@ class KeeperStateManager:
             raise DomainValidationError("Cannot record state without a valid StateDomain")
 
         now = datetime.now(timezone.utc).isoformat()
+        norm_nonce = int(nonce) if (nonce is not None and str(nonce).isdigit()) else (nonce if nonce is not None else "Unknown")
+        hashes = []
+        if tx_hashes is not None and isinstance(tx_hashes, list):
+            hashes = list(tx_hashes)
+        else:
+            try:
+                prev_state = self.load_state()
+                if isinstance(prev_state, dict):
+                    prev_nonce = prev_state.get("nonce")
+                    if prev_nonce == norm_nonce and isinstance(prev_state.get("tx_hashes"), list):
+                        hashes = list(prev_state.get("tx_hashes"))
+            except Exception:
+                pass
+
         state_data = {
             "version": CURRENT_STATE_VERSION,
             "domain": self.domain.to_dict(),
             "status": "PREPARING_TO_SEND",
             "operation": sanitize_state_value(operation),
             "epoch": epoch if epoch is not None else "Unknown",
-            "nonce": int(nonce) if (nonce is not None and str(nonce).isdigit()) else (nonce if nonce is not None else "Unknown"),
-            "tx_hash": "Unknown",
-            "tx_hashes": [],
+            "nonce": norm_nonce,
+            "tx_hash": hashes[-1] if hashes else "Unknown",
+            "tx_hashes": hashes,
             "reason_code": "PREPARING_TO_SEND",
             "created_at": now,
             "updated_at": now,
@@ -583,6 +599,8 @@ class KeeperStateManager:
             state_data["value"] = int(value_wei)
         if calldata is not None:
             state_data["calldata"] = sanitize_state_value(str(calldata))
+        if attempt is not None:
+            state_data["attempt"] = int(attempt)
         atomic_write_json(self.get_state_path(), state_data)
 
     def record_broadcasted(self, tx_hash: str):
@@ -756,7 +774,7 @@ class KeeperStateManager:
         if isinstance(prev_state, dict) and prev_state.get("status") in ("PREPARING_TO_SEND", "MANUAL_REVIEW_LOCKED"):
             prev_nonce = prev_state.get("nonce")
             if prev_nonce == normalized_nonce or prev_nonce in (None, "Unknown") or normalized_nonce == "Unknown":
-                for meta_key in ("epoch", "tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata"):
+                for meta_key in ("epoch", "tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata", "attempt"):
                     if meta_key in prev_state and prev_state.get(meta_key) is not None:
                         val = prev_state.get(meta_key)
                         preserved_meta[meta_key] = sanitize_state_value(val) if isinstance(val, str) else val
@@ -896,7 +914,7 @@ class KeeperStateManager:
             "reason_code": state_data.get("reason_code"),
             "status": state_data.get("status")
         }
-        for meta_key in ("tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata"):
+        for meta_key in ("tx_type", "max_fee_per_gas_wei", "max_priority_fee_per_gas_wei", "gas_limit", "to", "value", "calldata", "attempt"):
             if meta_key in state_data and state_data.get(meta_key) is not None:
                 ctx[meta_key] = state_data.get(meta_key)
         return ctx
