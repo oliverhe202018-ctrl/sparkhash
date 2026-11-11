@@ -1300,6 +1300,20 @@ class KeeperBot:
             return status in (1, "0x1", "1", True)
         return False
 
+    def _is_tx_success(self, receipt, allow_dry_run=False):
+        if isinstance(receipt, TxResult):
+            if receipt.status == TxExecutionStatus.CONFIRMED_SUCCESS:
+                return True
+            if allow_dry_run and receipt.status == TxExecutionStatus.DRY_RUN:
+                return True
+            return False
+        if isinstance(receipt, dict):
+            if allow_dry_run and receipt.get("dry_run") is True:
+                status = receipt.get("status", 1)
+                return status in (1, "0x1", "1") or status is True
+            return self.is_receipt_successful(receipt)
+        return False
+
     def send_transaction(self, calldata, desc, func_name=None, preflight=True):
         if func_name is None:
             func_name = desc
@@ -2050,20 +2064,20 @@ class KeeperBot:
     def handle_epoch_seed(self, cur_epoch, seed):
         if seed != 0:
             self.log("OK", "Epoch " + str(cur_epoch) + " seed already initialized: " + hex(seed)[:10] + "...")
-            return
+            return True
 
         if self.get_epoch_seed(cur_epoch) != 0:
             self.log("OK", "Epoch " + str(cur_epoch) + " seed already initialized on-chain. Skipping.")
-            return
+            return True
 
         min_e = self.find_earliest_uninitialized_epoch(cur_epoch)
         if min_e > cur_epoch:
             self.log("OK", "Epoch " + str(cur_epoch) + " seed already initialized. Skipping.")
-            return
+            return True
 
         n = cur_epoch - min_e + 1
         if n <= 0:
-            return
+            return True
 
         max_steps = min(int(getattr(self, "max_seed_steps", MAX_SEED_STEPS)), MAX_SEED_STEPS)
         if max_steps <= 0:
@@ -2086,10 +2100,10 @@ class KeeperBot:
                 calldata = "0x" + SELECTOR_INIT_EPOCH_SEED + encode_uint256(cur_epoch) + encode_uint256(max_steps)
                 func_desc = f"initEpochSeed({cur_epoch}, {max_steps})"
                 receipt = self.send_transaction(calldata, func_desc, func_desc)
-                if receipt is None or not (receipt.get("dry_run") or self.is_receipt_successful(receipt)):
+                if not self._is_tx_success(receipt, allow_dry_run=True):
                     self.alert(f"Failed to simulate {func_desc}.")
-                    break
-            return
+                    return False
+            return True
 
         max_allowed_calls = (n + max_steps - 1) // max_steps + 1
         calls_sent = 0
@@ -2098,7 +2112,7 @@ class KeeperBot:
         while calls_sent < max_allowed_calls:
             if self.get_epoch_seed(cur_epoch) != 0:
                 self.log("OK", f"Epoch {cur_epoch} seed is already initialized on-chain. Skipping.")
-                break
+                return True
 
             jitter = random.uniform(0.0, 3.0)
             self.log("ACTION", f"Applying {jitter:.2f}s random jitter before sending initEpochSeed...")
@@ -2109,9 +2123,9 @@ class KeeperBot:
             receipt = self.send_transaction(calldata, func_desc, func_desc)
             calls_sent += 1
 
-            if receipt is None or not self.is_receipt_successful(receipt):
+            if not self._is_tx_success(receipt, allow_dry_run=False):
                 self.alert(f"Failed to confirm {func_desc}. Stopping seed initialization sequence.")
-                break
+                return False
 
             if isinstance(receipt, (dict, TxResult)):
                 logs = receipt.get("receipt", {}).get("logs", []) if isinstance(receipt, TxResult) else receipt.get("logs", [])
@@ -2123,18 +2137,21 @@ class KeeperBot:
             new_cur_seed = self.get_epoch_seed(cur_epoch)
             if new_cur_seed != 0:
                 self.log("OK", f"Epoch {cur_epoch} seed successfully initialized: {hex(new_cur_seed)[:10]}...")
-                break
+                return True
 
             new_min_e = self.find_earliest_uninitialized_epoch(cur_epoch)
             if new_min_e <= prev_min_e:
                 self.alert(f"On-chain state did not advance after confirmed {func_desc} (earliest uninitialized still {new_min_e}, cur_epoch={cur_epoch} seed=0x0). Halting.")
-                break
+                return False
 
             self.log("ACTION", f"Epoch seed initialization progressed: earliest uninitialized epoch advanced from {prev_min_e} to {new_min_e}.")
             prev_min_e = new_min_e
         else:
             if self.get_epoch_seed(cur_epoch) == 0:
                 self.alert(f"Reached maximum allowed seed initialization calls ({max_allowed_calls}) without fully initializing epoch {cur_epoch}. Halting to prevent infinite loop.")
+                return False
+            return True
+        return True
 
     def handle_sync_lag(self, cur_epoch, last_synced):
         if last_synced < cur_epoch:
@@ -2144,15 +2161,18 @@ class KeeperBot:
             calldata = "0x" + SELECTOR_SYNC + encode_uint256(steps)
             func_desc = f"sync({steps})"
             receipt = self.send_transaction(calldata, func_desc, func_desc)
-            if receipt is None or not (receipt.get("dry_run") or self.is_receipt_successful(receipt)):
+            if not self._is_tx_success(receipt, allow_dry_run=self.dry_run):
                 self.alert(f"Failed to confirm {func_desc}.")
+                return False
+            return True
         else:
             self.log("OK", "Sync state up-to-date (lastSynced=" + str(last_synced) + ", currentEpoch=" + str(cur_epoch) + ").")
+            return True
 
     def step(self):
         if getattr(self, "locked_for_manual_review", False):
             self.alert("Keeper is locked pending manual review. Broadcast refused.")
-            return
+            return 1
 
         if not self.dry_run:
             sm = self._ensure_state_manager()
@@ -2163,13 +2183,13 @@ class KeeperBot:
                     if st == "PREPARING_TO_SEND":
                         if not sm.acquire_lock():
                             self.log("INFO", "Another active Keeper process is currently broadcasting (PREPARING_TO_SEND with lock held). Skipping step.")
-                            return
+                            return 1
                         try:
                             updated_state = sm.recover_crash_to_manual_review(state_data)
                             self.locked_for_manual_review = True
                             self.manual_review_context = sm.build_context_from_state(updated_state)
                             self.alert("Keeper is locked pending manual review: crash before confirmation detected from previous run. Broadcast refused.")
-                            return
+                            return 1
                         finally:
                             sm.release_lock()
                     else:
@@ -2177,7 +2197,7 @@ class KeeperBot:
                         if state_data:
                             self.manual_review_context = sm.build_context_from_state(state_data)
                         self.alert(f"Keeper is locked pending manual review: {block_reason}. Broadcast refused.")
-                        return
+                        return 1
         try:
             chain_id = self.get_chain_id()
             cur_epoch, last_synced, seed = self.get_epoch_state()
@@ -2185,12 +2205,16 @@ class KeeperBot:
             if self.dry_run:
                 self.log("DRY-RUN", f"[Context] Target Contract: {self.miner} | On-Chain Epoch: {cur_epoch} | Chain ID: {chain_id}")
             self.log("STATUS", "Current Epoch: " + str(cur_epoch) + " | LastSynced: " + str(last_synced) + " | Seed: " + seed_status)
-            self.handle_epoch_seed(cur_epoch, seed)
-            if getattr(self, "locked_for_manual_review", False):
-                return
-            self.handle_sync_lag(cur_epoch, last_synced)
+            seed_ok = self.handle_epoch_seed(cur_epoch, seed)
+            if getattr(self, "locked_for_manual_review", False) or seed_ok is not True:
+                return 1
+            sync_ok = self.handle_sync_lag(cur_epoch, last_synced)
+            if getattr(self, "locked_for_manual_review", False) or sync_ok is not True:
+                return 1
+            return 0
         except Exception as e:
             self.alert("Failed during keeper inspection: " + format_exception_safe(e))
+            return 1
 
     def run_forever(self):
         mode = "DRY-RUN (Simulated actions only)" if self.dry_run else "LIVE (Broadcasting transactions)"
@@ -2199,11 +2223,17 @@ class KeeperBot:
         while True:
             if getattr(self, "locked_for_manual_review", False):
                 self.alert("Keeper is locked pending manual review. Halting automatic execution.")
-                break
-            self.step()
+                return 1
+            step_code = self.step()
             if getattr(self, "locked_for_manual_review", False):
                 self.alert("Keeper entered locked state during step. Halting automatic execution.")
-                break
+                if isinstance(step_code, int) and not isinstance(step_code, bool) and step_code != 0:
+                    return step_code
+                return 1
+            if not (isinstance(step_code, int) and not isinstance(step_code, bool) and step_code == 0):
+                if isinstance(step_code, int) and not isinstance(step_code, bool) and step_code != 0:
+                    return step_code
+                return 1
             time.sleep(self.poll_interval)
 
 def main():
@@ -2416,9 +2446,15 @@ def main():
             sys.exit(1)
 
     if args.once:
-        bot.step()
+        exec_code = bot.step()
     else:
-        bot.run_forever()
+        exec_code = bot.run_forever()
+    if isinstance(exec_code, int) and not isinstance(exec_code, bool):
+        if exec_code == 0:
+            return 0
+        if 1 <= exec_code <= 255:
+            return exec_code
+    return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

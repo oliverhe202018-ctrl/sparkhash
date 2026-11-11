@@ -639,12 +639,13 @@ class TestKeeperExplicitRpcAndNoEnv(unittest.TestCase):
             "MINER_ADDRESS": "0x420382a0f874c1f120621f847d81581e8737504e"
         }
         mock_bot_instance = MagicMock()
+        mock_bot_instance.step.return_value = 0
         mock_bot_cls.return_value = mock_bot_instance
 
         test_args = ["keeper.py", "--rpc-url", "https://explicit-rpc.example.com", "--dry-run", "--once"]
         with patch.object(sys, "argv", test_args):
             from script.keeper import main
-            main()
+            self.assertEqual(main(), 0)
 
         mock_bot_cls.assert_called_once()
         call_kwargs = mock_bot_cls.call_args[1]
@@ -656,6 +657,7 @@ class TestKeeperExplicitRpcAndNoEnv(unittest.TestCase):
     def test_no_env_never_loads_env_file(self, mock_load_env, mock_bot_cls):
         """2. Under --no-env, load_env is never called for default .env or --env-file."""
         mock_bot_instance = MagicMock()
+        mock_bot_instance.step.return_value = 0
         mock_bot_cls.return_value = mock_bot_instance
 
         test_args = [
@@ -702,12 +704,13 @@ class TestKeeperExplicitRpcAndNoEnv(unittest.TestCase):
             "MINER_ADDRESS": "0x420382a0f874c1f120621f847d81581e8737504e"
         }
         mock_bot_instance = MagicMock()
+        mock_bot_instance.step.return_value = 0
         mock_bot_cls.return_value = mock_bot_instance
 
         test_args = ["keeper.py", "--dry-run", "--once"]
         with patch.object(sys, "argv", test_args):
             from script.keeper import main
-            main()
+            self.assertEqual(main(), 0)
 
         mock_load_env.assert_called_once_with(".env")
         mock_bot_cls.assert_called_once()
@@ -846,12 +849,13 @@ class TestKeeperExplicitRpcAndNoEnv(unittest.TestCase):
         """9. --once flag executes a single inspection step and exits cleanly without entering run_forever."""
         mock_load_env.return_value = {"MINER_ADDRESS": "0x420382a0f874c1f120621f847d81581e8737504e"}
         mock_bot_instance = MagicMock()
+        mock_bot_instance.step.return_value = 0
         mock_bot_cls.return_value = mock_bot_instance
 
         test_args = ["keeper.py", "--rpc-url", "https://mock-rpc", "--dry-run", "--once"]
         with patch.object(sys, "argv", test_args):
             from script.keeper import main
-            main()
+            self.assertEqual(main(), 0)
 
         mock_bot_instance.step.assert_called_once()
         mock_bot_instance.run_forever.assert_not_called()
@@ -1165,13 +1169,14 @@ class TestKeeperBoundaryCorrections(unittest.TestCase):
             "KEEPER_MAX_RETRIES": "5"
         }
         mock_bot_instance = MagicMock()
+        mock_bot_instance.step.return_value = 0
         mock_bot_cls.return_value = mock_bot_instance
 
         # 1. Explicit --max-retries 0 must be preserved as 0
         test_args_zero = ["keeper.py", "--rpc-url", "http://mock-rpc", "--dry-run", "--once", "--max-retries", "0"]
         with patch.object(sys, "argv", test_args_zero):
             from script.keeper import main
-            main()
+            self.assertEqual(main(), 0)
 
         mock_bot_cls.assert_called_once()
         self.assertEqual(mock_bot_cls.call_args[1]["max_retries"], 0)
@@ -1596,6 +1601,7 @@ class TestFoundryKeystoreIntegration(unittest.TestCase):
     def test_no_env_does_not_load_env_file(self, mock_bot_cls, mock_load_env):
         """--no-env strictly prevents calling load_env and reading .env."""
         mock_load_env.side_effect = AssertionError("load_env must NEVER be called when --no-env is specified!")
+        mock_bot_cls.return_value.step.return_value = 0
 
         test_args = [
             "keeper.py",
@@ -1607,7 +1613,7 @@ class TestFoundryKeystoreIntegration(unittest.TestCase):
             "--once"
         ]
         with patch.object(sys, "argv", test_args):
-            main()
+            self.assertEqual(main(), 0)
 
         mock_load_env.assert_not_called()
         mock_bot_cls.assert_called_once()
@@ -4499,3 +4505,351 @@ class TestKeeperReconciliationAndFaultMitigations(unittest.TestCase):
             with open(sm_bot.get_audit_path(), "r", encoding="utf-8") as f:
                 audits = [json.loads(line) for line in f if line.strip()]
             self.assertEqual(audits[-1]["onchain_snapshot"]["tx_receipts"][tx_h]["status"], "0x1")
+
+
+class TestKeeperExitCodePropagation(unittest.TestCase):
+    MINER = "0x420382a0f874c1F120621f847d81581e8737504e"
+    SENDER = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+
+    def _make_bot(self, tmp_dir, dry_run=False):
+        from script.keeper import KeeperBot
+
+        dummy_pw = os.path.join(tmp_dir, "dummy_pw.txt")
+        if not os.path.exists(dummy_pw):
+            with open(dummy_pw, "w", encoding="utf-8") as f:
+                f.write("dummy\n")
+
+        def rpc_side_effect(url, method, params):
+            if method == "eth_getCode":
+                return "0x6080604052"
+            if method == "eth_chainId":
+                return "0x61"
+            return None
+
+        with patch("script.keeper.rpc_call", side_effect=rpc_side_effect), \
+             patch.object(KeeperBot, "derive_keystore_address", return_value=self.SENDER):
+            return KeeperBot(
+                rpc_url="http://mock-rpc",
+                miner_address=self.MINER,
+                account=None if dry_run else "mock-acct",
+                password_file=None if dry_run else dummy_pw,
+                keeper_address=self.SENDER,
+                dry_run=dry_run,
+                poll_interval=1,
+                state_dir=tmp_dir,
+            )
+
+    def test_step_normal_noop_returns_zero(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = self._make_bot(tmp_dir, dry_run=False)
+            bot.get_chain_id = lambda: 97
+            bot.get_epoch_state = lambda: (10, 10, 0x1234)
+            bot.send_transaction = MagicMock()
+
+            self.assertEqual(bot.step(), 0)
+            bot.send_transaction.assert_not_called()
+
+    def test_step_confirmed_success_returns_zero(self):
+        from script.keeper import TxExecutionStatus, TxResult
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = self._make_bot(tmp_dir, dry_run=False)
+            bot.get_chain_id = lambda: 97
+            bot.get_epoch_state = lambda: (10, 8, 0)
+            bot.get_epoch_seed = MagicMock(side_effect=[0, 0, 0xABCD])
+            bot.find_earliest_uninitialized_epoch = MagicMock(return_value=10)
+            bot.send_transaction = MagicMock(
+                return_value=TxResult(
+                    TxExecutionStatus.CONFIRMED_SUCCESS,
+                    tx_hash="0x" + "1" * 64,
+                    receipt={"status": "0x1", "logs": []},
+                    nonce=0,
+                )
+            )
+
+            with patch("time.sleep"):
+                self.assertEqual(bot.step(), 0)
+            self.assertEqual(bot.send_transaction.call_count, 2)
+
+    def test_step_failure_statuses_return_nonzero_and_block_subsequent_sync(self):
+        from script.keeper import TxExecutionStatus, TxResult
+
+        failure_statuses = [
+            TxExecutionStatus.UNCERTAIN,
+            TxExecutionStatus.PENDING_UNCONFIRMED,
+            TxExecutionStatus.CONFIRMED_REVERT,
+            TxExecutionStatus.PREFLIGHT_FAILURE,
+        ]
+        for status in failure_statuses:
+            with self.subTest(phase="seed", status=status.value):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    bot = self._make_bot(tmp_dir, dry_run=False)
+                    bot.get_chain_id = lambda: 97
+                    bot.get_epoch_state = lambda: (10, 8, 0)
+                    bot.get_epoch_seed = MagicMock(return_value=0)
+                    bot.find_earliest_uninitialized_epoch = MagicMock(return_value=10)
+                    bot.send_transaction = MagicMock(
+                        return_value=TxResult(status, tx_hash="0x" + "2" * 64, error="failed")
+                    )
+                    bot.handle_sync_lag = MagicMock(wraps=bot.handle_sync_lag)
+
+                    with patch("time.sleep"):
+                        code = bot.step()
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(bot.send_transaction.call_count, 1)
+                    bot.handle_sync_lag.assert_not_called()
+
+            with self.subTest(phase="sync", status=status.value):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    bot = self._make_bot(tmp_dir, dry_run=False)
+                    bot.get_chain_id = lambda: 97
+                    bot.get_epoch_state = lambda: (10, 8, 0xABCD)
+                    bot.send_transaction = MagicMock(
+                        return_value=TxResult(status, tx_hash="0x" + "3" * 64, error="failed")
+                    )
+
+                    code = bot.step()
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(bot.send_transaction.call_count, 1)
+
+    def test_step_manual_review_locked_returns_nonzero(self):
+        from script.keeper_state import KeeperStateManager, StateDomain
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            domain = StateDomain(chain_id=97, miner_address=self.MINER, sender_address=self.SENDER)
+            sm = KeeperStateManager(tmp_dir, domain)
+            sm.record_manual_review_lock(
+                reason="Ambiguous broadcast",
+                nonce=0,
+                operation="initEpochSeed(10, 5)",
+                tx_hash="0x" + "a" * 64,
+            )
+
+            bot = self._make_bot(tmp_dir, dry_run=False)
+            bot.get_chain_id = lambda: 97
+            bot.send_transaction = MagicMock()
+
+            with patch("script.keeper.rpc_call", return_value="0x61"):
+                code = bot.step()
+            self.assertNotEqual(code, 0)
+            self.assertTrue(bot.locked_for_manual_review)
+            bot.send_transaction.assert_not_called()
+
+            # Subsequent step while locked in memory must also stay non-zero
+            self.assertNotEqual(bot.step(), 0)
+
+    def test_step_caught_exception_returns_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = self._make_bot(tmp_dir, dry_run=True)
+            bot.get_chain_id = lambda: 97
+            bot.get_epoch_state = MagicMock(side_effect=RuntimeError("rpc exploded"))
+
+            self.assertNotEqual(bot.step(), 0)
+
+    def test_step_rejects_unknown_and_magicmock_tx_results(self):
+        for bad_result in (MagicMock(), None, True, False, 1, "ok"):
+            with self.subTest(bad_result=type(bad_result).__name__):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    bot = self._make_bot(tmp_dir, dry_run=False)
+                    bot.get_chain_id = lambda: 97
+                    bot.get_epoch_state = lambda: (10, 8, 0xABCD)
+                    bot.send_transaction = MagicMock(return_value=bad_result)
+
+                    self.assertNotEqual(bot.step(), 0)
+
+    def test_run_forever_halts_and_returns_nonzero_on_failure_or_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = self._make_bot(tmp_dir, dry_run=False)
+            bot.step = MagicMock(side_effect=[0, 1])
+            with patch("time.sleep") as mock_sleep:
+                code = bot.run_forever()
+            self.assertNotEqual(code, 0)
+            self.assertEqual(bot.step.call_count, 2)
+            mock_sleep.assert_called_once()
+
+        for bad_step in (MagicMock(), None, False, True):
+            with self.subTest(bad_step=type(bad_step).__name__):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    bot = self._make_bot(tmp_dir, dry_run=False)
+                    bot.step = MagicMock(return_value=bad_step)
+                    with patch("time.sleep") as mock_sleep:
+                        code = bot.run_forever()
+                    self.assertNotEqual(code, 0)
+                    mock_sleep.assert_not_called()
+
+    @patch("script.keeper.KeeperBot")
+    def test_main_propagates_and_validates_exit_codes(self, mock_bot_cls):
+        from script.keeper import main
+
+        base_args = [
+            "keeper.py",
+            "--no-env",
+            "--rpc-url", "http://127.0.0.1:8545",
+            "--miner-address", self.MINER,
+            "--dry-run",
+            "--once",
+        ]
+        mock_bot_cls.return_value.step.return_value = 0
+        with patch.object(sys, "argv", base_args):
+            self.assertEqual(main(), 0)
+
+        for bad_code in (1, 2, 256, -1, None, False, True, MagicMock()):
+            with self.subTest(bad_code=repr(bad_code)):
+                mock_bot_cls.return_value.step.return_value = bad_code
+                with patch.object(sys, "argv", base_args):
+                    self.assertNotEqual(main(), 0)
+
+        loop_args = [a for a in base_args if a != "--once"]
+        mock_bot_cls.return_value.run_forever.return_value = 1
+        with patch.object(sys, "argv", loop_args):
+            self.assertNotEqual(main(), 0)
+
+    def test_cli_entrypoint_propagates_exit_codes_offline(self):
+        import subprocess
+        from script.keeper_state import KeeperStateManager, StateDomain
+
+        runner_code = (
+            "import argparse, inspect, json, runpy, sys, urllib.request\n"
+            "from unittest.mock import MagicMock\n"
+            "mode = sys.argv[1]\n"
+            "cli_args = sys.argv[2:]\n"
+            "def fake_urlopen(req, timeout=None):\n"
+            "    payload = json.loads(req.data.decode('utf-8'))\n"
+            "    method = payload.get('method')\n"
+            "    if method == 'eth_getCode':\n"
+            "        res = '0x6080604052'\n"
+            "    elif method == 'eth_chainId':\n"
+            "        if mode == 'step_exc':\n"
+            "            raise RuntimeError('offline rpc error')\n"
+            "        res = '0x61'\n"
+            "    else:\n"
+            "        res = '0x0'\n"
+            "    resp = MagicMock()\n"
+            "    resp.read.return_value = json.dumps({'jsonrpc': '2.0', 'id': payload.get('id', 1), 'result': res}).encode('utf-8')\n"
+            "    resp.__enter__ = lambda s: s\n"
+            "    resp.__exit__ = lambda s, *a: False\n"
+            "    return resp\n"
+            "urllib.request.urlopen = fake_urlopen\n"
+            "orig_parse = argparse.ArgumentParser.parse_args\n"
+            "patched = False\n"
+            "def hook_parse(self, args=None, namespace=None):\n"
+            "    global patched\n"
+            "    if not patched:\n"
+            "        patched = True\n"
+            "        g = inspect.currentframe().f_back.f_globals\n"
+            "        cls = g['KeeperBot']\n"
+            "        TxRes = g['TxResult']\n"
+            "        TxSt = g['TxExecutionStatus']\n"
+            "        cls.derive_keystore_address = lambda s: '0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A'\n"
+            "        if mode == 'noop':\n"
+            "            cls.get_chain_id = lambda s: 97\n"
+            "            cls.get_epoch_state = lambda s: (10, 10, 0x1234)\n"
+            "        elif mode == 'confirmed':\n"
+            "            cls.get_chain_id = lambda s: 97\n"
+            "            cls.get_epoch_state = lambda s: (10, 9, 0x1234)\n"
+            "            cls.send_transaction = lambda s, *a, **kw: TxRes(TxSt.CONFIRMED_SUCCESS, tx_hash='0x' + '1' * 64, receipt={'status': '0x1', 'logs': []}, nonce=0)\n"
+            "        elif mode == 'uncertain':\n"
+            "            cls.get_chain_id = lambda s: 97\n"
+            "            cls.get_epoch_state = lambda s: (10, 9, 0x1234)\n"
+            "            cls.send_transaction = lambda s, *a, **kw: TxRes(TxSt.UNCERTAIN, tx_hash='0x' + '2' * 64, error='timeout')\n"
+            "        elif mode == 'step_exc':\n"
+            "            cls.get_chain_id = lambda s: 97\n"
+            "            def raise_in_step(s):\n"
+            "                print('STEP_EXC_SENTINEL', flush=True)\n"
+            "                raise RuntimeError('step_exc_injected_failure')\n"
+            "            cls.get_epoch_state = raise_in_step\n"
+            "    return orig_parse(self, args=args, namespace=namespace)\n"
+            "if mode in ('noop', 'confirmed', 'uncertain', 'step_exc', 'locked'):\n"
+            "    argparse.ArgumentParser.parse_args = hook_parse\n"
+            "sys.argv = ['script/keeper.py'] + cli_args\n"
+            "runpy.run_path('script/keeper.py', run_name='__main__')\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dummy_pw = os.path.join(tmp_dir, "dummy_pw.txt")
+            with open(dummy_pw, "w", encoding="utf-8") as f:
+                f.write("dummy\n")
+            common = [
+                "--no-env",
+                "--rpc-url", "http://127.0.0.1:8545",
+                "--miner-address", self.MINER,
+                "--keeper-address", self.SENDER,
+                "--state-dir", tmp_dir,
+                "--once",
+            ]
+            live_auth = ["--account", "mock-acct", "--password-file", dummy_pw]
+            p_noop = subprocess.run(
+                [sys.executable, "-c", runner_code, "noop", "--dry-run"] + common,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(p_noop.returncode, 0, msg=p_noop.stderr + p_noop.stdout)
+
+            p_ok = subprocess.run(
+                [sys.executable, "-c", runner_code, "confirmed"] + live_auth + common,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(p_ok.returncode, 0, msg=p_ok.stderr + p_ok.stdout)
+
+            p_unc = subprocess.run(
+                [sys.executable, "-c", runner_code, "uncertain"] + live_auth + common,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(p_unc.returncode, 0, msg=p_unc.stderr + p_unc.stdout)
+
+            p_exc = subprocess.run(
+                [sys.executable, "-c", runner_code, "step_exc", "--dry-run"] + common,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(p_exc.returncode, 1, msg=p_exc.stderr + p_exc.stdout)
+            self.assertIn("STEP_EXC_SENTINEL", p_exc.stdout)
+            self.assertIn("Failed during keeper inspection", p_exc.stdout + p_exc.stderr)
+            self.assertIn("step_exc_injected_failure", p_exc.stdout + p_exc.stderr)
+
+            domain = StateDomain(chain_id=97, miner_address=self.MINER, sender_address=self.SENDER)
+            sm = KeeperStateManager(tmp_dir, domain)
+            sm.record_manual_review_lock(
+                reason="Pending manual check",
+                nonce=0,
+                operation="sync(1)",
+                tx_hash="0x" + "b" * 64,
+            )
+            p_lock = subprocess.run(
+                [sys.executable, "-c", runner_code, "locked"] + live_auth + common,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(p_lock.returncode, 1, msg=p_lock.stderr + p_lock.stdout)
+            self.assertIn("locked pending manual review", p_lock.stdout + p_lock.stderr)
+
+    def test_dry_run_sync_lag_succeeds_in_step_and_main(self):
+        from script.keeper import KeeperBot, TxExecutionStatus, TxResult, main
+
+        dry_result = TxResult(TxExecutionStatus.DRY_RUN, dry_run=True)
+        self.assertFalse(bool(dry_result))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bot = self._make_bot(tmp_dir, dry_run=True)
+            bot.get_chain_id = lambda: 97
+            bot.get_epoch_state = lambda: (10, 8, 0xABCD)
+            bot.send_transaction = MagicMock(return_value=dry_result)
+
+            self.assertTrue(bot.handle_sync_lag(10, 8))
+            self.assertEqual(bot.step(), 0)
+            self.assertEqual(bot.send_transaction.call_count, 2)
+
+            cli_args = [
+                "keeper.py",
+                "--no-env",
+                "--rpc-url", "http://127.0.0.1:8545",
+                "--miner-address", self.MINER,
+                "--keeper-address", self.SENDER,
+                "--state-dir", tmp_dir,
+                "--dry-run",
+                "--once",
+            ]
+            with patch.object(sys, "argv", cli_args), \
+                 patch("script.keeper.rpc_call", return_value="0x6080604052"), \
+                 patch.object(KeeperBot, "get_chain_id", return_value=97), \
+                 patch.object(KeeperBot, "get_epoch_state", return_value=(10, 8, 0xABCD)), \
+                 patch.object(KeeperBot, "send_transaction", return_value=dry_result) as mock_send:
+                self.assertEqual(main(), 0)
+                mock_send.assert_called_once()
