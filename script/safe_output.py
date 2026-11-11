@@ -119,8 +119,12 @@ def _collect_secrets(sensitive_values: Any, known_secrets: Any) -> set:
                 continue
             secrets_to_mask.add(clean_secret)
             if "/" in clean_secret or "\\" in clean_secret:
-                secrets_to_mask.add(clean_secret.replace("\\", "/"))
-                secrets_to_mask.add(clean_secret.replace("/", "\\"))
+                forward_path = clean_secret.replace("\\", "/")
+                backward_path = clean_secret.replace("/", "\\")
+                secrets_to_mask.add(forward_path)
+                secrets_to_mask.add(backward_path)
+                # Python OSError.__str__ and repr() double backslashes on Windows paths.
+                secrets_to_mask.add(backward_path.replace("\\", "\\\\"))
             # Deliberate divergence from script/keeper.py:
             # For explicit 64-hex private keys passed via sensitive_values, mask both
             # 0x-prefixed and unprefixed representations (keeper.py only did this in register_secret).
@@ -219,6 +223,17 @@ def sanitize_text(text: str, sensitive_values: Any = None, known_secrets: Any = 
     return sanitized
 
 
+def _is_cast_executable_name(filename: Any) -> bool:
+    if not filename:
+        return False
+    if isinstance(filename, os.PathLike):
+        filename = os.fspath(filename)
+    if not isinstance(filename, str):
+        return False
+    basename = filename.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].strip().lower()
+    return basename in ("cast", "cast.exe")
+
+
 def format_exception_safe(exc: Any, sensitive_values: Any = None) -> str:
     """
     Format an exception as "<ExceptionType>: <sanitized message>" without leaking raw URLs,
@@ -227,6 +242,9 @@ def format_exception_safe(exc: Any, sensitive_values: Any = None) -> str:
     Deliberate differences from script/keeper.py:
     - Accepts optional `sensitive_values` directly so callers do not need to wrap calls in
       a second `sanitize_text(...)`.
+    - Only formats `FileNotFoundError` as `FileNotFoundError(cast)` when `exc.filename` is
+      the `cast` executable (`cast` / `cast.exe`); ordinary missing files preserve their
+      sanitized message (with `sensitive_values` applied to mask password file paths).
     - Guards empty whitespace `SubprocessError.cmd` and `None` `__module__` attributes.
     """
     if exc is None:
@@ -234,7 +252,12 @@ def format_exception_safe(exc: Any, sensitive_values: Any = None) -> str:
     if not isinstance(exc, Exception):
         return sanitize_text(str(exc), sensitive_values=sensitive_values)
     exc_type = type(exc).__name__
-    if isinstance(exc, (subprocess.SubprocessError, FileNotFoundError)):
+    if isinstance(exc, FileNotFoundError):
+        if _is_cast_executable_name(getattr(exc, "filename", None)):
+            return "FileNotFoundError(cast)"
+        msg = sanitize_text(str(exc), sensitive_values=sensitive_values)
+        return f"{exc_type}: {msg}"
+    if isinstance(exc, subprocess.SubprocessError):
         cmd_name = "cast"
         if hasattr(exc, "cmd") and exc.cmd:
             if isinstance(exc.cmd, (list, tuple)):

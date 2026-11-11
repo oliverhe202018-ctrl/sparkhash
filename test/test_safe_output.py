@@ -260,7 +260,13 @@ class TestFormatExceptionSafe(unittest.TestCase):
             returncode=2,
             cmd=["cast", "wallet", "address", "--password-file", "/secret/pw.txt"],
         )
-        fnf_exc = FileNotFoundError(2, "No such file", "/secret/pw.txt")
+        fnf_cast = FileNotFoundError(2, "No such file", "cast")
+        fnf_cast_win = FileNotFoundError(2, "No such file", r"C:\Users\alice\.foundry\bin\cast.exe")
+        fnf_data = FileNotFoundError(2, "No such file", "batch_shares.json")
+        pw_posix = "/secret/keeper_pw.txt"
+        pw_win = r"C:\secrets\keeper_pw.txt"
+        fnf_pw_posix = FileNotFoundError(2, "No such file", pw_posix)
+        fnf_pw_win = FileNotFoundError(2, "No such file", pw_win)
         empty_cmd_exc = subprocess.SubprocessError()
         empty_cmd_exc.cmd = "   "
 
@@ -269,8 +275,29 @@ class TestFormatExceptionSafe(unittest.TestCase):
             safe_output.format_exception_safe(called_exc),
             "CalledProcessError(cast, returncode=2)",
         )
-        self.assertEqual(safe_output.format_exception_safe(fnf_exc), "FileNotFoundError(cast)")
+        self.assertEqual(safe_output.format_exception_safe(fnf_cast), "FileNotFoundError(cast)")
+        self.assertEqual(safe_output.format_exception_safe(fnf_cast_win), "FileNotFoundError(cast)")
         self.assertEqual(safe_output.format_exception_safe(empty_cmd_exc), "SubprocessError(cast)")
+
+        data_formatted = safe_output.format_exception_safe(fnf_data)
+        self.assertTrue(data_formatted.startswith("FileNotFoundError: "))
+        self.assertIn("batch_shares.json", data_formatted)
+
+        pw_posix_formatted = safe_output.format_exception_safe(
+            fnf_pw_posix,
+            sensitive_values=[pw_posix],
+        )
+        self.assertTrue(pw_posix_formatted.startswith("FileNotFoundError: "))
+        self.assertNotIn("keeper_pw.txt", pw_posix_formatted)
+        self.assertIn("[REDACTED_KEY]", pw_posix_formatted)
+
+        pw_win_formatted = safe_output.format_exception_safe(
+            fnf_pw_win,
+            sensitive_values=[pw_win],
+        )
+        self.assertTrue(pw_win_formatted.startswith("FileNotFoundError: "))
+        self.assertNotIn("keeper_pw.txt", pw_win_formatted)
+        self.assertIn("[REDACTED_KEY]", pw_win_formatted)
 
     def test_formats_http_url_rpc_and_requests_exceptions(self):
         http_exc = urllib.error.HTTPError(
@@ -378,7 +405,7 @@ class TestKeeperParityAndIntentionalDivergence(unittest.TestCase):
             ValueError("RPC https://u:p@rpc.example.com/v1?api_key=abc failed"),
             subprocess.TimeoutExpired(cmd=["cast", "send", "--private-key", SAMPLE_PK_0X], timeout=10),
             subprocess.CalledProcessError(returncode=1, cmd=["cast", "call"]),
-            FileNotFoundError(2, "No such file", "/secret/pw.txt"),
+            FileNotFoundError(2, "No such file", "cast"),
             urllib.error.HTTPError(
                 url="https://u:p@rpc.example.com/v1",
                 code=503,
@@ -477,6 +504,24 @@ class TestKeeperParityAndIntentionalDivergence(unittest.TestCase):
             safe_output.sanitize_text(both_forms, sensitive_values=[SAMPLE_PK_0X]),
             "raw=[REDACTED_KEY] hex=0x[REDACTED_KEY]",
         )
+
+        # 6. FileNotFoundError formatting:
+        #    keeper.py collapses every FileNotFoundError to "FileNotFoundError(cast)", hiding
+        #    ordinary missing data filenames; safe_output only outputs "(cast)" when filename
+        #    is the cast executable, and otherwise preserves sanitized message + filename.
+        missing_data = FileNotFoundError(2, "No such file", "shares_batch.json")
+        self.assertEqual(keeper.format_exception_safe(missing_data), "FileNotFoundError(cast)")
+        safe_data_msg = safe_output.format_exception_safe(missing_data)
+        self.assertTrue(safe_data_msg.startswith("FileNotFoundError: "))
+        self.assertIn("shares_batch.json", safe_data_msg)
+
+        pw_file = "/tmp/secret_pw.txt"
+        missing_pw = FileNotFoundError(2, "No such file", pw_file)
+        self.assertEqual(keeper.format_exception_safe(missing_pw), "FileNotFoundError(cast)")
+        safe_pw_msg = safe_output.format_exception_safe(missing_pw, sensitive_values=[pw_file])
+        self.assertTrue(safe_pw_msg.startswith("FileNotFoundError: "))
+        self.assertNotIn("secret_pw.txt", safe_pw_msg)
+        self.assertIn("[REDACTED_KEY]", safe_pw_msg)
 
 
 if __name__ == "__main__":
