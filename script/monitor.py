@@ -22,6 +22,11 @@ import argparse
 import urllib.request
 import urllib.error
 
+try:
+    from script.safe_output import format_exception_safe, sanitize_text, sanitize_url
+except ImportError:
+    from safe_output import format_exception_safe, sanitize_text, sanitize_url
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
@@ -70,7 +75,79 @@ EASIEST_TARGET = 1 << 224
 HARDEST_TARGET = 1 << 221
 
 
-def rpc_request(rpc_url, method, params, timeout=15):
+_SENSITIVE_ENV_EXACT = (
+    "PRIVATE_KEY",
+    "MINER_PRIVATE_KEY",
+    "KEEPER_PRIVATE_KEY",
+    "DEPLOYER_PRIVATE_KEY",
+    "SIGNER_PRIVATE_KEY",
+    "PASSWORD_FILE",
+    "KEEPER_PASSWORD_FILE",
+    "MINER_PASSWORD_FILE",
+    "KEYSTORE_PASSWORD_FILE",
+    "WALLET_PASSWORD_FILE",
+    "PASSWORD",
+    "KEYSTORE_PASSWORD",
+    "WALLET_PASSWORD",
+)
+_SENSITIVE_ENV_SUFFIXES = (
+    "_PRIVATE_KEY",
+    "_PRIV_KEY",
+    "_PASSWORD_FILE",
+    "_SECRET_KEY",
+    "_PASSPHRASE",
+)
+
+
+def _collect_sensitive_values(args=None, extra_secrets=None):
+    values = []
+    if extra_secrets:
+        for item in extra_secrets:
+            if isinstance(item, os.PathLike):
+                item = os.fspath(item)
+            if isinstance(item, str) and len(item.strip()) >= 4:
+                values.append(item.strip())
+    if args is not None:
+        for attr in ("private_key", "password_file", "keystore_password_file", "password"):
+            val = getattr(args, attr, None)
+            if isinstance(val, (str, os.PathLike)):
+                sval = os.fspath(val).strip()
+                if len(sval) >= 4:
+                    values.append(sval)
+                    if "password_file" in attr:
+                        values.append(os.path.abspath(sval))
+    for key, val in os.environ.items():
+        if not isinstance(val, str):
+            continue
+        upper_key = key.upper()
+        if upper_key in _SENSITIVE_ENV_EXACT or upper_key.endswith(_SENSITIVE_ENV_SUFFIXES):
+            sval = val.strip()
+            if len(sval) >= 4:
+                values.append(sval)
+                if "PASSWORD_FILE" in upper_key:
+                    values.append(os.path.abspath(sval))
+    return values
+
+
+def _sanitize_rpc_error_obj(err, sensitive_values=None):
+    if isinstance(err, dict):
+        sanitized = {}
+        for k, v in err.items():
+            if isinstance(v, str):
+                sanitized[k] = sanitize_text(v, sensitive_values=sensitive_values)
+            elif isinstance(v, (dict, list)):
+                sanitized[k] = _sanitize_rpc_error_obj(v, sensitive_values=sensitive_values)
+            else:
+                sanitized[k] = v
+        return sanitized
+    if isinstance(err, list):
+        return [_sanitize_rpc_error_obj(item, sensitive_values=sensitive_values) for item in err]
+    if isinstance(err, str):
+        return sanitize_text(err, sensitive_values=sensitive_values)
+    return sanitize_text(str(err), sensitive_values=sensitive_values)
+
+
+def rpc_request(rpc_url, method, params, timeout=15, sensitive_values=None):
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -82,11 +159,30 @@ def rpc_request(rpc_url, method, params, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8")
             res = json.loads(body)
-            if "error" in res:
-                return {"error": res["error"]}
-            return {"result": res.get("result")}
+            if isinstance(res, dict) and "error" in res:
+                sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
+                return {"error": _sanitize_rpc_error_obj(res["error"], sensitive)}
+            return {"result": res.get("result") if isinstance(res, dict) else res}
+    except urllib.error.HTTPError as e:
+        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
+        err_obj = None
+        try:
+            if getattr(e, "fp", None) is not None:
+                err_body = e.read().decode("utf-8", errors="replace")
+                parsed = json.loads(err_body)
+                if isinstance(parsed, dict) and "error" in parsed:
+                    err_obj = parsed.get("error")
+        except Exception:
+            err_obj = None
+        if err_obj is not None:
+            return {"error": _sanitize_rpc_error_obj(err_obj, sensitive)}
+        return {"error": {"message": format_exception_safe(e, sensitive_values=sensitive)}}
+    except urllib.error.URLError as e:
+        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
+        return {"error": {"message": format_exception_safe(e, sensitive_values=sensitive)}}
     except Exception as e:
-        return {"error": {"message": str(e)}}
+        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
+        return {"error": {"message": format_exception_safe(e, sensitive_values=sensitive)}}
 
 
 def eth_call(rpc_url, to, data, block="latest"):
@@ -701,185 +797,205 @@ def main():
     if args.start_round > args.end_round:
         sys.exit(f"Error: start-round ({args.start_round}) cannot be greater than end-round ({args.end_round})")
 
-    thresholds_cfg = {}
-    if os.path.exists(args.thresholds):
-        with open(args.thresholds, "r", encoding="utf-8") as f:
-            thresholds_cfg = json.load(f)
-    else:
-        print(f"[WARN] Thresholds file {args.thresholds} not found. Running with default evaluation.")
-
-    blk_res = rpc_request(rpc_url, "eth_blockNumber", [])
-    latest_block = int(blk_res.get("result", "0x0"), 16) if "result" in blk_res else 0
-
-    print("=" * 80)
-    print("PoolCoin On-Chain Monitor Starting...")
-    print(f"Target Epoch Range: [{args.start_round}, {args.end_round}]")
-    print(f"Latest Block Height: {latest_block}")
-    print("=" * 80)
-
-    global_state = query_global_state(rpc_url, args.miner, args.vault, args.token)
-    staker_info = query_staking_clustering(rpc_url, args.vault, latest_block)
-
-    epochs_data = []
-    all_alerts = []
-
-    for ep in range(args.start_round, args.end_round + 1):
-        ep_metrics = query_epoch_metrics(
-            rpc_url,
-            args.miner,
-            args.vault,
-            args.token,
-            ep,
-            latest_block,
-            global_state["start_ts"],
-        )
-        alerts = evaluate_thresholds(ep_metrics, global_state, staker_info, thresholds_cfg, past_epochs_data=epochs_data, fdv_bnb_input=args.fdv_bnb)
-        ep_metrics["alerts"] = alerts
-        epochs_data.append(ep_metrics)
-        all_alerts.extend(alerts)
-
-    conservation_status = {
-        "is_rc2": global_state["is_rc2"],
-        "total_mined_ttk": global_state["token_total_mined"] / 1e18,
-        "total_supply_ttk": global_state["token_total_supply"] / 1e18,
-        "mining_cap_ttk": global_state["token_mining_cap"] / 1e18,
-    }
-    if global_state["is_rc2"]:
-        rem = (global_state.get("remaining_emission") or 0) / 1e18
-        conservation_status["remaining_emission_ttk"] = rem
-        conservation_status["equation"] = "totalMined + pendingClaimable + remainingEmission == 900,000,000 TTK"
-        conservation_status["status"] = "VERIFIED_RC2_CLOSED_LOOP"
-    else:
-        conservation_status["remaining_emission_ttk"] = "N/A (rc1 does not have remainingEmission slot)"
-        conservation_status["equation"] = "totalMined <= 900M, totalSupply <= 1B (rc1 available checks)"
-        conservation_status["status"] = "VERIFIED_RC1_AVAILABLE_CHECKS"
-
-    print("\n[1. Global System Status]")
-    print(f"  Current On-Chain Epoch : {global_state['current_epoch']}")
-    print(f"  Last Settled Epoch     : {global_state['last_synced']}")
-    print(f"  Sync Lag               : {global_state['sync_lag']} epochs")
-    print(f"  Miner Contract Paused  : {global_state['miner_paused']}")
-    print(f"  StakeVault Paused      : {global_state['vault_paused']}")
-    print(f"  S_STAR Target Shares   : {global_state['s_star']}")
-    print(f"  Global EMA             : {global_state['ema']} (Ratio: {global_state['ema_sstar_ratio']:.4f})")
-    print(f"  Single Addr Cap BPS    : {global_state['addr_cap_bps']} ({global_state['addr_cap_bps']/100:.1f}%)")
-
-    print("\n[2. Conservation Verification (900M Hardcap)]")
-    print(f"  Contract Engine Version: {'rc2 (Progress Emission)' if global_state['is_rc2'] else 'rc1 (Calendar Decay Testnet)'}")
-    print(f"  Total Mined (TTK)      : {conservation_status['total_mined_ttk']:,.4f} TTK")
-    print(f"  Total Supply (TTK)     : {conservation_status['total_supply_ttk']:,.4f} TTK")
-    print(f"  Mining Cap Limit       : {conservation_status['mining_cap_ttk']:,.0f} TTK")
-    print(f"  Conservation Verdict   : {conservation_status['status']}")
-
-    print("\n[3. Staking & Sybil Clustering Analysis (24h Window)]")
-    print(f"  New Stakers (24h)      : {staker_info['new_stakers_24h']}")
-    print(f"  Hourly New Stakers     : {staker_info.get('hourly_new_stakers', 0)}")
-    print(f"  Same-Block Max Batch   : {staker_info.get('same_block_batch_stakers', 0)}")
-    print(f"  Same-Block Multi Blocks: {staker_info.get('same_block_cluster_count', 0)}")
-    print(f"  Identified Clusters    : {staker_info['cluster_count']}")
-    print(f"  Max Cluster Size       : {staker_info['max_cluster_size']}")
-    print(f"  Clustering Status      : {staker_info['clustering_status']}")
-    if 'limitations_note' in staker_info:
-        print(f"  Clustering Proxy Note  : {staker_info['limitations_note']}")
-
-    print("\n[4. Epoch Metrics Breakdown]")
-    for ed in epochs_data:
-        print(f"\n--- Epoch {ed['epoch']} Diagnostic ---")
-        print(f"  Active Miners          : {ed['active_miners_count']}")
-        print(f"  Total Shares Submitted : {ed['total_shares']}")
-        print(f"  Total Weight           : {ed['total_weight']:,} (Base scale: {ed['total_weight'] / WSCALE:.4f})")
-        print(f"  wMin Threshold         : {ed['w_min']:,} (Base scale: {ed['w_min'] / WSCALE:.0f})")
-        print(f"  tw / wMin Ratio        : {ed['tw_wmin_ratio_pct']:.2f}%")
-        print(f"  Unallocated Ratio      : {ed['unallocated_ratio_pct']:.2f}%")
-        print(f"  Target Bitmask         : {ed['target_hex']}")
-        print(f"  Difficulty Bits        : {ed['difficulty_bits']} bits")
-        print(f"  Seed Ready Status      : {'READY' if ed['is_seed_ready'] else 'NOT READY (0x0)'}")
-        print(f"  Full CAP Miners Ratio  : {ed['full_cap_ratio_pct']:.2f}% ({ed['full_cap_miners_count']}/{ed['active_miners_count']})")
-        print(f"  Top 1 Miner Weight Pct : {ed['top1_weight_share_pct']:.2f}%")
-        print(f"  Top 10 Weight Pct      : {ed['top10_weight_share_pct']:.2f}%")
-        print(f"  Weight Gini Index      : {ed['gini_weights']:.4f}")
-
-        if ed["alerts"]:
-            print("  Triggered Graded Alerts:")
-            for a in ed["alerts"]:
-                print(f"    [{a['tier']}] {a['rule_id']} - {a['name']}")
-                print(f"      Observed: {a['observed_value']}")
-                print(f"      Action  : {a['response_action']}")
-                print(f"      Executor: {a['executor']}")
+    try:
+        thresholds_cfg = {}
+        if os.path.exists(args.thresholds):
+            with open(args.thresholds, "r", encoding="utf-8") as f:
+                thresholds_cfg = json.load(f)
         else:
-            print("  Triggered Graded Alerts: None (Healthy)")
+            print(f"[WARN] Thresholds file {args.thresholds} not found. Running with default evaluation.")
 
-    report_data = {
-        "meta": {
-            "start_round": args.start_round,
-            "end_round": args.end_round,
-            "latest_block": latest_block,
-        },
-        "global_state": global_state,
-        "conservation": conservation_status,
-        "staking_clustering": staker_info,
-        "epochs": epochs_data,
-        "alerts_summary": all_alerts,
-    }
-    with open(args.output_json, "w", encoding="utf-8") as f:
-        json.dump(report_data, f, indent=2, ensure_ascii=False)
-    print(f"\n[INFO] Graded JSON report written to: {args.output_json}")
+        blk_res = rpc_request(rpc_url, "eth_blockNumber", [])
+        if isinstance(blk_res, dict) and "error" in blk_res:
+            err_obj = blk_res.get("error")
+            if isinstance(err_obj, dict):
+                err_msg = err_obj.get("message", "")
+                err_data = err_obj.get("data", "")
+                detail = f"{err_msg} | data: {err_data}" if err_data else str(err_msg or err_obj)
+            else:
+                detail = str(err_obj)
+            print(
+                f"[WARN] RPC error (eth_blockNumber): "
+                f"{sanitize_text(detail, sensitive_values=_collect_sensitive_values(args))}",
+                file=sys.stderr,
+            )
+        latest_block = int(blk_res.get("result", "0x0"), 16) if "result" in blk_res else 0
 
-    csv_fields = [
-        "epoch",
-        "active_miners_count",
-        "total_shares",
-        "total_weight",
-        "w_min",
-        "tw_wmin_ratio_pct",
-        "unallocated_ratio_pct",
-        "difficulty_bits",
-        "target_hex",
-        "is_seed_ready",
-        "full_cap_ratio_pct",
-        "top1_weight_share_pct",
-        "top10_weight_share_pct",
-        "gini_weights",
-        "sync_lag",
-        "miner_paused",
-        "vault_paused",
-        "highest_alert_tier",
-    ]
-    with open(args.output_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_fields)
-        writer.writeheader()
+        print("=" * 80)
+        print("PoolCoin On-Chain Monitor Starting...")
+        print(f"Target Epoch Range: [{args.start_round}, {args.end_round}]")
+        print(f"Latest Block Height: {latest_block}")
+        print("=" * 80)
+
+        global_state = query_global_state(rpc_url, args.miner, args.vault, args.token)
+        staker_info = query_staking_clustering(rpc_url, args.vault, latest_block)
+
+        epochs_data = []
+        all_alerts = []
+
+        for ep in range(args.start_round, args.end_round + 1):
+            ep_metrics = query_epoch_metrics(
+                rpc_url,
+                args.miner,
+                args.vault,
+                args.token,
+                ep,
+                latest_block,
+                global_state["start_ts"],
+            )
+            alerts = evaluate_thresholds(ep_metrics, global_state, staker_info, thresholds_cfg, past_epochs_data=epochs_data, fdv_bnb_input=args.fdv_bnb)
+            ep_metrics["alerts"] = alerts
+            epochs_data.append(ep_metrics)
+            all_alerts.extend(alerts)
+
+        conservation_status = {
+            "is_rc2": global_state["is_rc2"],
+            "total_mined_ttk": global_state["token_total_mined"] / 1e18,
+            "total_supply_ttk": global_state["token_total_supply"] / 1e18,
+            "mining_cap_ttk": global_state["token_mining_cap"] / 1e18,
+        }
+        if global_state["is_rc2"]:
+            rem = (global_state.get("remaining_emission") or 0) / 1e18
+            conservation_status["remaining_emission_ttk"] = rem
+            conservation_status["equation"] = "totalMined + pendingClaimable + remainingEmission == 900,000,000 TTK"
+            conservation_status["status"] = "VERIFIED_RC2_CLOSED_LOOP"
+        else:
+            conservation_status["remaining_emission_ttk"] = "N/A (rc1 does not have remainingEmission slot)"
+            conservation_status["equation"] = "totalMined <= 900M, totalSupply <= 1B (rc1 available checks)"
+            conservation_status["status"] = "VERIFIED_RC1_AVAILABLE_CHECKS"
+
+        print("\n[1. Global System Status]")
+        print(f"  Current On-Chain Epoch : {global_state['current_epoch']}")
+        print(f"  Last Settled Epoch     : {global_state['last_synced']}")
+        print(f"  Sync Lag               : {global_state['sync_lag']} epochs")
+        print(f"  Miner Contract Paused  : {global_state['miner_paused']}")
+        print(f"  StakeVault Paused      : {global_state['vault_paused']}")
+        print(f"  S_STAR Target Shares   : {global_state['s_star']}")
+        print(f"  Global EMA             : {global_state['ema']} (Ratio: {global_state['ema_sstar_ratio']:.4f})")
+        print(f"  Single Addr Cap BPS    : {global_state['addr_cap_bps']} ({global_state['addr_cap_bps']/100:.1f}%)")
+
+        print("\n[2. Conservation Verification (900M Hardcap)]")
+        print(f"  Contract Engine Version: {'rc2 (Progress Emission)' if global_state['is_rc2'] else 'rc1 (Calendar Decay Testnet)'}")
+        print(f"  Total Mined (TTK)      : {conservation_status['total_mined_ttk']:,.4f} TTK")
+        print(f"  Total Supply (TTK)     : {conservation_status['total_supply_ttk']:,.4f} TTK")
+        print(f"  Mining Cap Limit       : {conservation_status['mining_cap_ttk']:,.0f} TTK")
+        print(f"  Conservation Verdict   : {conservation_status['status']}")
+
+        print("\n[3. Staking & Sybil Clustering Analysis (24h Window)]")
+        print(f"  New Stakers (24h)      : {staker_info['new_stakers_24h']}")
+        print(f"  Hourly New Stakers     : {staker_info.get('hourly_new_stakers', 0)}")
+        print(f"  Same-Block Max Batch   : {staker_info.get('same_block_batch_stakers', 0)}")
+        print(f"  Same-Block Multi Blocks: {staker_info.get('same_block_cluster_count', 0)}")
+        print(f"  Identified Clusters    : {staker_info['cluster_count']}")
+        print(f"  Max Cluster Size       : {staker_info['max_cluster_size']}")
+        print(f"  Clustering Status      : {staker_info['clustering_status']}")
+        if 'limitations_note' in staker_info:
+            print(f"  Clustering Proxy Note  : {staker_info['limitations_note']}")
+
+        print("\n[4. Epoch Metrics Breakdown]")
         for ed in epochs_data:
-            tiers_present = [a["tier"] for a in ed.get("alerts", [])]
-            highest = "NORMAL"
-            if "EMERGENCY" in tiers_present:
-                highest = "EMERGENCY"
-            elif "ACTION" in tiers_present:
-                highest = "ACTION"
-            elif "OBSERVATION" in tiers_present:
-                highest = "OBSERVATION"
+            print(f"\n--- Epoch {ed['epoch']} Diagnostic ---")
+            print(f"  Active Miners          : {ed['active_miners_count']}")
+            print(f"  Total Shares Submitted : {ed['total_shares']}")
+            print(f"  Total Weight           : {ed['total_weight']:,} (Base scale: {ed['total_weight'] / WSCALE:.4f})")
+            print(f"  wMin Threshold         : {ed['w_min']:,} (Base scale: {ed['w_min'] / WSCALE:.0f})")
+            print(f"  tw / wMin Ratio        : {ed['tw_wmin_ratio_pct']:.2f}%")
+            print(f"  Unallocated Ratio      : {ed['unallocated_ratio_pct']:.2f}%")
+            print(f"  Target Bitmask         : {ed['target_hex']}")
+            print(f"  Difficulty Bits        : {ed['difficulty_bits']} bits")
+            print(f"  Seed Ready Status      : {'READY' if ed['is_seed_ready'] else 'NOT READY (0x0)'}")
+            print(f"  Full CAP Miners Ratio  : {ed['full_cap_ratio_pct']:.2f}% ({ed['full_cap_miners_count']}/{ed['active_miners_count']})")
+            print(f"  Top 1 Miner Weight Pct : {ed['top1_weight_share_pct']:.2f}%")
+            print(f"  Top 10 Weight Pct      : {ed['top10_weight_share_pct']:.2f}%")
+            print(f"  Weight Gini Index      : {ed['gini_weights']:.4f}")
 
-            writer.writerow({
-                "epoch": ed["epoch"],
-                "active_miners_count": ed["active_miners_count"],
-                "total_shares": ed["total_shares"],
-                "total_weight": ed["total_weight"],
-                "w_min": ed["w_min"],
-                "tw_wmin_ratio_pct": ed["tw_wmin_ratio_pct"],
-                "unallocated_ratio_pct": ed["unallocated_ratio_pct"],
-                "difficulty_bits": ed["difficulty_bits"],
-                "target_hex": ed["target_hex"],
-                "is_seed_ready": ed["is_seed_ready"],
-                "full_cap_ratio_pct": ed["full_cap_ratio_pct"],
-                "top1_weight_share_pct": ed["top1_weight_share_pct"],
-                "top10_weight_share_pct": ed["top10_weight_share_pct"],
-                "gini_weights": ed["gini_weights"],
-                "sync_lag": global_state["sync_lag"],
-                "miner_paused": global_state["miner_paused"],
-                "vault_paused": global_state["vault_paused"],
-                "highest_alert_tier": highest,
-            })
-    print(f"[INFO] Tabular CSV report written to: {args.output_csv}")
-    print("=" * 80)
+            if ed["alerts"]:
+                print("  Triggered Graded Alerts:")
+                for a in ed["alerts"]:
+                    print(f"    [{a['tier']}] {a['rule_id']} - {a['name']}")
+                    print(f"      Observed: {a['observed_value']}")
+                    print(f"      Action  : {a['response_action']}")
+                    print(f"      Executor: {a['executor']}")
+            else:
+                print("  Triggered Graded Alerts: None (Healthy)")
+
+        report_data = {
+            "meta": {
+                "start_round": args.start_round,
+                "end_round": args.end_round,
+                "latest_block": latest_block,
+            },
+            "global_state": global_state,
+            "conservation": conservation_status,
+            "staking_clustering": staker_info,
+            "epochs": epochs_data,
+            "alerts_summary": all_alerts,
+        }
+        with open(args.output_json, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, indent=2, ensure_ascii=False)
+        print(f"\n[INFO] Graded JSON report written to: {args.output_json}")
+
+        csv_fields = [
+            "epoch",
+            "active_miners_count",
+            "total_shares",
+            "total_weight",
+            "w_min",
+            "tw_wmin_ratio_pct",
+            "unallocated_ratio_pct",
+            "difficulty_bits",
+            "target_hex",
+            "is_seed_ready",
+            "full_cap_ratio_pct",
+            "top1_weight_share_pct",
+            "top10_weight_share_pct",
+            "gini_weights",
+            "sync_lag",
+            "miner_paused",
+            "vault_paused",
+            "highest_alert_tier",
+        ]
+        with open(args.output_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fields)
+            writer.writeheader()
+            for ed in epochs_data:
+                tiers_present = [a["tier"] for a in ed.get("alerts", [])]
+                highest = "NORMAL"
+                if "EMERGENCY" in tiers_present:
+                    highest = "EMERGENCY"
+                elif "ACTION" in tiers_present:
+                    highest = "ACTION"
+                elif "OBSERVATION" in tiers_present:
+                    highest = "OBSERVATION"
+
+                writer.writerow({
+                    "epoch": ed["epoch"],
+                    "active_miners_count": ed["active_miners_count"],
+                    "total_shares": ed["total_shares"],
+                    "total_weight": ed["total_weight"],
+                    "w_min": ed["w_min"],
+                    "tw_wmin_ratio_pct": ed["tw_wmin_ratio_pct"],
+                    "unallocated_ratio_pct": ed["unallocated_ratio_pct"],
+                    "difficulty_bits": ed["difficulty_bits"],
+                    "target_hex": ed["target_hex"],
+                    "is_seed_ready": ed["is_seed_ready"],
+                    "full_cap_ratio_pct": ed["full_cap_ratio_pct"],
+                    "top1_weight_share_pct": ed["top1_weight_share_pct"],
+                    "top10_weight_share_pct": ed["top10_weight_share_pct"],
+                    "gini_weights": ed["gini_weights"],
+                    "sync_lag": global_state["sync_lag"],
+                    "miner_paused": global_state["miner_paused"],
+                    "vault_paused": global_state["vault_paused"],
+                    "highest_alert_tier": highest,
+                })
+        print(f"[INFO] Tabular CSV report written to: {args.output_csv}")
+        print("=" * 80)
+    except Exception as e:
+        print(
+            f"[ERROR] {format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

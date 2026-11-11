@@ -27,6 +27,64 @@ import argparse
 from decimal import Decimal
 from typing import List, Dict, Any, Tuple
 
+try:
+    from script.safe_output import format_exception_safe, sanitize_text, sanitize_url
+except ImportError:
+    from safe_output import format_exception_safe, sanitize_text, sanitize_url
+
+_SENSITIVE_ENV_EXACT = (
+    "PRIVATE_KEY",
+    "MINER_PRIVATE_KEY",
+    "KEEPER_PRIVATE_KEY",
+    "DEPLOYER_PRIVATE_KEY",
+    "SIGNER_PRIVATE_KEY",
+    "PASSWORD_FILE",
+    "KEEPER_PASSWORD_FILE",
+    "MINER_PASSWORD_FILE",
+    "KEYSTORE_PASSWORD_FILE",
+    "WALLET_PASSWORD_FILE",
+    "PASSWORD",
+    "KEYSTORE_PASSWORD",
+    "WALLET_PASSWORD",
+)
+_SENSITIVE_ENV_SUFFIXES = (
+    "_PRIVATE_KEY",
+    "_PRIV_KEY",
+    "_PASSWORD_FILE",
+    "_SECRET_KEY",
+    "_PASSPHRASE",
+)
+
+
+def _collect_sensitive_values(args=None, extra_secrets=None):
+    values = []
+    if extra_secrets:
+        for item in extra_secrets:
+            if isinstance(item, os.PathLike):
+                item = os.fspath(item)
+            if isinstance(item, str) and len(item.strip()) >= 4:
+                values.append(item.strip())
+    if args is not None:
+        for attr in ("private_key", "password_file", "keystore_password_file", "password"):
+            val = getattr(args, attr, None)
+            if isinstance(val, (str, os.PathLike)):
+                sval = os.fspath(val).strip()
+                if len(sval) >= 4:
+                    values.append(sval)
+                    if "password_file" in attr:
+                        values.append(os.path.abspath(sval))
+    for key, val in os.environ.items():
+        if not isinstance(val, str):
+            continue
+        upper_key = key.upper()
+        if upper_key in _SENSITIVE_ENV_EXACT or upper_key.endswith(_SENSITIVE_ENV_SUFFIXES):
+            sval = val.strip()
+            if len(sval) >= 4:
+                values.append(sval)
+                if "PASSWORD_FILE" in upper_key:
+                    values.append(os.path.abspath(sval))
+    return values
+
 REQUIRED_CHAIN_ID = 97
 BATCH_SIZE = 6
 CAP = 6  # Single address share cap per epoch in MinerV1
@@ -213,12 +271,18 @@ def validate_single_share_file(
         with open(file_path, "r", encoding="utf-8") as f:
             raw_text = f.read()
     except Exception as e:
-        raise ValueError(f"Failed to read share file {file_path}: {e}")
+        raise ValueError(
+            f"Failed to read share file {file_path}: "
+            f"{format_exception_safe(e, sensitive_values=_collect_sensitive_values())}"
+        )
 
     try:
         data = json.loads(raw_text, parse_float=Decimal)
     except Exception as e:
-        raise ValueError(f"Failed to parse JSON in {file_path}: {e}")
+        raise ValueError(
+            f"Failed to parse JSON in {file_path}: "
+            f"{format_exception_safe(e, sensitive_values=_collect_sensitive_values())}"
+        )
 
     if not isinstance(data, dict):
         raise ValueError(f"Top-level JSON in {file_path} must be an object")
@@ -467,6 +531,11 @@ def validate_batch(
             f.write("\n")
     except FileExistsError:
         raise FileExistsError(f"Output file already exists (refusing to overwrite): {out_path}")
+    except Exception as e:
+        raise OSError(
+            f"Failed to write output file {out_path}: "
+            f"{format_exception_safe(e, sensitive_values=_collect_sensitive_values())}"
+        ) from None
 
     return result
 
@@ -550,8 +619,16 @@ ILLUSTRATIVE PARAMETERS SCHEMATIC NOTICE:
             target=args.target,
             out_path=args.out
         )
-    except Exception as e:
+    except (ValueError, FileExistsError) as e:
+        # Validation ValueError messages carry diagnostic unlabelled 64-hex values
+        # (epochSeed, hash, target) that must remain intact without redaction.
         print(f"[VALIDATION FAILED] {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(
+            f"[VALIDATION FAILED] {format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     print("=================================================================")

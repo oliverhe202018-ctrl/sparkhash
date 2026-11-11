@@ -768,8 +768,11 @@ class TestValidateShareBatch(unittest.TestCase):
             "--out", out_path
         ]
 
+        sub_env = os.environ.copy()
+        sub_env["PYTHONIOENCODING"] = "utf-8"
+
         # 1. Success run
-        proc = subprocess.run(cmd_success, capture_output=True, text=True)
+        proc = subprocess.run(cmd_success, capture_output=True, text=True, encoding="utf-8", env=sub_env)
         self.assertEqual(proc.returncode, 0, f"CLI stderr: {proc.stderr}")
         self.assertIn("Validation Result:    SUCCESS (6/6 shares verified)", proc.stdout)
         self.assertIn(f"Miner Proxy:          {self.rc2_proxy.lower()}", proc.stdout)
@@ -791,7 +794,7 @@ class TestValidateShareBatch(unittest.TestCase):
         cmd_fail[cmd_fail.index("--chain-id") + 1] = "1"
         cmd_fail[cmd_fail.index("--out") + 1] = fail_out_path
 
-        proc_fail = subprocess.run(cmd_fail, capture_output=True, text=True)
+        proc_fail = subprocess.run(cmd_fail, capture_output=True, text=True, encoding="utf-8", env=sub_env)
         self.assertNotEqual(proc_fail.returncode, 0)
         self.assertIn("[VALIDATION FAILED]", proc_fail.stderr)
         self.assertFalse(os.path.exists(fail_out_path))

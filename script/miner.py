@@ -18,6 +18,7 @@ import time
 import json
 import struct
 import argparse
+import urllib.error
 import urllib.request
 import threading
 import multiprocessing as mp
@@ -49,10 +50,76 @@ try:
 except Exception:
     HAS_RAW_KECCAK = False
 
+try:
+    from script.safe_output import format_exception_safe, sanitize_text, sanitize_url
+except ImportError:
+    from safe_output import format_exception_safe, sanitize_text, sanitize_url
+
 from eth_hash.auto import keccak as standard_keccak
 
+_SENSITIVE_ENV_EXACT = (
+    "PRIVATE_KEY",
+    "MINER_PRIVATE_KEY",
+    "KEEPER_PRIVATE_KEY",
+    "DEPLOYER_PRIVATE_KEY",
+    "SIGNER_PRIVATE_KEY",
+    "PASSWORD_FILE",
+    "KEEPER_PASSWORD_FILE",
+    "MINER_PASSWORD_FILE",
+    "KEYSTORE_PASSWORD_FILE",
+    "WALLET_PASSWORD_FILE",
+    "PASSWORD",
+    "KEYSTORE_PASSWORD",
+    "WALLET_PASSWORD",
+)
+_SENSITIVE_ENV_SUFFIXES = (
+    "_PRIVATE_KEY",
+    "_PRIV_KEY",
+    "_PASSWORD_FILE",
+    "_SECRET_KEY",
+    "_PASSPHRASE",
+)
 
-def rpc_call(rpc_url, method, params):
+
+def _collect_sensitive_values(args=None, extra_secrets=None):
+    values = []
+    if extra_secrets:
+        for item in extra_secrets:
+            if isinstance(item, os.PathLike):
+                item = os.fspath(item)
+            if isinstance(item, str) and len(item.strip()) >= 4:
+                values.append(item.strip())
+    if args is not None:
+        for attr in ("private_key", "password_file", "keystore_password_file", "password"):
+            val = getattr(args, attr, None)
+            if isinstance(val, (str, os.PathLike)):
+                sval = os.fspath(val).strip()
+                if len(sval) >= 4:
+                    values.append(sval)
+                    if "password_file" in attr:
+                        values.append(os.path.abspath(sval))
+    for key, val in os.environ.items():
+        if not isinstance(val, str):
+            continue
+        upper_key = key.upper()
+        if upper_key in _SENSITIVE_ENV_EXACT or upper_key.endswith(_SENSITIVE_ENV_SUFFIXES):
+            sval = val.strip()
+            if len(sval) >= 4:
+                values.append(sval)
+                if "PASSWORD_FILE" in upper_key:
+                    values.append(os.path.abspath(sval))
+    return values
+
+
+def _format_rpc_error_pair(err, sensitive_values=None):
+    err_data = err.get("data", "") if isinstance(err, dict) else ""
+    err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+    safe_msg = sanitize_text(str(err_msg), sensitive_values=sensitive_values)
+    safe_data = sanitize_text(str(err_data), sensitive_values=sensitive_values)
+    return safe_msg, safe_data
+
+
+def rpc_call(rpc_url, method, params, sensitive_values=None):
     """Performs a JSON-RPC call."""
     payload = {
         "jsonrpc": "2.0",
@@ -65,11 +132,36 @@ def rpc_call(rpc_url, method, params):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "User-Agent": "PoolCoin-Miner/1.0"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        res = json.loads(resp.read().decode("utf-8"))
-        if "error" in res:
-            raise RuntimeError(f"RPC Error ({method}): {res.get('error')}")
-        return res.get("result")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
+        err_obj = None
+        try:
+            if getattr(e, "fp", None) is not None:
+                err_body = e.read().decode("utf-8", errors="replace")
+                parsed = json.loads(err_body)
+                if isinstance(parsed, dict) and "error" in parsed:
+                    err_obj = parsed.get("error")
+        except Exception:
+            err_obj = None
+        if err_obj is not None:
+            safe_msg, safe_data = _format_rpc_error_pair(err_obj, sensitive)
+            raise RuntimeError(f"RPC Error ({method}): {safe_msg} | data: {safe_data}") from None
+        raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+    except urllib.error.URLError as e:
+        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
+        raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+    except Exception as e:
+        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
+        raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+
+    if isinstance(res, dict) and "error" in res:
+        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
+        safe_msg, safe_data = _format_rpc_error_pair(res.get("error"), sensitive)
+        raise RuntimeError(f"RPC Error ({method}): {safe_msg} | data: {safe_data}")
+    return res.get("result") if isinstance(res, dict) else res
 
 
 def verify_chain_id(rpc_url):
@@ -288,7 +380,11 @@ def backfill_epoch_seed(rpc_url, miner_contract, cur_epoch, private_key=None, ma
             time.sleep(2)
             return tx_hash
         except Exception as exc:
-            print(f"[BACKFILL] Failed to broadcast backfill tx: {exc}")
+            safe_exc = format_exception_safe(
+                exc,
+                sensitive_values=_collect_sensitive_values(extra_secrets=[private_key]),
+            )
+            print(f"[BACKFILL] Failed to broadcast backfill tx: {safe_exc}")
             return None
     else:
         try:
@@ -614,7 +710,14 @@ def main():
     parser.add_argument("--out", type=str, default=None, help="Output JSON file path")
 
     args = parser.parse_args()
-    mine(args)
+    try:
+        mine(args)
+    except Exception as e:
+        print(
+            f"[ERROR] {format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
