@@ -5,8 +5,9 @@ PoolCoin Safe Share Submission Script for MinerV1 on BSC Testnet (chainId 97)
 
 Submits mined PoW shares to MinerV1.
 DEFAULT MODE: Read-only simulation via eth_call / cast call.
-SEND MODE (--send): Prompts for manual user confirmation, enforces gasPrice >= eth_gasPrice,
-and signs transaction using MINER_PRIVATE_KEY from environment.
+SEND MODE (--send): Prompts for manual user confirmation, enforces EIP-1559
+maxFeePerGas >= max(eth_gasPrice, maxPriorityFeePerGas), and signs via Foundry keystore
+(--account / --password-file) using cast send (or legacy MINER_PRIVATE_KEY env fallback).
 
 HARD CONSTRAINTS ENFORCED:
 1. Hardcoded refusal for any chainId != 97 (BSC Testnet only).
@@ -37,6 +38,8 @@ try:
         cast_send,
         get_keystore_address,
         parse_pending_nonce,
+        resolve_eip1559_fees,
+        validate_cli_fee_and_gas_args,
     )
 except ImportError:
     from cast_signer import (
@@ -46,6 +49,8 @@ except ImportError:
         cast_send,
         get_keystore_address,
         parse_pending_nonce,
+        resolve_eip1559_fees,
+        validate_cli_fee_and_gas_args,
     )
 
 REQUIRED_CHAIN_ID = 97
@@ -150,20 +155,26 @@ def rpc_call(rpc_url, method, params, sensitive_values=None):
         with urllib.request.urlopen(req, timeout=15) as resp:
             res = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
-        err_obj = None
         try:
-            if getattr(e, "fp", None) is not None:
-                err_body = e.read().decode("utf-8", errors="replace")
-                parsed = json.loads(err_body)
-                if isinstance(parsed, dict) and "error" in parsed:
-                    err_obj = parsed.get("error")
-        except Exception:
+            sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
             err_obj = None
-        if err_obj is not None:
-            safe_msg, safe_data = _format_rpc_error_pair(err_obj, sensitive)
-            raise RuntimeError(f"RPC Error ({method}): {safe_msg} | data: {safe_data}") from None
-        raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+            try:
+                if getattr(e, "fp", None) is not None:
+                    err_body = e.read().decode("utf-8", errors="replace")
+                    parsed = json.loads(err_body)
+                    if isinstance(parsed, dict) and "error" in parsed:
+                        err_obj = parsed.get("error")
+            except Exception:
+                err_obj = None
+            if err_obj is not None:
+                safe_msg, safe_data = _format_rpc_error_pair(err_obj, sensitive)
+                raise RuntimeError(f"RPC Error ({method}): {safe_msg} | data: {safe_data}") from None
+            raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
     except urllib.error.URLError as e:
         sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
         raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
@@ -236,6 +247,14 @@ def simulate_call(rpc_url, to_addr, from_addr, calldata_bytes, sensitive_values=
 
 
 def submit(args):
+    cli_fee_cfg = validate_cli_fee_and_gas_args(
+        gas_limit=args.gas_limit,
+        gas_multiplier=args.gas_multiplier,
+        max_fee_per_gas_gwei=getattr(args, "max_fee_per_gas_gwei", None),
+        priority_fee_per_gas_gwei=getattr(args, "priority_fee_per_gas_gwei", None),
+        deprecated_gas_price_gwei=getattr(args, "gas_price_gwei", None),
+    )
+
     # 1. Enforce BSC Testnet
     chain_id = verify_chain_id(args.rpc)
 
@@ -301,29 +320,42 @@ def submit(args):
     print(f"Calldata Size:    {len(calldata)} bytes")
     print("================================")
 
-    # 3. Network Gas Price Check
-    net_gas_price_hex = rpc_call(args.rpc, "eth_gasPrice", [])
-    network_gas_price_wei = int(net_gas_price_hex, 16)
-    network_gas_price_gwei = network_gas_price_wei / 1e9
-    print(f"Network Gas Price: {network_gas_price_gwei:.3f} gwei ({network_gas_price_wei} wei)")
+    # 3. Resolve EIP-1559 Fees (type 2: maxFeePerGas & maxPriorityFeePerGas)
+    fee_info = resolve_eip1559_fees(
+        rpc_url=args.rpc,
+        rpc_call_fn=rpc_call,
+        gas_multiplier=args.gas_multiplier,
+        max_fee_per_gas_gwei=getattr(args, "max_fee_per_gas_gwei", None),
+        priority_fee_per_gas_gwei=getattr(args, "priority_fee_per_gas_gwei", None),
+        deprecated_gas_price_gwei=getattr(args, "gas_price_gwei", None),
+    )
+    network_gas_price_wei = fee_info["network_gas_price_wei"]
+    network_priority_fee_wei = fee_info["network_priority_fee_wei"]
+    max_fee_wei = fee_info["max_fee_per_gas_wei"]
+    priority_fee_wei = fee_info["priority_fee_per_gas_wei"]
 
-    # Enforce effective gas price >= network_gas_price
-    multiplier = max(1.0, float(args.gas_multiplier))
-    target_gas_price_wei = int(network_gas_price_wei * multiplier)
+    if network_gas_price_wei is not None:
+        print(f"Network Gas Price (eth_gasPrice): {network_gas_price_wei / 1e9:.3f} gwei ({network_gas_price_wei} wei)")
+    else:
+        print(f"Explicit Max Fee (maxFeePerGas): {max_fee_wei / 1e9:.3f} gwei ({max_fee_wei} wei) [eth_gasPrice skipped / N/A]")
+    if network_priority_fee_wei is not None:
+        print(f"Network Priority Fee (eth_maxPriorityFeePerGas): {network_priority_fee_wei / 1e9:.3f} gwei ({network_priority_fee_wei} wei)")
+    else:
+        print(f"Explicit Priority Fee (maxPriorityFeePerGas): {priority_fee_wei / 1e9:.3f} gwei ({priority_fee_wei} wei) [eth_maxPriorityFeePerGas skipped]")
 
-    if args.gas_price_gwei is not None:
-        override_wei = int(float(args.gas_price_gwei) * 1e9)
-        if override_wei < network_gas_price_wei:
+    for warn_kind, orig_val, lifted_val in fee_info["warnings"]:
+        if warn_kind == "priority_floor":
             print(
-                f"[WARNING] Requested gas price ({args.gas_price_gwei} gwei) is lower than network gasPrice ({network_gas_price_gwei:.3f} gwei). "
-                f"Forcing gas price to network gasPrice floor."
+                f"[WARNING] Computed maxFeePerGas ({orig_val / 1e9:.3f} gwei) is lower than maxPriorityFeePerGas ({lifted_val / 1e9:.3f} gwei). "
+                f"Raising maxFeePerGas to match priority fee."
             )
-            target_gas_price_wei = network_gas_price_wei
-        else:
-            target_gas_price_wei = override_wei
 
-    print(f"Selected Gas Price: {target_gas_price_wei / 1e9:.3f} gwei ({target_gas_price_wei} wei)")
-    assert target_gas_price_wei >= network_gas_price_wei, "Enforcement check: tx gas price MUST be >= network gas price!"
+    print(f"Selected Max Fee (maxFeePerGas):           {max_fee_wei / 1e9:.3f} gwei ({max_fee_wei} wei)")
+    print(f"Selected Priority Fee (maxPriorityFee):    {priority_fee_wei / 1e9:.3f} gwei ({priority_fee_wei} wei)")
+    if network_gas_price_wei is not None and not fee_info["explicit_max_fee"] and max_fee_wei < network_gas_price_wei:
+        raise ValueError("Enforcement check failed: computed maxFeePerGas cannot be less than network gas price.")
+    if max_fee_wei < priority_fee_wei:
+        raise ValueError("Enforcement check failed: maxFeePerGas cannot be less than maxPriorityFeePerGas.")
 
     # 4. Mandatory Preflight eth_call Simulation
     print("\n[Step 1/2] Running eth_call preflight simulation...")
@@ -340,21 +372,23 @@ def submit(args):
         sys.exit(1)
 
     print(f"[SUCCESS] Preflight simulation passed! Estimated gas: {gas_est:,}")
+    gas_limit = max(gas_est + 50000, cli_fee_cfg["gas_limit"])
+    max_gas_cost_bnb = (gas_limit * max_fee_wei) / 1e18
+    print(f"Gas Limit Ceiling:        {gas_limit:,}")
+    print(f"Max Gas Fee Ceiling:      {max_gas_cost_bnb:.6f} BNB")
 
     # 5. Check --send Flag
     if not args.send:
         print("\n" + "=" * 50)
         print("SIMULATION COMPLETED (DRY-RUN)")
         print("No transaction was sent to the blockchain.")
-        print("To broadcast this share on-chain, please execute:")
-        print("  1. In your terminal, provide your private key via environment variable:")
-        print("     PowerShell:  $env:MINER_PRIVATE_KEY=\"<your_private_key>\"")
-        print("     Bash/Linux:  export MINER_PRIVATE_KEY=\"<your_private_key>\"")
-        print("  2. Re-run this script with --send:")
+        print("To broadcast this share on-chain, please use Foundry keystore signing:")
+        print("  1. Prepare your Foundry keystore account name and password file (--account and --password-file).")
+        print("  2. Re-run this script with --send, --account, and --password-file:")
         if args.file:
-            print(f"     python script/submit_share.py --file {args.file} --send")
+            print(f"     python script/submit_share.py --file {args.file} --send --account <keystore_account> --password-file <password_file_path>")
         else:
-            print(f"     python script/submit_share.py --miner {miner_addr} --k {k} --nonce {nonce} --send")
+            print(f"     python script/submit_share.py --miner {miner_addr} --k {k} --nonce {nonce} --send --account <keystore_account> --password-file <password_file_path>")
         print("=" * 50)
         return
 
@@ -397,15 +431,12 @@ def submit(args):
             print(f"[ERROR] Failed to load private key from environment: {safe_err}")
             sys.exit(1)
     else:
-        print("[ERROR] MINER_PRIVATE_KEY environment variable is not set!")
-        print("Please set it in your current terminal session:")
-        print("  PowerShell:  $env:MINER_PRIVATE_KEY=\"<0x_hex_private_key>\"")
-        print("  Bash/Linux:  export MINER_PRIVATE_KEY=\"<0x_hex_private_key>\"")
-        print("Note: Do NOT write your private key into .env or any file.")
+        print("[ERROR] --send mode requires Foundry keystore parameters (--account and --password-file).")
+        print("Recommended: python script/submit_share.py ... --send --account <keystore_account> --password-file <password_file_path>")
+        print("Legacy fallback: MINER_PRIVATE_KEY environment variable (not recommended; never write keys into .env or files).")
         sys.exit(1)
 
     # Print Full Transaction Summary for Manual Confirmation
-    gas_limit = max(gas_est + 50000, int(args.gas_limit))
     print("\n================ TRANSACTION PREVIEW ================")
     print(f"Target Contract:  {miner_contract} (MinerV1 Proxy)")
     print(f"Sender / Signer:  {signer_addr}")
@@ -413,7 +444,9 @@ def submit(args):
     print(f"Share Index k:    [{k}]")
     print(f"Nonce:            [{nonce}]")
     print(f"Gas Limit:        {gas_limit:,}")
-    print(f"Gas Price:        {target_gas_price_wei / 1e9:.3f} gwei ({target_gas_price_wei} wei)")
+    print(f"Max Fee:          {max_fee_wei / 1e9:.3f} gwei ({max_fee_wei} wei)")
+    print(f"Priority Fee:     {priority_fee_wei / 1e9:.3f} gwei ({priority_fee_wei} wei)")
+    print(f"Max Gas Cost Cap: {max_gas_cost_bnb:.6f} BNB")
     print(f"Chain ID:         {chain_id} (BSC Testnet: VERIFIED)")
     print(f"Preflight Sim:    PASSED")
     print("=====================================================")
@@ -444,8 +477,9 @@ def submit(args):
                 password_file=args.password_file,
                 rpc_url=args.rpc,
                 nonce=account_nonce,
-                gas_price=target_gas_price_wei,
+                gas_price=max_fee_wei,
                 gas_limit=gas_limit,
+                priority_gas_price=priority_fee_wei,
             )
         except CastSendUncertainError as e:
             safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
@@ -458,11 +492,13 @@ def submit(args):
     else:
         # Build Transaction Object
         tx_dict = {
+            "type": 2,
             "to": miner_contract,
             "from": signer_addr,
             "value": 0,
             "gas": gas_limit,
-            "gasPrice": target_gas_price_wei,
+            "maxFeePerGas": max_fee_wei,
+            "maxPriorityFeePerGas": priority_fee_wei,
             "nonce": account_nonce,
             "chainId": chain_id,
             "data": "0x" + calldata.hex(),
@@ -520,8 +556,10 @@ def main():
     parser.add_argument("--account", type=str, default=None, help="Foundry keystore account name (must be used with --password-file)")
     parser.add_argument("--password-file", type=str, default=None, help="Path to password file for Foundry keystore (must be used with --account)")
     parser.add_argument("--send", action="store_true", help="Broadcast transaction (default: simulation only)")
-    parser.add_argument("--gas-multiplier", type=float, default=1.15, help="Gas price multiplier over eth_gasPrice (default: 1.15)")
-    parser.add_argument("--gas-price-gwei", type=float, default=None, help="Explicit gas price in gwei (must be >= eth_gasPrice)")
+    parser.add_argument("--gas-multiplier", type=str, default="1.15", help="Max fee multiplier over eth_gasPrice (default: 1.15)")
+    parser.add_argument("--max-fee-per-gas-gwei", type=str, default=None, help="Explicit EIP-1559 maxFeePerGas in gwei")
+    parser.add_argument("--priority-fee-per-gas-gwei", type=str, default=None, help="Explicit EIP-1559 maxPriorityFeePerGas in gwei")
+    parser.add_argument("--gas-price-gwei", type=str, default=None, help="[Compatibility alias] Equivalent to --max-fee-per-gas-gwei (gwei)")
     parser.add_argument("--gas-limit", type=int, default=350000, help="Gas limit ceiling (default: 350000)")
 
     args = parser.parse_args()

@@ -5,14 +5,15 @@ PoolCoin Mining Reward Claim Script for MinerV1 on BSC Testnet (chainId 97)
 
 Claims finalized epoch mining rewards from MinerV1.
 DEFAULT MODE: Read-only simulation via eth_call (dry-run preflight).
-SEND MODE (--send): Prompts for manual user secondary confirmation, enforces gasPrice >= eth_gasPrice,
-and signs transaction using PRIVATE_KEY from environment variable.
+SEND MODE (--send): Prompts for manual user secondary confirmation, enforces EIP-1559
+maxFeePerGas >= max(eth_gasPrice, maxPriorityFeePerGas), and signs via Foundry keystore
+(--account / --password-file) using cast send (or legacy PRIVATE_KEY env fallback).
 
 HARD CONSTRAINTS ENFORCED:
 1. Hardcoded refusal for any chainId != 97 (BSC Testnet only).
 2. Never reads .env or prints private keys. Private key is strictly from PRIVATE_KEY env var.
 3. Requires explicit manual confirmation ("yes") before broadcasting.
-4. Gas price strictly >= network gasPrice floor.
+4. EIP-1559 maxFeePerGas strictly >= network eth_gasPrice floor and >= maxPriorityFeePerGas.
 """
 
 import os
@@ -44,6 +45,8 @@ try:
         cast_send,
         get_keystore_address,
         parse_pending_nonce,
+        resolve_eip1559_fees,
+        validate_cli_fee_and_gas_args,
     )
 except ImportError:
     from cast_signer import (
@@ -53,6 +56,8 @@ except ImportError:
         cast_send,
         get_keystore_address,
         parse_pending_nonce,
+        resolve_eip1559_fees,
+        validate_cli_fee_and_gas_args,
     )
 
 REQUIRED_CHAIN_ID = 97
@@ -184,20 +189,26 @@ def rpc_call(rpc_url, method, params, sensitive_values=None):
         with urllib.request.urlopen(req, timeout=15) as resp:
             res = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
-        err_obj = None
         try:
-            if getattr(e, "fp", None) is not None:
-                err_body = e.read().decode("utf-8", errors="replace")
-                parsed = json.loads(err_body)
-                if isinstance(parsed, dict) and "error" in parsed:
-                    err_obj = parsed.get("error")
-        except Exception:
+            sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
             err_obj = None
-        if err_obj is not None:
-            safe_msg, safe_data = _format_rpc_error_pair(err_obj, sensitive)
-            raise RuntimeError(f"RPC Error ({method}): {safe_msg} | data: {safe_data}") from None
-        raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+            try:
+                if getattr(e, "fp", None) is not None:
+                    err_body = e.read().decode("utf-8", errors="replace")
+                    parsed = json.loads(err_body)
+                    if isinstance(parsed, dict) and "error" in parsed:
+                        err_obj = parsed.get("error")
+            except Exception:
+                err_obj = None
+            if err_obj is not None:
+                safe_msg, safe_data = _format_rpc_error_pair(err_obj, sensitive)
+                raise RuntimeError(f"RPC Error ({method}): {safe_msg} | data: {safe_data}") from None
+            raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
     except urllib.error.URLError as e:
         sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
         raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
@@ -230,20 +241,26 @@ def rpc_batch_call(rpc_url, calls, timeout=15, sensitive_values=None):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             res_list = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
-        err_obj = None
         try:
-            if getattr(e, "fp", None) is not None:
-                err_body = e.read().decode("utf-8", errors="replace")
-                parsed = json.loads(err_body)
-                if isinstance(parsed, dict) and "error" in parsed:
-                    err_obj = parsed.get("error")
-        except Exception:
+            sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
             err_obj = None
-        if err_obj is not None:
-            safe_msg, safe_data = _format_rpc_error_pair(err_obj, sensitive)
-            raise RuntimeError(f"RPC Batch Error: {safe_msg} | data: {safe_data}") from None
-        raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+            try:
+                if getattr(e, "fp", None) is not None:
+                    err_body = e.read().decode("utf-8", errors="replace")
+                    parsed = json.loads(err_body)
+                    if isinstance(parsed, dict) and "error" in parsed:
+                        err_obj = parsed.get("error")
+            except Exception:
+                err_obj = None
+            if err_obj is not None:
+                safe_msg, safe_data = _format_rpc_error_pair(err_obj, sensitive)
+                raise RuntimeError(f"RPC Batch Error: {safe_msg} | data: {safe_data}") from None
+            raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
     except urllib.error.URLError as e:
         sensitive = _collect_sensitive_values(extra_secrets=sensitive_values)
         raise RuntimeError(format_exception_safe(e, sensitive_values=sensitive)) from None
@@ -285,6 +302,12 @@ def get_working_rpc(rpc_urls):
                 cid = int(data["result"], 16)
                 if cid == REQUIRED_CHAIN_ID:
                     return url
+        except urllib.error.HTTPError as e:
+            try:
+                e.close()
+            except Exception:
+                pass
+            continue
         except Exception:
             continue
     return rpc_urls[0]
@@ -330,6 +353,8 @@ def calculate_reward_details(rpc_url, miner_contract, miner_addr, epoch):
         ("userWeight(uint256,address)", ["uint256", "address"], [epoch, miner_addr], ["uint256"]),
         ("epochAddrCapBps(uint256)", ["uint256"], [epoch], ["uint256"]),
         ("claimed(uint256,address)", ["uint256", "address"], [epoch, miner_addr], ["bool"]),
+        ("epoch()", [], [], ["uint256"]),
+        ("lastSynced()", [], [], ["uint256"]),
     ]
     batch = []
     for sig, in_types, in_vals, _ in calls_def:
@@ -339,11 +364,17 @@ def calculate_reward_details(rpc_url, miner_contract, miner_addr, epoch):
 
     res_list = rpc_batch_call(rpc_url, batch)
     results = []
-    for i, (_, _, _, out_types) in enumerate(calls_def):
+    for i, (_, _, _, out_types) in enumerate(calls_def[:6]):
         val = decode(out_types, bytes.fromhex(res_list[i][2:]))[0]
         results.append(val)
 
     effQ, tw, wm, uw, capBps, cl = results
+    cur_epoch = None
+    last_synced = None
+    if len(res_list) >= 8 and res_list[6] and res_list[7]:
+        cur_epoch = decode(["uint256"], bytes.fromhex(res_list[6][2:]))[0]
+        last_synced = decode(["uint256"], bytes.fromhex(res_list[7][2:]))[0]
+
     if capBps == 0:
         cap_res = rpc_call(rpc_url, "eth_call", [{"to": miner_contract, "data": SEL_ADDR_CAP_BPS}, "latest"])
         capBps = decode(["uint256"], bytes.fromhex(cap_res[2:]))[0]
@@ -353,6 +384,14 @@ def calculate_reward_details(rpc_url, miner_contract, miner_addr, epoch):
     maxAmt = (effQ * capBps) // 10000
     final_amt = min(amt, maxAmt)
 
+    epoch_ended = (epoch < cur_epoch) if cur_epoch is not None else None
+    if epoch_ended is False:
+        epoch_settled = False
+    elif epoch_ended is True and last_synced is not None:
+        epoch_settled = epoch < last_synced
+    else:
+        epoch_settled = None
+
     return {
         "effectiveQuota": effQ,
         "totalWeight": tw,
@@ -361,10 +400,22 @@ def calculate_reward_details(rpc_url, miner_contract, miner_addr, epoch):
         "capBps": capBps,
         "claimed": cl,
         "expectedReward": final_amt,
+        "currentEpoch": cur_epoch,
+        "lastSynced": last_synced,
+        "epochEnded": epoch_ended,
+        "epochSettled": epoch_settled,
     }
 
 
 def claim(args):
+    cli_fee_cfg = validate_cli_fee_and_gas_args(
+        gas_limit=args.gas_limit,
+        gas_multiplier=args.gas_multiplier,
+        max_fee_per_gas_gwei=getattr(args, "max_fee_per_gas_gwei", None),
+        priority_fee_per_gas_gwei=getattr(args, "priority_fee_per_gas_gwei", None),
+        deprecated_gas_price_gwei=getattr(args, "gas_price_gwei", None),
+    )
+
     rpc_url = args.rpc if args.rpc else get_working_rpc(DEFAULT_RPC_URLS)
     
     # 1. Enforce BSC Testnet
@@ -430,7 +481,7 @@ def claim(args):
                     print("拒绝执行以避免资金或签名混乱。")
                     sys.exit(1)
         else:
-            print("[错误] --send 模式需要提供签名私钥！")
+            print("[错误] --send 模式需要提供签名方式！")
             print("安全规则: 推荐使用 Foundry keystore 参数: --account <别名> --password-file <密码文件>")
             print("旧路径:   环境变量 PRIVATE_KEY (或 MINER_PRIVATE_KEY) 读取 (不推荐)")
             sys.exit(1)
@@ -483,19 +534,46 @@ def claim(args):
     # 3. Calculate Reward & Fetch On-Chain State
     print("[步骤 1/3] 正在查询链上轮次结算状态与应得奖励...")
     r_details = calculate_reward_details(rpc_url, miner_contract, miner_addr, epoch_to_claim)
+    epoch_ended = r_details.get("epochEnded")
+    epoch_settled = r_details.get("epochSettled")
+    cur_epoch = r_details.get("currentEpoch")
+    last_synced = r_details.get("lastSynced")
+
+    if r_details["claimed"]:
+        settlement_status = "[已结算且已在链上领取]"
+        reward_label = "已领取轮次应得奖励"
+    elif epoch_ended is False:
+        cur_info = f"当前进行中: Epoch {cur_epoch}" if cur_epoch is not None else "当前轮次进行中"
+        settlement_status = f"[尚未结束 ({cur_info}) - 仅作动态估算，不可作为已确定可领取金额]"
+        reward_label = "估算参考奖励 (未结束)"
+    elif epoch_ended is True and epoch_settled is False:
+        sync_info = f"lastSynced={last_synced}" if last_synced is not None else "尚未 sync 结算"
+        settlement_status = f"[已结束但尚未结算 ({sync_info}) - 仅作估算，需待 sync 后冻结配额]"
+        reward_label = "估算参考奖励 (未结算)"
+    elif epoch_ended is True and epoch_settled is True:
+        settlement_status = f"[已结束且已结算 (lastSynced={last_synced} > Epoch {epoch_to_claim})]"
+        reward_label = "已结算可领取奖励"
+    else:
+        settlement_status = "[未获取轮次结束/结算高度 - 暂按估算口径展示，以链上结算为准]"
+        reward_label = "估算参考奖励 (待确认)"
+
+    print(f"  • 轮次结算状态:     {settlement_status}")
     print(f"  • 轮次有效配额:     {r_details['effectiveQuota'] / 1e18:.4f} TTK")
     print(f"  • 矿工有效权重:     {r_details['userWeight']:,}")
     print(f"  • 全网总权重分母:   {max(r_details['totalWeight'], r_details['wMin']):,} (totalWeight={r_details['totalWeight']:,}, wMin={r_details['wMin']:,})")
     print(f"  • 单地址比例上限:   {r_details['capBps'] / 100:.2f}%")
     print(f"  • 链上已领取标记:   {r_details['claimed']}")
-    print(f"  • 预期可领取奖励:   {r_details['expectedReward'] / 1e18:.6f} TTK ({r_details['expectedReward']} wei)")
+    print(f"  • {reward_label}: {r_details['expectedReward'] / 1e18:.6f} TTK ({r_details['expectedReward']} wei)")
 
     if r_details["claimed"]:
         print(f"\n[提示] 该轮次 Epoch {epoch_to_claim} 的奖励此前已在链上领取完毕，无需重复操作。")
         return
 
     if r_details["userWeight"] == 0:
-        print(f"\n[错误] 矿工在 Epoch {epoch_to_claim} 没有任何算力权重 (userWeight == 0)，无法领取。")
+        if epoch_ended is False:
+            print(f"\n[提示] Epoch {epoch_to_claim} 尚未结束 (当前 Epoch {cur_epoch})，且矿工当前暂无算力权重 (userWeight == 0)，无法领取。")
+        else:
+            print(f"\n[错误] 矿工在 Epoch {epoch_to_claim} 没有任何算力权重 (userWeight == 0)，无法领取。")
         return
 
     # 4. Mandatory Preflight eth_call Simulation
@@ -510,25 +588,43 @@ def claim(args):
     print(f"  [+] eth_call 模拟调用通过！无 revert 错误。")
     print(f"  [+] 预估 Gas Limit: {gas_est:,}")
 
-    # 5. Check Gas Price
-    net_gas_price_hex = rpc_call(rpc_url, "eth_gasPrice", [])
-    network_gas_price_wei = int(net_gas_price_hex, 16)
-    network_gas_price_gwei = network_gas_price_wei / 1e9
-    print(f"  [+] 当前网络 Gas 价格: {network_gas_price_gwei:.3f} gwei ({network_gas_price_wei} wei)")
+    # 5. Resolve EIP-1559 Fees (type 2: maxFeePerGas & maxPriorityFeePerGas)
+    fee_info = resolve_eip1559_fees(
+        rpc_url=rpc_url,
+        rpc_call_fn=rpc_call,
+        gas_multiplier=args.gas_multiplier,
+        max_fee_per_gas_gwei=getattr(args, "max_fee_per_gas_gwei", None),
+        priority_fee_per_gas_gwei=getattr(args, "priority_fee_per_gas_gwei", None),
+        deprecated_gas_price_gwei=getattr(args, "gas_price_gwei", None),
+    )
+    network_gas_price_wei = fee_info["network_gas_price_wei"]
+    network_priority_fee_wei = fee_info["network_priority_fee_wei"]
+    max_fee_wei = fee_info["max_fee_per_gas_wei"]
+    priority_fee_wei = fee_info["priority_fee_per_gas_wei"]
 
-    multiplier = max(1.0, float(args.gas_multiplier))
-    target_gas_price_wei = int(network_gas_price_wei * multiplier)
+    if network_gas_price_wei is not None:
+        print(f"  [+] 当前网络 Gas 价格 (eth_gasPrice): {network_gas_price_wei / 1e9:.3f} gwei ({network_gas_price_wei} wei)")
+    else:
+        print(f"  [+] 显式 Max Fee 覆盖 (maxFeePerGas): {max_fee_wei / 1e9:.3f} gwei ({max_fee_wei} wei) [未查询 eth_gasPrice，不适用]")
+    if network_priority_fee_wei is not None:
+        print(f"  [+] 当前网络建议优先费 (eth_maxPriorityFeePerGas): {network_priority_fee_wei / 1e9:.3f} gwei ({network_priority_fee_wei} wei)")
+    else:
+        print(f"  [+] 显式优先费覆盖 (maxPriorityFeePerGas): {priority_fee_wei / 1e9:.3f} gwei ({priority_fee_wei} wei) [未查询 eth_maxPriorityFeePerGas]")
 
-    if args.gas_price_gwei is not None:
-        override_wei = int(float(args.gas_price_gwei) * 1e9)
-        if override_wei < network_gas_price_wei:
-            print(f"  [警告] 指定 Gas Price ({args.gas_price_gwei} gwei) 低于网络价，强制提升至网络价下限。")
-            target_gas_price_wei = network_gas_price_wei
-        else:
-            target_gas_price_wei = override_wei
+    for warn_kind, orig_val, lifted_val in fee_info["warnings"]:
+        if warn_kind == "priority_floor":
+            print(f"  [警告] 计算所得 Max Fee ({orig_val / 1e9:.3f} gwei) 低于 Priority Fee，已提升至 {lifted_val / 1e9:.3f} gwei。")
 
-    print(f"  [+] 最终交易 Gas 价格: {target_gas_price_wei / 1e9:.3f} gwei ({target_gas_price_wei} wei)")
-    assert target_gas_price_wei >= network_gas_price_wei, "安全校验: 交易 gas price 必须 >= 网络当前 gas price！"
+    gas_limit = max(gas_est + 40000, cli_fee_cfg["gas_limit"])
+    max_gas_cost_bnb = (gas_limit * max_fee_wei) / 1e18
+    print(f"  [+] 最终 Max Fee (maxFeePerGas): {max_fee_wei / 1e9:.3f} gwei ({max_fee_wei} wei)")
+    print(f"  [+] 最终 Priority Fee (maxPriorityFeePerGas): {priority_fee_wei / 1e9:.3f} gwei ({priority_fee_wei} wei)")
+    print(f"  [+] Gas Limit 上限: {gas_limit:,}")
+    print(f"  [+] 最大 Gas 费用上限: {max_gas_cost_bnb:.6f} BNB")
+    if network_gas_price_wei is not None and not fee_info["explicit_max_fee"] and max_fee_wei < network_gas_price_wei:
+        raise ValueError("安全校验失败: 自动计算的 maxFeePerGas 不得低于网络当前 gas price。")
+    if max_fee_wei < priority_fee_wei:
+        raise ValueError("安全校验失败: maxFeePerGas 不得低于 maxPriorityFeePerGas。")
 
     # If NOT in --send mode, stop here and guide the user
     if not args.send:
@@ -536,10 +632,10 @@ def claim(args):
         print("                  预检成功 (DRY-RUN SIMULATION PASSED)")
         print("=" * 78)
         print(f"本操作为只读预检，尚未向网络广播任何交易。")
-        print(f"若要向网络广播真实领取交易，请执行以下步骤:")
-        print(f"  1. 确保已将矿工私钥注入环境变量: $env:PRIVATE_KEY=\"0x...\" (或 export PRIVATE_KEY=\"0x...\")")
+        print(f"若要向网络广播真实领取交易，请使用 Foundry keystore 签名并执行:")
+        print(f"  1. 准备 Foundry keystore 账户与密码文件 (--account 与 --password-file)")
         print(f"  2. 添加 --send 参数执行:")
-        print(f"     python script/claim.py --epoch {epoch_to_claim} --send")
+        print(f"     python script/claim.py --epoch {epoch_to_claim} --send --account <keystore_account> --password-file <password_file_path>")
         print("=" * 78)
         return
 
@@ -550,11 +646,14 @@ def claim(args):
     print(f"合约目标:     {miner_contract} (MinerV1 Proxy)")
     print(f"签名调用方:   {miner_addr}")
     print(f"调用函数:     claim(uint256 e = {epoch_to_claim})")
-    print(f"预期铸造量:   {r_details['expectedReward'] / 1e18:.6f} TTK")
-    gas_limit = max(gas_est + 40000, int(args.gas_limit))
+    if epoch_settled is True:
+        print(f"已结算领取量: {r_details['expectedReward'] / 1e18:.6f} TTK")
+    else:
+        print(f"估算铸造量:   {r_details['expectedReward'] / 1e18:.6f} TTK (以链上结算为准)")
     print(f"Gas Limit:    {gas_limit:,}")
-    print(f"Gas 价格:     {target_gas_price_wei / 1e9:.3f} gwei ({target_gas_price_wei} wei)")
-    print(f"预计 Gas 费:  {(gas_limit * target_gas_price_wei) / 1e18:.6f} BNB")
+    print(f"Max Fee:      {max_fee_wei / 1e9:.3f} gwei ({max_fee_wei} wei)")
+    print(f"Priority Fee: {priority_fee_wei / 1e9:.3f} gwei ({priority_fee_wei} wei)")
+    print(f"最大 Gas 费上限: {max_gas_cost_bnb:.6f} BNB")
     print("=" * 78)
 
     # Secondary confirmation prompt
@@ -584,8 +683,9 @@ def claim(args):
                 password_file=args.password_file,
                 rpc_url=rpc_url,
                 nonce=account_nonce,
-                gas_price=target_gas_price_wei,
+                gas_price=max_fee_wei,
                 gas_limit=gas_limit,
+                priority_gas_price=priority_fee_wei,
             )
         except CastSendUncertainError as e:
             safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
@@ -598,11 +698,13 @@ def claim(args):
     else:
         from eth_account import Account
         tx_dict = {
+            "type": 2,
             "to": miner_contract,
             "from": miner_addr,
             "value": 0,
             "gas": gas_limit,
-            "gasPrice": target_gas_price_wei,
+            "maxFeePerGas": max_fee_wei,
+            "maxPriorityFeePerGas": priority_fee_wei,
             "nonce": account_nonce,
             "chainId": chain_id,
             "data": calldata_hex,
@@ -635,7 +737,10 @@ def claim(args):
         if status == 1:
             print(f"[交易成功] 交易已在区块 #{block_num} 确认！")
             print(f"实际消耗 Gas: {gas_used:,}")
-            print(f"成功领取 Epoch {epoch_to_claim} 奖励 {r_details['expectedReward'] / 1e18:.6f} TTK！")
+            if epoch_settled is True:
+                print(f"成功领取 Epoch {epoch_to_claim} 奖励 {r_details['expectedReward'] / 1e18:.6f} TTK！")
+            else:
+                print(f"成功领取 Epoch {epoch_to_claim} 奖励（估算参考 {r_details['expectedReward'] / 1e18:.6f} TTK，实际以链上结算为准）！")
         else:
             print(f"[交易回滚] 交易在区块 #{block_num} 回滚，执行失败！")
             print(f"消耗 Gas: {gas_used:,}")
@@ -653,8 +758,10 @@ def main():
     parser.add_argument("--send", action="store_true", help="发送真实链上交易 (默认仅进行 eth_call 预检)")
     parser.add_argument("--rpc", type=str, default=None, help="自定义 BSC Testnet RPC 节点")
     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="MinerV1 代理合约地址")
-    parser.add_argument("--gas-multiplier", type=float, default=1.15, help="Gas price 浮动乘数 (默认: 1.15)")
-    parser.add_argument("--gas-price-gwei", type=float, default=None, help="指定的 Gas 价格 (gwei, 不得低于网络价)")
+    parser.add_argument("--gas-multiplier", type=str, default="1.15", help="Max fee 浮动乘数 (默认: 1.15)")
+    parser.add_argument("--max-fee-per-gas-gwei", type=str, default=None, help="显式指定 EIP-1559 maxFeePerGas (gwei)")
+    parser.add_argument("--priority-fee-per-gas-gwei", type=str, default=None, help="显式指定 EIP-1559 maxPriorityFeePerGas (gwei)")
+    parser.add_argument("--gas-price-gwei", type=str, default=None, help="[兼容别名] 等同于 --max-fee-per-gas-gwei (gwei)")
     parser.add_argument("--gas-limit", type=int, default=250000, help="Gas Limit 上限 (默认: 250000)")
 
     args = parser.parse_args()

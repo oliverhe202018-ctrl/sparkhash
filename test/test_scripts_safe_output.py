@@ -139,8 +139,11 @@ class TestScriptsSafeOutput(unittest.TestCase):
             hdrs=None,
             fp=io.BytesIO(b"Unauthorized raw body"),
         )
-        with patch("urllib.request.urlopen", side_effect=http_err):
-            code, out, err = _run_cli(status.main, argv, env)
+        try:
+            with patch("urllib.request.urlopen", side_effect=http_err):
+                code, out, err = _run_cli(status.main, argv, env)
+        finally:
+            http_err.close()
         self.assertEqual(code, 1)
         self._assert_no_secrets(out, err)
         self.assertIn("HTTPError(401):", err)
@@ -263,8 +266,11 @@ class TestScriptsSafeOutput(unittest.TestCase):
             hdrs=None,
             fp=io.BytesIO(b"Forbidden raw upstream body"),
         )
-        with patch("urllib.request.urlopen", side_effect=http_err_plain):
-            code, out, err = _run_cli(claim.main, argv, env)
+        try:
+            with patch("urllib.request.urlopen", side_effect=http_err_plain):
+                code, out, err = _run_cli(claim.main, argv, env)
+        finally:
+            http_err_plain.close()
         self.assertEqual(code, 1)
         self._assert_no_secrets(out, err)
         self.assertIn("HTTPError(403):", err)
@@ -287,6 +293,8 @@ class TestScriptsSafeOutput(unittest.TestCase):
                     {"jsonrpc": "2.0", "id": 3, "result": _abi_word_uint(1500)},
                     {"jsonrpc": "2.0", "id": 4, "result": _abi_word_uint(2000)},
                     {"jsonrpc": "2.0", "id": 5, "result": "0x" + encode(["bool"], [False]).hex()},
+                    {"jsonrpc": "2.0", "id": 6, "result": _abi_word_uint(10)},
+                    {"jsonrpc": "2.0", "id": 7, "result": _abi_word_uint(10)},
                 ]
                 return _FakeHTTPResponse(resp)
             raise AssertionError(f"Unexpected request: {payload}")
@@ -304,7 +312,7 @@ class TestScriptsSafeOutput(unittest.TestCase):
                 return "0x61"
             raise RuntimeError(leak_msg)
 
-        batch_ok = [100 * 10**18, 3000, 1000, 1500, 2000, False]
+        batch_ok = [100 * 10**18, 3000, 1000, 1500, 2000, False, 10, 10]
         batch_hex = [_abi_word_uint(v) if isinstance(v, int) and not isinstance(v, bool) else ("0x" + encode(["bool"], [v]).hex()) for v in batch_ok]
         with patch.object(claim, "rpc_call", side_effect=fake_rpc_call_direct), patch.object(claim, "rpc_batch_call", return_value=batch_hex):
             code, out, err = _run_cli(claim.main, argv, env)
@@ -341,6 +349,8 @@ class TestScriptsSafeOutput(unittest.TestCase):
                     _abi_word_uint(1500),
                     _abi_word_uint(2000),
                     "0x" + encode(["bool"], [False]).hex(),
+                    _abi_word_uint(10),
+                    _abi_word_uint(10),
                 ]
                 return _FakeHTTPResponse([{"jsonrpc": "2.0", "id": i, "result": v} for i, v in enumerate(vals)])
             method = payload["method"]
@@ -352,6 +362,8 @@ class TestScriptsSafeOutput(unittest.TestCase):
                 return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": hex(120000)})
             if method == "eth_gasPrice":
                 return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": hex(2_000_000_000)})
+            if method == "eth_maxPriorityFeePerGas":
+                return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": hex(100_000_000)})
             raise AssertionError(f"Unexpected RPC method: {method}")
 
         argv = ["claim.py", "--epoch", "4", "--miner", TEST_MINER, "--rpc", KEY_URL]
@@ -367,8 +379,13 @@ class TestScriptsSafeOutput(unittest.TestCase):
         self.assertIn("目标领取轮次:        Epoch 4", out)
         self.assertIn("20.000000 TTK (20000000000000000000 wei)", out)
         self.assertIn("预估 Gas Limit: 120,000", out)
-        self.assertIn("最终交易 Gas 价格: 2.300 gwei (2300000000 wei)", out)
+        self.assertIn("最终 Max Fee (maxFeePerGas): 2.300 gwei (2300000000 wei)", out)
+        self.assertIn("最终 Priority Fee (maxPriorityFeePerGas): 0.100 gwei (100000000 wei)", out)
+        self.assertIn("最大 Gas 费用上限:", out)
         self.assertIn("DRY-RUN SIMULATION PASSED", out)
+        self.assertIn("--account", out)
+        self.assertIn("--password-file", out)
+        self.assertNotIn("PRIVATE_KEY", out)
 
         with patch.object(claim, "rpc_call", side_effect=RuntimeError("RPC Error (eth_call): execution reverted | data: 0x756b7857")):
             ok, gas_est, rev_err, _ = claim.simulate_claim(KEY_URL, TEST_CONTRACT, TEST_MINER, 4)
@@ -407,8 +424,11 @@ class TestScriptsSafeOutput(unittest.TestCase):
             hdrs=None,
             fp=io.BytesIO(b"Unauthorized raw body"),
         )
-        with patch("urllib.request.urlopen", side_effect=http_err_plain):
-            code, out, err = _run_cli(submit_share.main, argv, env)
+        try:
+            with patch("urllib.request.urlopen", side_effect=http_err_plain):
+                code, out, err = _run_cli(submit_share.main, argv, env)
+        finally:
+            http_err_plain.close()
         self.assertEqual(code, 1)
         self._assert_no_secrets(out, err)
         self.assertIn("HTTPError(401):", err)
@@ -421,6 +441,8 @@ class TestScriptsSafeOutput(unittest.TestCase):
                 return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": "0x61"})
             if method == "eth_gasPrice":
                 return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": hex(3_000_000_000)})
+            if method == "eth_maxPriorityFeePerGas":
+                return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": hex(100_000_000)})
             if method == "eth_call":
                 return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": leak_msg, "data": PK_HEX}})
             raise AssertionError(f"Unexpected method: {method}")
@@ -456,6 +478,8 @@ class TestScriptsSafeOutput(unittest.TestCase):
                 return "0x61"
             if method == "eth_gasPrice":
                 return hex(3_000_000_000)
+            if method == "eth_maxPriorityFeePerGas":
+                return hex(100_000_000)
             if method == "eth_call":
                 return "0x"
             if method == "eth_estimateGas":
@@ -497,6 +521,8 @@ class TestScriptsSafeOutput(unittest.TestCase):
                 return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": "0x61"})
             if method == "eth_gasPrice":
                 return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": hex(3_000_000_000)})
+            if method == "eth_maxPriorityFeePerGas":
+                return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": hex(100_000_000)})
             if method == "eth_call":
                 return _FakeHTTPResponse({"jsonrpc": "2.0", "id": 1, "result": "0x"})
             if method == "eth_estimateGas":
@@ -529,6 +555,12 @@ class TestScriptsSafeOutput(unittest.TestCase):
         self.assertIn(f"Share Hash:       {TEST_SHARE_HASH}", out)
         self.assertIn("[SUCCESS] Preflight simulation passed! Estimated gas: 140,000", out)
         self.assertIn("SIMULATION COMPLETED (DRY-RUN)", out)
+        self.assertIn("3.450 gwei (3450000000 wei)", out)
+        self.assertIn("0.100 gwei (100000000 wei)", out)
+        self.assertIn("Max Gas Fee Ceiling:", out)
+        self.assertIn("--account", out)
+        self.assertIn("--password-file", out)
+        self.assertNotIn("MINER_PRIVATE_KEY", out)
 
 
 if __name__ == "__main__":
