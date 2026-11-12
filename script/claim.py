@@ -548,8 +548,10 @@ def claim(args):
         reward_label = "估算参考奖励 (未结束)"
     elif epoch_ended is True and epoch_settled is False:
         sync_info = f"lastSynced={last_synced}" if last_synced is not None else "尚未 sync 结算"
-        settlement_status = f"[已结束但尚未结算 ({sync_info}) - 仅作估算，需待 sync 后冻结配额]"
-        reward_label = "估算参考奖励 (未结算)"
+        settlement_status = (
+            f"[已结束但尚未结算 ({sync_info}) - 仅作动态估算，实际结算配额将在 claim 交易内自动结算冻结（或由 Keeper sync 结算）]"
+        )
+        reward_label = "估算参考奖励 (待claim内结算或sync)"
     elif epoch_ended is True and epoch_settled is True:
         settlement_status = f"[已结束且已结算 (lastSynced={last_synced} > Epoch {epoch_to_claim})]"
         reward_label = "已结算可领取奖励"

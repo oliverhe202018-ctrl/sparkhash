@@ -6174,3 +6174,34 @@ class TestKeeperEip1559K3(unittest.TestCase):
             recon = bot.reconcile_pre_replacement("sync", self.MINER, "0x93afb4c5", 5, 200_000, 10**9, 2*10**8, "0x11"*32, [])
             self.assertEqual(recon["action"], "STOP_LOCK")
             self.assertEqual(recon["reason_code"], "NONCE_READING_ANOMALY")
+
+    def test_rpc_call_closes_http_error_response_and_sanitizes(self):
+        import io, urllib.error
+        from script.keeper import rpc_call
+
+        class DummyFP(io.BytesIO):
+            def __init__(self, data):
+                super().__init__(data)
+                self.is_closed = False
+            def close(self):
+                self.is_closed = True
+                super().close()
+
+        # 1. HTTPError with JSON body
+        fp1 = DummyFP(b'{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"execution reverted"}}')
+        err1 = urllib.error.HTTPError("http://example.com", 500, "Internal Server Error", {}, fp1)
+        with patch("urllib.request.urlopen", side_effect=err1):
+            with self.assertRaises(Exception) as ctx:
+                rpc_call("http://example.com", "eth_call", [])
+            self.assertIn("execution reverted", str(ctx.exception))
+            self.assertTrue(fp1.is_closed)
+
+        # 2. HTTPError with non-JSON body and sensitive reason
+        fp2 = DummyFP(b'Bad Gateway HTML')
+        err2 = urllib.error.HTTPError("http://example.com", 502, "Bad Gateway with secret https://user:pass@rpc.node", {}, fp2)
+        with patch("urllib.request.urlopen", side_effect=err2):
+            with self.assertRaises(RuntimeError) as ctx:
+                rpc_call("http://example.com", "eth_call", [])
+            self.assertIn("HTTP Error 502", str(ctx.exception))
+            self.assertNotIn("pass@", str(ctx.exception))
+            self.assertTrue(fp2.is_closed)

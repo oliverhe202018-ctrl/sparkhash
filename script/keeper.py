@@ -654,10 +654,18 @@ def rpc_call(rpc_url, method, params):
             res = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
-            err_body = e.read().decode("utf-8")
+            if getattr(e, "fp", None) is not None:
+                err_body = e.read().decode("utf-8", errors="replace")
+                e.close()
+            else:
+                err_body = ""
             res = json.loads(err_body)
         except Exception:
-            raise RuntimeError(f"HTTP Error {e.code}: {e.reason}") from None
+            try:
+                e.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"HTTP Error {e.code}: {sanitize_text(str(e.reason))}") from None
     except urllib.error.URLError as e:
         reason = type(e.reason).__name__ if isinstance(e.reason, Exception) else str(e.reason)
         raise RuntimeError(f"URLError: {sanitize_text(str(reason))}") from None

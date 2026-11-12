@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import json
+import math
 import struct
 import argparse
 import urllib.error
@@ -796,6 +797,8 @@ def mine(args):
         if diff_bits < 0 or diff_bits > 256:
             raise ValueError(f"Invalid difficulty_bits={diff_bits}; must be 0..256")
         target_int = (1 << (256 - diff_bits)) if diff_bits > 0 else ((1 << 256) - 1)
+        if target_int <= 0:
+            raise ValueError(f"Resolved target from difficulty_bits={diff_bits} must be > 0, got {target_int}")
     else:
         if not args.rpc:
             raise RuntimeError(
@@ -803,18 +806,22 @@ def mine(args):
             )
         target_data = SELECTOR_TARGET + encode_uint256(cur_epoch)  # target(uint256)
         target_int = get_uint_call(args.rpc, miner_contract, target_data, f"target({cur_epoch})")
-        if target_int == 0:
+        if target_int <= 0:
             raise RuntimeError(
                 f"On-chain target({cur_epoch}) is 0 (epoch not initialized/synced or invalid target); "
                 f"refusing fallback to default 32-bit target (1<<224)."
             )
         diff_bits = 256 - target_int.bit_length()
 
+    if target_int <= 0:
+        raise RuntimeError(f"Target must be strictly positive, got {target_int}")
+
     target_bytes = target_int.to_bytes(32, "big")
     target_lanes = struct.unpack(">4Q", target_bytes)
-    expected_trials = 2 ** diff_bits
-    print(f"Target Difficulty: {diff_bits} bits (Target: 0x{target_bytes.hex()[:16]}...)")
-    print(f"Expected Hashes:  2^{diff_bits} = {expected_trials:,}")
+    expected_trials = (1 << 256) / target_int
+    display_diff_bits = 256.0 - math.log2(target_int)
+    print(f"Target Difficulty: {display_diff_bits:.2f} bits (Target: 0x{target_bytes.hex()[:16]}...)")
+    print(f"Expected Hashes:  2^{display_diff_bits:.2f} ≈ {expected_trials:,.0f}")
 
     # 5. Resolve Share Index k
     if args.k is not None:
@@ -929,10 +936,16 @@ def mine(args):
                 overall_dt = now - start_time
                 avg_rate = total_hashes / overall_dt if overall_dt > 0 else 0
                 pct = (total_hashes / expected_trials * 100) if expected_trials > 0 else 0
-                eta_sec = ((expected_trials - total_hashes) / avg_rate) if (avg_rate > 0 and total_hashes < expected_trials) else 0
+                if total_hashes >= expected_trials:
+                    eta_str = "已超过统计期望 (Over expected trials)"
+                elif avg_rate > 0:
+                    eta_sec = (expected_trials - total_hashes) / avg_rate
+                    eta_str = f"{eta_sec:.1f}s ({eta_sec/60:.1f}m)"
+                else:
+                    eta_str = "N/A"
                 print(
                     f"[Progress] Hashes: {total_hashes:,.0f} | Speed: {avg_rate/1e6:.2f} MH/s "
-                    f"| Done: {pct:.2f}% | Expected ETA: {eta_sec:.1f}s ({eta_sec/60:.1f}m)",
+                    f"| Done: {pct:.2f}% | Expected ETA: {eta_str}",
                     flush=True
                 )
                 last_log_time = now
