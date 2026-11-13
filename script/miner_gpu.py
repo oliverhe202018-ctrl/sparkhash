@@ -818,10 +818,13 @@ def mine(args):
 
     target_bytes = target_int.to_bytes(32, "big")
     target_lanes = struct.unpack(">4Q", target_bytes)
-    expected_trials = (1 << 256) / target_int
-    display_diff_bits = 256.0 - math.log2(target_int)
+    expected_trials = (1 << 256) / (target_int + 1)
+    display_diff_bits = 256.0 - math.log2(target_int + 1)
     print(f"Target Difficulty: {display_diff_bits:.2f} bits (Target: 0x{target_bytes.hex()[:16]}...)")
-    print(f"Expected Hashes:  2^{display_diff_bits:.2f} ≈ {expected_trials:,.0f}")
+    print(
+        f"Expected Hashes:  2^{display_diff_bits:.2f} ≈ {expected_trials:,.0f} "
+        f"(statistical expectation approx; consensus check remains hash <= target)"
+    )
 
     # 5. Resolve Share Index k
     if args.k is not None:

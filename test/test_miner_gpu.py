@@ -924,17 +924,18 @@ class TestMinerGpuPrechecksAndSecurity(unittest.TestCase):
 
     def test_target_zero_explicit_and_rpc_rejected(self):
         mock_cl = MagicMock()
-        # Explicit target=0
-        with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
-             patch.object(miner_gpu, "HAS_NUMPY", True), \
-             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
-             patch("script.miner_gpu.verify_chain_id", return_value=97), \
-             patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call()), \
-             patch("script.miner_gpu.cl", mock_cl, create=True):
-            with self.assertRaises(ValueError) as ctx:
-                miner_gpu.mine(self._make_args(target="0"))
-            self.assertIn("Explicit --target must be > 0", str(ctx.exception))
-            mock_cl.Context.assert_not_called()
+        # Explicit target <= 0 rejected
+        for invalid_t in ["0", "-1"]:
+            with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+                 patch.object(miner_gpu, "HAS_NUMPY", True), \
+                 patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+                 patch("script.miner_gpu.verify_chain_id", return_value=97), \
+                 patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call()), \
+                 patch("script.miner_gpu.cl", mock_cl, create=True):
+                with self.assertRaises(ValueError) as ctx:
+                    miner_gpu.mine(self._make_args(target=invalid_t))
+                self.assertIn("Explicit --target must be > 0", str(ctx.exception))
+                mock_cl.Context.assert_not_called()
 
         # Target 2^224 displays approx 2^32.00
         mock_cl.Context.side_effect = MiningStoppedAtGpuBoundary("GPU boundary")
@@ -951,9 +952,43 @@ class TestMinerGpuPrechecksAndSecurity(unittest.TestCase):
             out = f.getvalue()
             self.assertIn("Target Difficulty: 32.00 bits", out)
             self.assertIn("Expected Hashes:  2^32.00 ≈ 4,294,967,296", out)
+            self.assertIn("statistical expectation approx", out)
+
+        # Target = 1: (1<<256) / (1 + 1) = 2^255 expected trials, difficulty = 255.00 bits
+        f_one = io.StringIO()
+        with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+             patch.object(miner_gpu, "HAS_NUMPY", True), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call(target=hex(1))), \
+             patch("script.miner_gpu.cl", mock_cl, create=True), \
+             redirect_stdout(f_one):
+            with self.assertRaises(MiningStoppedAtGpuBoundary):
+                miner_gpu.mine(self._make_args())
+            out_one = f_one.getvalue()
+            self.assertIn("Target Difficulty: 255.00 bits", out_one)
+            self.assertIn("Expected Hashes:  2^255.00 ≈ 57,896,044,618,658,097,711,785,492,504,343,953,926,634,992,332,820,282,019,728,792,003,956,564,819,968", out_one)
+            self.assertIn("statistical expectation approx", out_one)
+
+        # Target = 2^256 - 1: (1<<256) / 2^256 = 1 expected trial, difficulty = 0.00 bits
+        max_target = (1 << 256) - 1
+        f_max = io.StringIO()
+        with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
+             patch.object(miner_gpu, "HAS_NUMPY", True), \
+             patch("script.miner_gpu.detect_devices", return_value=[{"device_obj": MagicMock(), "name": "MockGPU", "backend": "Mock"}]), \
+             patch("script.miner_gpu.verify_chain_id", return_value=97), \
+             patch("script.miner_gpu.eth_call", side_effect=self._make_eth_call(target=hex(max_target))), \
+             patch("script.miner_gpu.cl", mock_cl, create=True), \
+             redirect_stdout(f_max):
+            with self.assertRaises(MiningStoppedAtGpuBoundary):
+                miner_gpu.mine(self._make_args())
+            out_max = f_max.getvalue()
+            self.assertIn("Target Difficulty: 0.00 bits", out_max)
+            self.assertIn("Expected Hashes:  2^0.00 ≈ 1", out_max)
+            self.assertIn("statistical expectation approx", out_max)
 
         # Non power of 2 target: target = 3 * (1 << 223)
-        # Expected trials = 2^256 / (3 * 2^223) = 2^33 / 3 ≈ 2,863,311,531
+        # Expected trials = 2^256 / (3 * 2^223 + 1) ≈ 2,863,311,531
         non_pow2_target = 3 * (1 << 223)
         f_non_pow2 = io.StringIO()
         with patch.object(miner_gpu, "HAS_PYOPENCL", True), \
@@ -966,4 +1001,6 @@ class TestMinerGpuPrechecksAndSecurity(unittest.TestCase):
             with self.assertRaises(MiningStoppedAtGpuBoundary):
                 miner_gpu.mine(self._make_args())
             out_np = f_non_pow2.getvalue()
+            self.assertIn("Target Difficulty: 31.42 bits", out_np)
             self.assertIn("2,863,311,531", out_np)
+            self.assertIn("statistical expectation approx", out_np)
