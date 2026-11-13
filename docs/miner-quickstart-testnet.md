@@ -4,7 +4,7 @@
 > **测试网环境与免责提示**  
 > 1. 本指引专供 **PoolCoin RC2 (BSC Testnet, chainId 97)** 的 **M1 阶段（有限受邀、有人协助）** 测试者使用。测试网上的 tBNB 及 TTK 代币仅用于协议功能闭环验证，**无任何真实货币价值**。  
 > 2. 测试网可能因治理演练、参数校准或升级验证随时发生重启、暂停或重新部署。  
-> 3. 本指引中的所有命令均基于当前仓库源码及 CLI 参数经过严格静态核对，**尚未在完全干净的外部硬件环境中实机跑通**。测试过程中如遇任何未预期的异常，请立即停止操作并联系测试协调员。  
+> 3. **实机记录与验收范围说明**：本指引核心流程已在 Epoch 122 完成 GPU 实机闭环验证（详见证据报告 [rc2-gpu-live-e122-evidence.md](rc2-gpu-live-e122-evidence.md)）。必须明确：该实机记录基于现有开发机器及既有成熟押金账户，**并非新用户从零安装、新钱包首次存入质押或本金退出的完整验收**。在干净的独立环境实测前，仍需谨慎核对各环节条件。  
 > 4. **零私钥泄露原则**：本指引全程强制采用 Foundry 加密 Keystore 托管机制。严禁在终端明文输入私钥，严禁配置包含私钥的环境变量，严禁向任何第三方或 AI 透露密码与私钥。
 
 ---
@@ -34,9 +34,10 @@ Get-ChildItem -Directory script, src, test
 
 首版主路径严格限定为：**Windows 10 / 11 + PowerShell 5.1 或 PowerShell 7+**。
 
-### 2.1 Python 环境统一性说明（避免环境错位）
-在 Windows 多 Python 环境共存时，直接运行全局 `pip` 极易将依赖安装到系统全局路径，导致执行 `python script/...` 时仍然抛出 `ModuleNotFoundError`。  
-**强制要求**：始终使用 `python -m pip` 来确保依赖安装与当前执行的 Python 解释器严格绑定在同一环境。
+### 2.1 Python 环境统一性与版本证据说明
+- **实测验证环境**：本次离线回归与 Epoch 122 GPU 实机闭环验证均在 **Python 3.14.5** 环境下执行通过。
+- **兼容性边界**：该实测结果**不是所有 Python 版本的兼容证明**。常规推荐范围（Python 3.10 ~ 3.12）主要基于主流依赖库生态基线，但**这些版本未在本轮中进行实测验收**，请勿擅自扩大版本支持承诺。
+- **环境统一性（避免环境错位）**：在 Windows 多 Python 环境共存时，直接运行全局 `pip` 极易将依赖安装到系统全局路径，导致执行 `python script/...` 时仍然抛出 `ModuleNotFoundError`。**强制要求**始终使用 `python -m pip` 确保依赖安装与当前执行的 Python 解释器严格绑定在同一环境。
 
 ```powershell
 # [只读检查] 确认当前 Python 解释器路径及 pip 所属环境
@@ -72,11 +73,11 @@ cast --version
 ### 3.1 统一 RPC 节点配置与 chainId=97 检查
 在 PowerShell 会话中设置统一的 RPC 变量：
 ```powershell
-# [会话配置] 设置主用 RPC 节点
-$RPC_URL = "https://data-seed-prebsc-1-s1.binance.org:8545"
+# [会话配置] 设置默认 RPC 节点（本次实机验证跑通节点）
+$RPC_URL = "https://bsc-testnet-rpc.publicnode.com"
 
-# [备用节点] 若主用节点网络超时或异常，可手动切换：
-# $RPC_URL = "https://bsc-testnet-rpc.publicnode.com"
+# [备用节点] 备用公开节点（未在本次用户网络下完整验证通过，仅作备用切换）：
+# $RPC_URL = "https://data-seed-prebsc-1-s1.binance.org:8545"
 ```
 
 > [!CAUTION]
@@ -273,6 +274,11 @@ python script/miner_gpu.py --miner $MINER_ADDR --out share_k0.json --rpc $RPC_UR
 > **GPU 进度百分比超过 100% 的数学含义**  
 > GPU 挖矿终端输出中的 `Done: 115.00%` 表示当前已扫描的 Nonce 数量超过了理论平均期望值（泊松分布数学期望）。  
 > 泊松过程中，有约 36.8% 的概率单次搜寻哈希数会超过 100% 期望值。这属于**正常的随机波动，不代表程序卡死，也不代表即将完成或保证命中**，显卡仍在正常算力搜寻中。
+
+> [!NOTE]
+> **GPU 求解已知文案与元数据不一致说明**  
+> 在当前实机求解中可能观察到：终端顶部难度显示为 `32.00 bits`，但成功提示文案仍包含 `required >= 31`，且生成的 JSON 文件中存在 `"difficultyBits": 31` 与 `"actualDifficultyBits": 32`。  
+> 此现象属于**待独立修复的元数据与文案不一致**。份额的实际有效性严格依据链上 `target`、密码学 share 校验以及后续的仿真与合约调用，**严禁要求用户手动修改 share JSON 文件**。
 
 ### 跨 Epoch 过期 Share 的失效规则（关键防踩坑）
 - 依据 `src/MinerV1.sol:338`：`if (e != epoch()) revert FutureEpoch();`。
