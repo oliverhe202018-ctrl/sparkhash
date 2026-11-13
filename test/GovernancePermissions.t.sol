@@ -267,4 +267,83 @@ contract GovernancePermissionsTest is Test {
         assertFalse(timelock.hasRole(timelock.PROPOSER_ROLE(), guardian), "Guardian does NOT have PROPOSER_ROLE");
         assertFalse(timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), guardian), "Guardian does NOT have DEFAULT_ADMIN_ROLE");
     }
+
+    /// @notice Test: Verify paused status semantics on submitShares vs claim/sync.
+    /// @dev Demonstrates:
+    ///      - While submissions are paused, submitShares reverts with SubmissionsPausedError.
+    ///      - While submissions are paused, sync(uint256) succeeds as it does not check paused.
+    ///      - While submissions are paused, claim(uint256) succeeds as it is explicitly NEVER PAUSABLE.
+    function test_WhenSubmissionsPaused_SubmitSharesReverts_ClaimAndSyncAllowed() public {
+        // 1. Initial deposit in epoch 0 for Alice
+        vm.warp(start + 1);
+        miner.initEpochSeed(0);
+        vm.prank(alice);
+        vault.deposit{value: DEPOSIT}();
+
+        // 2. Advance to epoch 1: Alice submits share k=0
+        vm.warp(start + 3600);
+        miner.initEpochSeed(1);
+        miner.sync(1);
+
+        // Fast target for epoch 1
+        bytes32 slot1 = keccak256(abi.encode(uint256(1), uint256(10)));
+        vm.store(address(miner), slot1, bytes32(uint256(1) << 248));
+
+        bytes32 es1 = bytes32(miner.epochSeed(1));
+        bytes32 sub1 = keccak256(abi.encode(es1, alice, uint256(0), address(miner), block.chainid));
+        uint256 nonce1 = 0;
+        while (uint256(keccak256(abi.encode(sub1, nonce1))) > uint256(1) << 248) {
+            nonce1++;
+        }
+
+        uint8[] memory ks1 = new uint8[](1);
+        ks1[0] = 0;
+        uint256[] memory nonces1 = new uint256[](1);
+        nonces1[0] = nonce1;
+
+        vm.prank(alice);
+        miner.submitShares(ks1, nonces1);
+
+        // 3. Advance to epoch 2
+        vm.warp(start + 7200);
+
+        // 4. Guardian pauses submissions
+        vm.prank(guardian);
+        miner.pauseSubmissions();
+        assertTrue(miner.paused(), "Submissions paused");
+
+        // 5. While paused: submitShares MUST REVERT with SubmissionsPausedError
+        bytes32 slot2 = keccak256(abi.encode(uint256(2), uint256(10)));
+        vm.store(address(miner), slot2, bytes32(uint256(1) << 248));
+        miner.initEpochSeed(2);
+
+        bytes32 es2 = bytes32(miner.epochSeed(2));
+        bytes32 sub2 = keccak256(abi.encode(es2, alice, uint256(0), address(miner), block.chainid));
+        uint256 nonce2 = 0;
+        while (uint256(keccak256(abi.encode(sub2, nonce2))) > uint256(1) << 248) {
+            nonce2++;
+        }
+
+        uint8[] memory ks2 = new uint8[](1);
+        ks2[0] = 0;
+        uint256[] memory nonces2 = new uint256[](1);
+        nonces2[0] = nonce2;
+
+        vm.prank(alice);
+        vm.expectRevert(MinerV1.SubmissionsPausedError.selector);
+        miner.submitShares(ks2, nonces2);
+
+        // 6. While paused: sync(10) MUST SUCCEED (NEVER PAUSABLE)
+        miner.sync(10);
+        assertEq(miner.lastSynced(), 2, "Sync must advance lastSynced even when submissions are paused");
+
+        // 7. While paused: claim(1) MUST SUCCEED (NEVER PAUSABLE)
+        uint256 balBefore = token.balanceOf(alice);
+        vm.prank(alice);
+        miner.claim(1);
+
+        uint256 claimedAmt = token.balanceOf(alice) - balBefore;
+        assertTrue(claimedAmt > 0, "Alice must receive claim payout even when submissions are paused");
+        assertTrue(miner.claimed(1, alice), "Claim recorded successfully");
+    }
 }

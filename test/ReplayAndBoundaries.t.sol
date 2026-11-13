@@ -75,10 +75,14 @@ contract ReplayAndBoundariesTest is Test {
     }
 
     function _mineNonce(address user, uint8 k) internal view returns (uint256) {
-        bytes32 es = bytes32(miner.epochSeed(1));
+        return _mineNonceForEpoch(1, user, k);
+    }
+
+    function _mineNonceForEpoch(uint256 e, address user, uint8 k) internal view returns (uint256) {
+        bytes32 es = bytes32(miner.epochSeed(e));
         bytes32 sub = keccak256(abi.encode(es, user, uint256(k), address(miner), block.chainid));
         uint256 nonce = 0;
-        uint256 t = miner.target(1);
+        uint256 t = miner.target(e);
         while (uint256(keccak256(abi.encode(sub, nonce))) > t) {
             nonce++;
         }
@@ -282,5 +286,56 @@ contract ReplayAndBoundariesTest is Test {
         uint256 claimedAmt = token.balanceOf(alice) - balBefore;
 
         assertEq(claimedAmt, 0);
+    }
+
+    /// @notice Test: Verify same share index k can be reused across different epochs.
+    /// @dev Demonstrates:
+    ///      - Alice submits k = 2 in epoch 1 -> succeeds, usedMask[1][alice] bit 2 set.
+    ///      - Alice resubmits k = 2 in epoch 1 -> reverts with DuplicateShareIndex.
+    ///      - Epoch advances to 2. Alice submits k = 2 in epoch 2 -> succeeds, usedMask[2][alice] bit 2 set.
+    ///      - Alice resubmits k = 2 in epoch 2 -> reverts with DuplicateShareIndex.
+    function test_SameKCanBeReusedInDifferentEpochs() public {
+        // Epoch 1: Alice submits share with k = 2
+        uint8[] memory ks1 = new uint8[](1);
+        ks1[0] = 2;
+        uint256[] memory nonces1 = new uint256[](1);
+        nonces1[0] = _mineNonceForEpoch(1, alice, 2);
+
+        vm.prank(alice);
+        miner.submitShares(ks1, nonces1);
+
+        assertEq(miner.usedMask(1, alice), 1 << 2, "usedMask for epoch 1 has bit 2 set");
+        assertEq(miner.counted(1, alice), 1, "Alice counted shares in epoch 1 is 1");
+
+        // Submitting duplicate k = 2 within epoch 1 REVERTS
+        vm.prank(alice);
+        vm.expectRevert(MinerV1.DuplicateShareIndex.selector);
+        miner.submitShares(ks1, nonces1);
+
+        // Advance to epoch 2
+        vm.warp(start + 7200);
+        miner.initEpochSeed(2);
+        miner.sync(2);
+
+        // Fast target for epoch 2 (8-bit)
+        bytes32 slot2 = keccak256(abi.encode(uint256(2), uint256(10)));
+        vm.store(address(miner), slot2, bytes32(uint256(1) << 248));
+
+        // In epoch 2, Alice can legally reuse the exact same share index k = 2
+        uint8[] memory ks2 = new uint8[](1);
+        ks2[0] = 2;
+        uint256[] memory nonces2 = new uint256[](1);
+        nonces2[0] = _mineNonceForEpoch(2, alice, 2);
+
+        vm.prank(alice);
+        miner.submitShares(ks2, nonces2);
+
+        assertEq(miner.usedMask(2, alice), 1 << 2, "usedMask for epoch 2 has bit 2 set");
+        assertEq(miner.counted(2, alice), 1, "Alice counted shares in epoch 2 is 1");
+
+        // In epoch 2, submitting duplicate k = 2 again within epoch 2 REVERTS
+        vm.prank(alice);
+        vm.expectRevert(MinerV1.DuplicateShareIndex.selector);
+        miner.submitShares(ks2, nonces2);
     }
 }

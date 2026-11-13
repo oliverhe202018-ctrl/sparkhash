@@ -517,4 +517,280 @@ contract CapAndOverflowConservationTest is Test {
             "Past epoch claim must use immutable snapshot cap of 20%, not new 10% parameter"
         );
     }
+
+    struct BoundaryVars {
+        address carol;
+        address dave;
+        uint256 effQ;
+        uint256 maxReward;
+        uint256 aliceRaw;
+        uint256 bobRaw;
+        uint256 carolRaw;
+        uint256 daveRaw;
+        uint256 carolOverflow;
+        uint256 daveOverflow;
+        uint256 initialR;
+        uint256 initialM;
+        uint256 pendingReserved;
+        uint256 rBefore;
+    }
+
+    /// @notice Test 6: Boundary testing around exactly 20% cap (below, equal, above).
+    /// @dev Demonstrates:
+    ///      - Alice at 19.99% (below): cappedOverflow == 0, full raw payout, zero recycled.
+    ///      - Bob at 20.00% (equal): cappedOverflow == 0, full raw payout, zero recycled.
+    ///      - Carol at 20.01% (above): capped at 20%, cappedOverflow == 0.01%, 0.01% recycled to remainingEmission.
+    ///      - Dave at 40.00% (above): capped at 20%, cappedOverflow == 20%, 20% recycled to remainingEmission.
+    ///      - Total minted (79.99%) + total recycled (20.01%) == 100% of effQ.
+    ///      - Strict 3-term conservation holds at every intermediate step and after all claims.
+    function test_TwentyPercentThreshold_ExactBoundary_BelowEqualAbove() public {
+        BoundaryVars memory v;
+        v.carol = address(0x30);
+        v.dave = address(0x40);
+
+        vm.warp(start + 3600);
+        miner.initEpochSeed(1);
+        miner.sync(1);
+
+        assertEq(miner.wMin(1), 100_000_000_000);
+
+        // Set up weights totaling exactly wm (100_000_000_000) so unallocatedGap == 0:
+        // Alice: 19_990_000_000 (19.99% - strictly below 20%)
+        // Bob:   20_000_000_000 (20.00% - exactly equal 20%)
+        // Carol: 20_010_000_000 (20.01% - strictly above 20%)
+        // Dave:  40_000_000_000 (40.00% - remainder to reach exactly wm)
+        bytes32 slotAlice = keccak256(abi.encode(alice, keccak256(abi.encode(uint256(1), uint256(15)))));
+        vm.store(address(miner), slotAlice, bytes32(uint256(19_990_000_000)));
+
+        bytes32 slotBob = keccak256(abi.encode(bob, keccak256(abi.encode(uint256(1), uint256(15)))));
+        vm.store(address(miner), slotBob, bytes32(uint256(20_000_000_000)));
+
+        bytes32 slotCarol = keccak256(abi.encode(v.carol, keccak256(abi.encode(uint256(1), uint256(15)))));
+        vm.store(address(miner), slotCarol, bytes32(uint256(20_010_000_000)));
+
+        bytes32 slotDave = keccak256(abi.encode(v.dave, keccak256(abi.encode(uint256(1), uint256(15)))));
+        vm.store(address(miner), slotDave, bytes32(uint256(40_000_000_000)));
+
+        bytes32 slotTW = keccak256(abi.encode(uint256(1), uint256(12)));
+        vm.store(address(miner), slotTW, bytes32(uint256(100_000_000_000)));
+
+        // Advance to epoch 2 to settle epoch 1
+        vm.warp(start + 7200);
+        v.initialR = miner.remainingEmission();
+        v.initialM = token.totalMined();
+
+        miner.sync(1);
+
+        v.effQ = miner.settledEpochQuota(1);
+        assertEq(miner.unallocatedGap(1), 0, "Unallocated gap is 0 when tw == wm");
+        assertEq(v.initialR - miner.remainingEmission(), v.effQ, "Settlement must deduct effQ from remainingEmission");
+
+        assertEq(miner.epochAddrCapBps(1), 2000, "Default cap snapshot is 2000 bps (20%)");
+        v.maxReward = (v.effQ * 2000) / 10000;
+
+        // Raw rewards
+        v.aliceRaw = (v.effQ * 19_990_000_000) / 100_000_000_000;
+        v.bobRaw = (v.effQ * 20_000_000_000) / 100_000_000_000;
+        v.carolRaw = (v.effQ * 20_010_000_000) / 100_000_000_000;
+        v.daveRaw = (v.effQ * 40_000_000_000) / 100_000_000_000;
+
+        assertLt(v.aliceRaw, v.maxReward, "Alice raw is strictly below 20% cap");
+        assertEq(v.bobRaw, v.maxReward, "Bob raw is exactly equal to 20% cap");
+        assertGt(v.carolRaw, v.maxReward, "Carol raw is strictly above 20% cap");
+        assertGt(v.daveRaw, v.maxReward, "Dave raw is strictly above 20% cap");
+
+        v.carolOverflow = v.carolRaw - v.maxReward;
+        v.daveOverflow = v.daveRaw - v.maxReward;
+        assertEq(v.carolOverflow, (v.effQ * 10_000_000) / 100_000_000_000, "Carol overflow is exactly 0.01% of effQ");
+        assertEq(v.daveOverflow, (v.effQ * 20_000_000_000) / 100_000_000_000, "Dave overflow is exactly 20.00% of effQ");
+
+        // Pre-claim conservation: totalMined + remainingEmission + pendingReserved == initialConstant
+        v.pendingReserved = v.aliceRaw + v.bobRaw + v.carolRaw + v.daveRaw;
+        assertEq(v.pendingReserved, v.effQ, "Pending reserved equals effQ");
+        assertEq(
+            token.totalMined() + miner.remainingEmission() + v.pendingReserved,
+            v.initialM + v.initialR,
+            "Pre-claim 3-term conservation holds"
+        );
+
+        // 1. Alice claims (below cap): receives aliceRaw, overflow == 0, remainingEmission unchanged
+        v.rBefore = miner.remainingEmission();
+        vm.expectEmit(true, true, false, true, address(miner));
+        emit RewardClaimed(alice, 1, v.aliceRaw, 0);
+        vm.prank(alice);
+        miner.claim(1);
+
+        assertEq(token.balanceOf(alice), v.aliceRaw, "Alice receives exactly aliceRaw (19.99%)");
+        assertEq(miner.remainingEmission(), v.rBefore, "Remaining emission unchanged when below cap");
+
+        v.pendingReserved -= v.aliceRaw;
+        assertEq(
+            token.totalMined() + miner.remainingEmission() + v.pendingReserved,
+            v.initialM + v.initialR,
+            "Conservation after Alice claim holds"
+        );
+
+        // 2. Bob claims (exactly at cap): receives maxReward, overflow == 0, remainingEmission unchanged
+        v.rBefore = miner.remainingEmission();
+        vm.expectEmit(true, true, false, true, address(miner));
+        emit RewardClaimed(bob, 1, v.maxReward, 0);
+        vm.prank(bob);
+        miner.claim(1);
+
+        assertEq(token.balanceOf(bob), v.maxReward, "Bob receives exactly maxReward (20.00%)");
+        assertEq(miner.remainingEmission(), v.rBefore, "Remaining emission unchanged when exactly at cap");
+
+        v.pendingReserved -= v.bobRaw;
+        assertEq(
+            token.totalMined() + miner.remainingEmission() + v.pendingReserved,
+            v.initialM + v.initialR,
+            "Conservation after Bob claim holds"
+        );
+
+        // 3. Carol claims (above cap): receives maxReward, overflow == carolOverflow, remainingEmission increases
+        v.rBefore = miner.remainingEmission();
+        vm.expectEmit(true, true, false, true, address(miner));
+        emit RewardClaimed(v.carol, 1, v.maxReward, v.carolOverflow);
+        vm.prank(v.carol);
+        miner.claim(1);
+
+        assertEq(token.balanceOf(v.carol), v.maxReward, "Carol capped at exactly maxReward (20.00%)");
+        assertEq(miner.remainingEmission() - v.rBefore, v.carolOverflow, "Remaining emission increases by carolOverflow");
+
+        v.pendingReserved -= v.carolRaw;
+        assertEq(
+            token.totalMined() + miner.remainingEmission() + v.pendingReserved,
+            v.initialM + v.initialR,
+            "Conservation after Carol claim holds"
+        );
+
+        // 4. Dave claims (above cap): receives maxReward, overflow == daveOverflow, remainingEmission increases
+        v.rBefore = miner.remainingEmission();
+        vm.expectEmit(true, true, false, true, address(miner));
+        emit RewardClaimed(v.dave, 1, v.maxReward, v.daveOverflow);
+        vm.prank(v.dave);
+        miner.claim(1);
+
+        assertEq(token.balanceOf(v.dave), v.maxReward, "Dave capped at exactly maxReward (20.00%)");
+        assertEq(miner.remainingEmission() - v.rBefore, v.daveOverflow, "Remaining emission increases by daveOverflow");
+
+        v.pendingReserved -= v.daveRaw;
+        assertEq(v.pendingReserved, 0, "All pending reserved claims cleared");
+
+        // Final conservation: totalMined + remainingEmission == initialConstant
+        assertEq(
+            token.totalMined() + miner.remainingEmission(),
+            v.initialM + v.initialR,
+            "Final strict conservation holds after all claims"
+        );
+
+        // Verify minted + recycled == effQ
+        uint256 totalMinted = token.balanceOf(alice) + token.balanceOf(bob) + token.balanceOf(v.carol) + token.balanceOf(v.dave);
+        uint256 totalRecycled = v.carolOverflow + v.daveOverflow;
+        assertEq(totalMinted + totalRecycled, v.effQ, "totalMinted + totalRecycled equals effQ exactly");
+    }
+
+    struct MultiCapVars {
+        address carol;
+        address dave;
+        uint256 initialR;
+        uint256 initialM;
+        uint256 effQ;
+        uint256 expectedRaw;
+        uint256 expectedMax;
+        uint256 expectedOverflow;
+        uint256 pendingReserved;
+    }
+
+    /// @notice Test 7: Multi-miner simultaneous cap hit verification.
+    /// @dev Demonstrates:
+    ///      - 4 miners each holding 25% of total weight (25,000,000,000 / 100,000,000,000).
+    ///      - Each miner raw reward is 25% of effQ; each is capped at 20% of effQ.
+    ///      - Each miner produces 5% cappedOverflow recycled back into remainingEmission.
+    ///      - Total minted = 80% of effQ; total recycled = 20% of effQ.
+    ///      - 3-term conservation holds after each individual claim and at final state.
+    function test_MultiMinersSimultaneousCap_ConservationAndOverflowConsistent() public {
+        MultiCapVars memory v;
+        v.carol = address(0x30);
+        v.dave = address(0x40);
+
+        vm.warp(start + 3600);
+        miner.initEpochSeed(1);
+        miner.sync(1);
+
+        assertEq(miner.wMin(1), 100_000_000_000);
+
+        // 4 miners each with 25% weight: 25_000_000_000
+        bytes32 slotAlice = keccak256(abi.encode(alice, keccak256(abi.encode(uint256(1), uint256(15)))));
+        vm.store(address(miner), slotAlice, bytes32(uint256(25_000_000_000)));
+
+        bytes32 slotBob = keccak256(abi.encode(bob, keccak256(abi.encode(uint256(1), uint256(15)))));
+        vm.store(address(miner), slotBob, bytes32(uint256(25_000_000_000)));
+
+        bytes32 slotCarol = keccak256(abi.encode(v.carol, keccak256(abi.encode(uint256(1), uint256(15)))));
+        vm.store(address(miner), slotCarol, bytes32(uint256(25_000_000_000)));
+
+        bytes32 slotDave = keccak256(abi.encode(v.dave, keccak256(abi.encode(uint256(1), uint256(15)))));
+        vm.store(address(miner), slotDave, bytes32(uint256(25_000_000_000)));
+
+        bytes32 slotTW = keccak256(abi.encode(uint256(1), uint256(12)));
+        vm.store(address(miner), slotTW, bytes32(uint256(100_000_000_000)));
+
+        // Settle epoch 1
+        vm.warp(start + 7200);
+        v.initialR = miner.remainingEmission();
+        v.initialM = token.totalMined();
+
+        miner.sync(1);
+
+        v.effQ = miner.settledEpochQuota(1);
+        assertEq(miner.unallocatedGap(1), 0, "Unallocated gap is 0 when tw == wm");
+        assertEq(v.initialR - miner.remainingEmission(), v.effQ, "Settlement deducts exactly effQ");
+
+        v.expectedRaw = (v.effQ * 25) / 100;
+        v.expectedMax = (v.effQ * 20) / 100;
+        v.expectedOverflow = v.expectedRaw - v.expectedMax;
+        assertEq(v.expectedOverflow, (v.effQ * 5) / 100, "Each miner generates exactly 5% overflow");
+
+        address[4] memory miners = [alice, bob, v.carol, v.dave];
+        v.pendingReserved = v.effQ;
+
+        for (uint256 i = 0; i < 4; i++) {
+            address m = miners[i];
+            uint256 rBefore = miner.remainingEmission();
+            uint256 mBefore = token.totalMined();
+
+            vm.expectEmit(true, true, false, true, address(miner));
+            emit RewardClaimed(m, 1, v.expectedMax, v.expectedOverflow);
+
+            vm.prank(m);
+            miner.claim(1);
+
+            assertEq(token.balanceOf(m), v.expectedMax, "Miner must receive exactly 20% cap");
+            assertEq(token.totalMined() - mBefore, v.expectedMax, "Total mined increments by 20%");
+            assertEq(miner.remainingEmission() - rBefore, v.expectedOverflow, "Remaining emission increments by 5% overflow");
+
+            v.pendingReserved -= v.expectedRaw;
+            assertEq(
+                token.totalMined() + miner.remainingEmission() + v.pendingReserved,
+                v.initialM + v.initialR,
+                "Conservation holds after each individual claim in multi-miner cap scenario"
+            );
+        }
+
+        assertEq(v.pendingReserved, 0, "All pending claims cleared");
+
+        // Verify totals across all 4 miners
+        uint256 totalMinted = token.balanceOf(alice) + token.balanceOf(bob) + token.balanceOf(v.carol) + token.balanceOf(v.dave);
+        assertEq(totalMinted, v.expectedMax * 4, "Total minted is 80% of effQ");
+        assertEq(miner.remainingEmission() - (v.initialR - v.effQ), v.expectedOverflow * 4, "Total recycled is 20% of effQ");
+        assertEq(totalMinted + (v.expectedOverflow * 4), v.effQ, "80% minted + 20% recycled == 100% effQ");
+
+        // Final conservation: totalMined + remainingEmission == initialConstant
+        assertEq(
+            token.totalMined() + miner.remainingEmission(),
+            v.initialM + v.initialR,
+            "Final strict conservation holds after all 4 miners claim"
+        );
+    }
 }
