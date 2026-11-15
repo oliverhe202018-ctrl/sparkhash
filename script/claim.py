@@ -144,13 +144,13 @@ def _collect_sensitive_values(args=None, extra_secrets=None):
             if isinstance(item, str) and len(item.strip()) >= 4:
                 values.append(item.strip())
     if args is not None:
-        for attr in ("private_key", "password_file", "keystore_password_file", "password"):
+        for attr in ("private_key", "password_file", "keystore_password_file", "password", "keystore"):
             val = getattr(args, attr, None)
             if isinstance(val, (str, os.PathLike)):
                 sval = os.fspath(val).strip()
                 if len(sval) >= 4:
                     values.append(sval)
-                    if "password_file" in attr:
+                    if "password_file" in attr or "keystore" in attr:
                         values.append(os.path.abspath(sval))
     for key, val in os.environ.items():
         if not isinstance(val, str):
@@ -429,25 +429,37 @@ def claim(args):
     miner_contract = to_checksum_address(args.miner_contract)
     
     # 2. Determine Miner Address & Signing Mode
-    if bool(args.account) != bool(args.password_file):
+    has_account = bool(getattr(args, "account", None) and args.account.strip())
+    has_keystore = bool(getattr(args, "keystore", None) and args.keystore.strip())
+    has_pw = bool(getattr(args, "password_file", None) and args.password_file.strip())
+
+    if has_account and has_keystore:
+        print("[错误] 参数冲突: --account 与 --keystore 互斥，请只选择其中一种！")
+        sys.exit(1)
+
+    if (has_account and not has_pw) or (has_pw and not has_account and not has_keystore):
         print("[错误] --account 与 --password-file 必须同时提供！")
         sys.exit(1)
 
-    has_keystore = bool(args.account and args.password_file)
+    has_signer_flags = has_account or has_keystore
     env_pk = os.environ.get("PRIVATE_KEY") or os.environ.get("MINER_PRIVATE_KEY")
     has_env_pk = bool(env_pk and env_pk.strip())
 
-    if has_keystore and has_env_pk:
-        print("[错误] 同时提供了 keystore 参数 (--account/--password-file) 与环境变量私钥。为避免签名方式歧义，请只选择其中一种方式。")
+    if has_signer_flags and has_env_pk:
+        print("[错误] 同时提供了 keystore 参数 (--account/--keystore) 与环境变量私钥。为避免签名方式歧义，请只选择其中一种方式。")
         sys.exit(1)
 
     private_key = None
     miner_addr = None
 
     if args.send:
-        if has_keystore:
+        if has_signer_flags:
             try:
-                miner_addr = get_keystore_address(args.account, args.password_file)
+                miner_addr = get_keystore_address(
+                    account=args.account,
+                    password_file=args.password_file,
+                    keystore=args.keystore,
+                )
             except CastSignerError as e:
                 safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
                 print(f"[错误] Keystore 签名地址解析失败: {safe_err}")
@@ -460,7 +472,7 @@ def claim(args):
                     print("拒绝执行以避免资金或签名混乱。")
                     sys.exit(1)
         elif has_env_pk:
-            print("[警告] 正在使用环境变量私钥签名方式（不推荐）。建议改用 Foundry keystore 方式 (--account <别名> --password-file <密码文件>) 进行签名。")
+            print("[警告] 正在使用环境变量私钥签名方式（不推荐）。建议改用 Foundry keystore 方式 (--account <别名> --password-file <密码文件> 或 --keystore <路径>) 进行签名。")
             private_key = env_pk.strip()
             from eth_account import Account
             try:
@@ -482,14 +494,18 @@ def claim(args):
                     sys.exit(1)
         else:
             print("[错误] --send 模式需要提供签名方式！")
-            print("安全规则: 推荐使用 Foundry keystore 参数: --account <别名> --password-file <密码文件>")
+            print("安全规则: 推荐使用 Foundry keystore 参数: --keystore <路径> 或 --account <别名> --password-file <密码文件>")
             print("旧路径:   环境变量 PRIVATE_KEY (或 MINER_PRIVATE_KEY) 读取 (不推荐)")
             sys.exit(1)
     else:
         # Dry-run mode: can use --miner, or derive from keystore / env PRIVATE_KEY if available
-        if has_keystore:
+        if has_signer_flags:
             try:
-                derived_addr = get_keystore_address(args.account, args.password_file)
+                derived_addr = get_keystore_address(
+                    account=args.account,
+                    password_file=args.password_file,
+                    keystore=args.keystore,
+                )
                 if args.miner:
                     input_miner = to_checksum_address(args.miner)
                     if input_miner.lower() != derived_addr.lower():
@@ -497,6 +513,9 @@ def claim(args):
                         sys.exit(1)
                 miner_addr = derived_addr
             except CastSignerError as e:
+                safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+                print(f"[错误] Keystore 签名地址解析失败: {safe_err}")
+                sys.exit(1)
                 safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
                 print(f"[错误] Keystore 签名地址解析失败: {safe_err}")
                 sys.exit(1)
@@ -676,7 +695,7 @@ def claim(args):
 
     print(f"\n[步骤 3/3] 正在向 BSC Testnet 广播交易 (Nonce: {account_nonce})...", flush=True)
 
-    if has_keystore:
+    if has_signer_flags:
         try:
             tx_hash = cast_send(
                 contract_address=miner_contract,
@@ -688,6 +707,7 @@ def claim(args):
                 gas_price=max_fee_wei,
                 gas_limit=gas_limit,
                 priority_gas_price=priority_fee_wei,
+                keystore=args.keystore,
             )
         except CastSendUncertainError as e:
             safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
@@ -757,6 +777,7 @@ def main():
     parser.add_argument("--miner", type=str, default=None, help="矿工钱包地址 (只读预检时必填或从私钥推导)")
     parser.add_argument("--account", type=str, default=None, help="Foundry keystore 钱包别名 (与 --password-file 搭配使用)")
     parser.add_argument("--password-file", type=str, default=None, help="Foundry keystore 密码文件路径 (与 --account 搭配使用)")
+    parser.add_argument("--keystore", type=str, default=None, help="自定义加密 keystore 文件路径 (支持交互式原生 TTY 提示或配合 --password-file)")
     parser.add_argument("--send", action="store_true", help="发送真实链上交易 (默认仅进行 eth_call 预检)")
     parser.add_argument("--rpc", type=str, default=None, help="自定义 BSC Testnet RPC 节点")
     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="MinerV1 代理合约地址")

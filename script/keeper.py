@@ -895,6 +895,7 @@ class KeeperBot:
         self.state_dir = state_dir or os.environ.get("KEEPER_STATE_DIR")
         self.state_manager = None
         self._domain_lock_acquired = False
+        self.read_max_retries = 3
 
         if self.rpc_url and isinstance(self.rpc_url, str):
             try:
@@ -1218,14 +1219,25 @@ class KeeperBot:
                 high = mid
         return low
 
-    def get_epoch_state(self):
-        res_epoch = eth_call(self.rpc_url, self.miner, SELECTOR_EPOCH)
-        cur_epoch = int(res_epoch, 16) if res_epoch else 0
-        self.current_epoch = cur_epoch
-        res_synced = eth_call(self.rpc_url, self.miner, SELECTOR_LAST_SYNCED)
-        last_synced = int(res_synced, 16) if res_synced else 0
-        seed = self.get_epoch_seed(cur_epoch)
-        return cur_epoch, last_synced, seed
+    def get_epoch_state(self, max_retries: Optional[int] = None, initial_backoff: float = 1.0):
+        retries = max_retries if max_retries is not None else getattr(self, "read_max_retries", 3)
+        attempt = 0
+        while True:
+            try:
+                res_epoch = eth_call(self.rpc_url, self.miner, SELECTOR_EPOCH)
+                cur_epoch = int(res_epoch, 16) if res_epoch else 0
+                self.current_epoch = cur_epoch
+                res_synced = eth_call(self.rpc_url, self.miner, SELECTOR_LAST_SYNCED)
+                last_synced = int(res_synced, 16) if res_synced else 0
+                seed = self.get_epoch_seed(cur_epoch)
+                return cur_epoch, last_synced, seed
+            except Exception as e:
+                attempt += 1
+                if attempt >= retries:
+                    raise
+                backoff = initial_backoff * (2 ** (attempt - 1))
+                self.log("WARN", f"Transient failure reading epoch state (attempt {attempt}/{retries}): {format_exception_safe(e)}. Retrying in {backoff:.1f}s...")
+                time.sleep(backoff)
 
     def get_network_gas_price(self):
         """Fetches raw eth_gasPrice from RPC or returns floor on error."""

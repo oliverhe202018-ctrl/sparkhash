@@ -1,0 +1,100 @@
+{
+  "query_metadata": {
+    "target_block_number": 142730498,
+    "target_block_hex": "0x881e502",
+    "tx_hash": "0xd873d1c90e63002aed560d5f9ed1d479a951add4cc4ea6805e29cb19df15e1d0",
+    "primary_rpc": "https://bsc-testnet-rpc.publicnode.com",
+    "cross_check_rpc": "https://data-seed-prebsc-1-s1.bnbchain.org:8545",
+    "query_timestamp_utc": "2026-11-14T18:28:30Z",
+    "query_timestamp_bjt": "2026-11-15 02:28:30"
+  },
+  "chain_id": {
+    "decimal": 97,
+    "hex": "0x61"
+  },
+  "block": {
+    "number": 142730498,
+    "hash": "0x9eceb309763ebf00c637d2bf85c352b83bfa9b7edca389e4f2109e1fe74a8239",
+    "timestamp_raw_hex": "0x6af8a721",
+    "timestamp_decimal": 1794680609,
+    "timestamp_utc": "2026-11-14 18:23:29 UTC",
+    "timestamp_bjt": "2026-11-15 02:23:29 BJT"
+  },
+  "transaction": {
+    "hash": "0xd873d1c90e63002aed560d5f9ed1d479a951add4cc4ea6805e29cb19df15e1d0",
+    "from": "0xd8d630b6172f9ed5db58a17ec9b0512fbd4c9484",
+    "to": "0x40b92431de886ea46117407c8f7123a31fb3f744",
+    "nonce": 5,
+    "type": "0x2",
+    "value_wei": 0,
+    "gas_limit": 150000,
+    "gas_price_wei": 1000000000,
+    "max_fee_per_gas_wei": 3000000000,
+    "max_priority_fee_per_gas_wei": 1000000000,
+    "input": "0xb3423eec",
+    "function_signature": "requestWithdraw()",
+    "block_number": 142730498,
+    "block_hash": "0x9eceb309763ebf00c637d2bf85c352b83bfa9b7edca389e4f2109e1fe74a8239"
+  },
+  "receipt": {
+    "status": 1,
+    "gas_used": 28621,
+    "effective_gas_price_wei": 1000000000,
+    "total_fee_wei": 28621000000000,
+    "total_fee_bnb": "0.000028621",
+    "logs": [
+      {
+        "address": "0x40b92431de886ea46117407c8f7123a31fb3f744",
+        "topics": [
+          "0xf7774b688d56120b783560a913ee60792a73dfd511812b7be5eccf10d08c6689",
+          "0x000000000000000000000000d8d630b6172f9ed5db58a17ec9b0512fbd4c9484"
+        ],
+        "data": "0x0000000000000000000000000000000000000000000000000000000000000097",
+        "decoded_event": {
+          "name": "WithdrawRequested",
+          "topic0_full": "0xf7774b688d56120b783560a913ee60792a73dfd511812b7be5eccf10d08c6689",
+          "miner": "0xd8d630b6172f9ed5db58a17ec9b0512fbd4c9484",
+          "epoch": 151
+        }
+      }
+    ]
+  },
+  "stake_vault_state_at_block_142730498": {
+    "START_raw_hex": "0x000000000000000000000000000000000000000000000000000000006af05630",
+    "START_decimal": 1794135600,
+    "START_bjt": "2026-11-08 19:00:00 BJT",
+    "EPOCH_LEN": 3600,
+    "epoch_at_block": 151,
+    "stakes_raw_return_128_bytes": "0x000000000000000000000000000000000000000000000000000000000000007e00000000000000000000000000000000000000000000000000000000000000980000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000002386f26fc10000",
+    "stakes_decoded": {
+      "depositEpoch": 126,
+      "withdrawReqEpoch": 152,
+      "has": true,
+      "depositAmount_wei": 10000000000000000,
+      "depositAmount_bnb": "0.01"
+    },
+    "status_decoded": {
+      "active": false,
+      "since": 126
+    }
+  },
+  "miner_contract_state_at_block_142730498": {
+    "START_raw_hex": "0x000000000000000000000000000000000000000000000000000000006af05630",
+    "START_decimal": 1794135600,
+    "EPOCH_LEN": 3600,
+    "epoch_at_block": 151
+  },
+  "cooldown_math": {
+    "formula": "epoch >= (withdrawReqEpoch - 1) + COOLDOWN_EPOCHS",
+    "withdrawReqEpoch": 152,
+    "COOLDOWN_EPOCHS": 48,
+    "unlock_epoch": 199,
+    "unlock_epoch_start_timestamp": 1794852000,
+    "unlock_epoch_start_utc": "2026-11-16 18:00:00 UTC",
+    "unlock_epoch_start_bjt": "2026-11-17 02:00:00 BJT",
+    "tx_block_timestamp": 1794680609,
+    "seconds_until_unlock_from_tx": 171391,
+    "hours_until_unlock_from_tx": 47.6086,
+    "seconds_diff_from_strict_48h": -1409
+  }
+}

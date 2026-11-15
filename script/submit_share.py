@@ -110,13 +110,13 @@ def _collect_sensitive_values(args=None, extra_secrets=None):
             if isinstance(item, str) and len(item.strip()) >= 4:
                 values.append(item.strip())
     if args is not None:
-        for attr in ("private_key", "password_file", "keystore_password_file", "password"):
+        for attr in ("private_key", "password_file", "keystore_password_file", "password", "keystore"):
             val = getattr(args, attr, None)
             if isinstance(val, (str, os.PathLike)):
                 sval = os.fspath(val).strip()
                 if len(sval) >= 4:
                     values.append(sval)
-                    if "password_file" in attr:
+                    if "password_file" in attr or "keystore" in attr:
                         values.append(os.path.abspath(sval))
     for key, val in os.environ.items():
         if not isinstance(val, str):
@@ -282,21 +282,33 @@ def submit(args):
     nonces = [nonce]
     calldata = encode_submit_shares(ks, nonces)
 
-    if bool(args.account) != bool(args.password_file):
+    has_account = bool(getattr(args, "account", None) and args.account.strip())
+    has_keystore = bool(getattr(args, "keystore", None) and args.keystore.strip())
+    has_pw = bool(getattr(args, "password_file", None) and args.password_file.strip())
+
+    if has_account and has_keystore:
+        print("[ERROR] Mutual exclusion error: Cannot specify both --account and --keystore!")
+        sys.exit(1)
+
+    if (has_account and not has_pw) or (has_pw and not has_account and not has_keystore):
         print("[ERROR] --account and --password-file must be provided together!")
         sys.exit(1)
 
-    has_keystore = bool(args.account and args.password_file)
+    has_signer_flags = has_account or has_keystore
     env_pk = os.environ.get("MINER_PRIVATE_KEY") or os.environ.get("PRIVATE_KEY")
     has_env_pk = bool(env_pk and env_pk.strip())
 
-    if has_keystore and has_env_pk:
-        print("[ERROR] Both keystore flags (--account/--password-file) and environment private key are provided. Please specify only one signing method.")
+    if has_signer_flags and has_env_pk:
+        print("[ERROR] Both keystore flags (--account/--keystore) and environment private key are provided. Please specify only one signing method.")
         sys.exit(1)
 
-    if not args.send and has_keystore:
+    if not args.send and has_signer_flags:
         try:
-            derived_signer = get_keystore_address(args.account, args.password_file)
+            derived_signer = get_keystore_address(
+                account=args.account,
+                password_file=args.password_file,
+                keystore=args.keystore,
+            )
             if derived_signer.lower() != miner_addr.lower():
                 print(f"[SECURITY ERROR] Keystore signer address corresponds to {derived_signer},")
                 print(f"                 which does NOT match miner address {miner_addr}!")
@@ -398,9 +410,13 @@ def submit(args):
     print("=" * 50)
 
     private_key = None
-    if has_keystore:
+    if has_signer_flags:
         try:
-            signer_addr = get_keystore_address(args.account, args.password_file)
+            signer_addr = get_keystore_address(
+                account=args.account,
+                password_file=args.password_file,
+                keystore=args.keystore,
+            )
         except CastSignerError as e:
             safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
             print(f"[ERROR] Failed to resolve keystore address: {safe_err}")
@@ -412,7 +428,7 @@ def submit(args):
             print("Submission rejected to prevent transaction failure.")
             sys.exit(1)
     elif has_env_pk:
-        print("[WARNING] Using environment private key is not recommended (不推荐). Please consider using --account and --password-file instead.")
+        print("[WARNING] Using environment private key is not recommended (不推荐). Please consider using --account and --password-file or --keystore instead.")
         private_key = env_pk.strip()
         try:
             from eth_account import Account
@@ -431,8 +447,8 @@ def submit(args):
             print(f"[ERROR] Failed to load private key from environment: {safe_err}")
             sys.exit(1)
     else:
-        print("[ERROR] --send mode requires Foundry keystore parameters (--account and --password-file).")
-        print("Recommended: python script/submit_share.py ... --send --account <keystore_account> --password-file <password_file_path>")
+        print("[ERROR] --send mode requires Foundry keystore parameters (--account and --password-file, or --keystore).")
+        print("Recommended: python script/submit_share.py ... --send --keystore <keystore_path> (or --account <keystore_account> --password-file <password_file_path>)")
         print("Legacy fallback: MINER_PRIVATE_KEY environment variable (not recommended; never write keys into .env or files).")
         sys.exit(1)
 
@@ -467,7 +483,7 @@ def submit(args):
         print("Nonce query failed, aborting transaction broadcast (will not fallback to 0).")
         sys.exit(1)
 
-    if has_keystore:
+    if has_signer_flags:
         print("\nBroadcasting transaction to BSC Testnet via cast send...", flush=True)
         try:
             tx_hash = cast_send(
@@ -480,6 +496,7 @@ def submit(args):
                 gas_price=max_fee_wei,
                 gas_limit=gas_limit,
                 priority_gas_price=priority_fee_wei,
+                keystore=args.keystore,
             )
         except CastSendUncertainError as e:
             safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
@@ -555,6 +572,7 @@ def main():
     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="Miner proxy address")
     parser.add_argument("--account", type=str, default=None, help="Foundry keystore account name (must be used with --password-file)")
     parser.add_argument("--password-file", type=str, default=None, help="Path to password file for Foundry keystore (must be used with --account)")
+    parser.add_argument("--keystore", type=str, default=None, help="Path to custom encrypted keystore file (supports interactive password prompt or --password-file)")
     parser.add_argument("--send", action="store_true", help="Broadcast transaction (default: simulation only)")
     parser.add_argument("--gas-multiplier", type=str, default="1.15", help="Max fee multiplier over eth_gasPrice (default: 1.15)")
     parser.add_argument("--max-fee-per-gas-gwei", type=str, default=None, help="Explicit EIP-1559 maxFeePerGas in gwei")

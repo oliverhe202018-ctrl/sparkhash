@@ -1,0 +1,508 @@
+diff --git a/script/cast_signer.py b/script/cast_signer.py
+index 35f6c06..5b8648a 100644
+--- a/script/cast_signer.py
++++ b/script/cast_signer.py
+@@ -549,27 +549,83 @@ def validate_password_file(password_file: str) -> None:
+         raise CastSignerError(f"Password file is empty: {safe_path}")
+ 
+ 
+-def get_keystore_address(account: str, password_file: str, timeout: float = 30.0) -> str:
++def validate_keystore_path(keystore_path: str) -> str:
++    """
++    Validates that keystore file path is non-empty, exists, and is a file (not directory).
++    All error messages sanitize paths to prevent leakage.
++    """
++    if not keystore_path or not isinstance(keystore_path, str) or not keystore_path.strip():
++        raise CastSignerError("Keystore path must be specified and non-empty.")
++
++    clean_path = keystore_path.strip()
++    abs_path = os.path.abspath(clean_path)
++    safe_path = sanitize_text(clean_path, sensitive_values=[clean_path, abs_path])
++    if safe_path == clean_path:
++        safe_path = "[REDACTED_PATH]"
++
++    if not os.path.exists(clean_path):
++        raise CastSignerError(f"Keystore file does not exist: {safe_path}")
++    if os.path.isdir(clean_path):
++        raise CastSignerError(f"Keystore path is a directory, not a file: {safe_path}")
++
++    return clean_path
++
++
++def get_keystore_address(
++    account: str = None,
++    password_file: str = None,
++    timeout: float = 30.0,
++    keystore: str = None,
++) -> str:
+     """
+     Derives signer address using:
+-    cast wallet address --account <name> --password-file <path>
++    - cast wallet address --account <name> [--password-file <path>]
++    - cast wallet address --keystore <path> [--password-file <path>]
+     Strictly parses stdout into a single legal Ethereum address.
++    If password_file is None, requires sys.stdin.isatty() == True for interactive password prompt.
+     """
+-    if not account or not isinstance(account, str) or not account.strip():
+-        raise CastSignerError("Keystore account name must be specified and non-empty.")
+-
+-    clean_account = account.strip()
+-    validate_password_file(password_file)
+-    clean_pw_file = password_file.strip()
+-    abs_pw_file = os.path.abspath(clean_pw_file)
++    if account and keystore:
++        raise CastSignerError("Cannot specify both 'account' and 'keystore'.")
++    if not account and not keystore:
++        raise CastSignerError("Either 'account' or 'keystore' must be specified.")
++
++    target_args = []
++    sensitive_secrets = []
++
++    if account:
++        if not isinstance(account, str) or not account.strip():
++            raise CastSignerError("Keystore account name must be specified and non-empty.")
++        clean_account = account.strip()
++        target_args = ["--account", clean_account]
++    else:
++        clean_keystore = validate_keystore_path(keystore)
++        abs_keystore = os.path.abspath(clean_keystore)
++        target_args = ["--keystore", clean_keystore]
++        sensitive_secrets.extend([clean_keystore, abs_keystore])
++
++    if password_file is not None:
++        validate_password_file(password_file)
++        clean_pw_file = password_file.strip()
++        abs_pw_file = os.path.abspath(clean_pw_file)
++        sensitive_secrets.extend([clean_pw_file, abs_pw_file])
++        pw_args = ["--password-file", clean_pw_file]
++    else:
++        import sys
++        if not sys.stdin.isatty():
++            raise CastSignerError(
++                "Interactive keystore password prompt requires an interactive TTY terminal (sys.stdin.isatty() is False). "
++                "In non-interactive environments, please provide a password file, or run directly in an interactive terminal."
++            )
++        pw_args = []
+ 
+     cast_bin = shutil.which("cast") or "cast"
+-    cmd = [cast_bin, "wallet", "address", "--account", clean_account, "--password-file", clean_pw_file]
++    cmd = [cast_bin, "wallet", "address"] + target_args + pw_args
+     isolated_env = get_isolated_cast_env()
+ 
+     try:
+         proc = subprocess.run(
+             cmd,
++            stdin=None if pw_args else None,
+             stdout=subprocess.PIPE,
+             stderr=subprocess.PIPE,
+             text=True,
+@@ -580,13 +636,13 @@ def get_keystore_address(account: str, password_file: str, timeout: float = 30.0
+     except subprocess.TimeoutExpired:
+         raise CastSignerError(f"cast wallet address timed out after {timeout}s") from None
+     except Exception as e:
+-        safe_msg = format_exception_safe(e, sensitive_values=[clean_pw_file, abs_pw_file])
++        safe_msg = format_exception_safe(e, sensitive_values=sensitive_secrets)
+         raise CastSignerError(f"Failed to execute cast wallet address: {safe_msg}") from None
+ 
+     if proc.returncode != 0:
+         err_msg = sanitize_text(
+             (proc.stderr or proc.stdout or "unknown error").strip(),
+-            sensitive_values=[clean_pw_file, abs_pw_file],
++            sensitive_values=sensitive_secrets,
+         )
+         raise CastSignerError(f"cast wallet address failed (code {proc.returncode}): {err_msg}")
+ 
+@@ -612,12 +668,14 @@ def cast_send(
+     gas_limit: int,
+     priority_gas_price: int,
+     timeout: float = 60.0,
++    keystore: str = None,
+ ) -> str:
+     """
+     Broadcasts a single EIP-1559 (type 2) transaction using:
+-    cast send <contract> --data <calldata> --account <account> --password-file <file>
+-              --rpc-url <rpc_url> --nonce <nonce> --gas-price <gas_price>
+-              --priority-gas-price <priority_gas_price> --gas-limit <gas_limit> --async
++    cast send <contract> --data <calldata> [--account <account> | --keystore <keystore>]
++              [--password-file <file>] --rpc-url <rpc_url> --nonce <nonce>
++              --gas-price <gas_price> --priority-gas-price <priority_gas_price>
++              --gas-limit <gas_limit> --async
+ 
+     EIP-1559 fee parameter semantics:
+     - gas_price: retained interface name representing type-2 maxFeePerGas (in wei),
+@@ -628,22 +686,50 @@ def cast_send(
+     Shell is False, isolated env without ETH_* / PRIVATE_KEY.
+     Single send, no auto-retries or price bumping.
+     On timeout or missing txHash, raises CastSendUncertainError and displays warning:
+-    UNCOINCERTAIN_TX_WARNING
++    UNCERTAIN_TX_WARNING
++    If password_file is None, requires sys.stdin.isatty() == True for interactive password prompt.
+     """
+-    if not account or not isinstance(account, str) or not account.strip():
+-        raise CastSignerError("Keystore account name must be specified and non-empty.")
+-    clean_account = account.strip()
++    if account and keystore:
++        raise CastSignerError("Cannot specify both 'account' and 'keystore'.")
++    if not account and not keystore:
++        raise CastSignerError("Either 'account' or 'keystore' must be specified.")
++
++    target_args = []
++    sensitive_secrets = []
++
++    if account:
++        if not isinstance(account, str) or not account.strip():
++            raise CastSignerError("Keystore account name must be specified and non-empty.")
++        clean_account = account.strip()
++        target_args = ["--account", clean_account]
++    else:
++        clean_keystore = validate_keystore_path(keystore)
++        abs_keystore = os.path.abspath(clean_keystore)
++        target_args = ["--keystore", clean_keystore]
++        sensitive_secrets.extend([clean_keystore, abs_keystore])
+ 
+     if not rpc_url or not isinstance(rpc_url, str) or not rpc_url.strip():
+         raise CastSignerError("RPC URL must be specified and non-empty.")
+     clean_rpc_url = rpc_url.strip()
++    sensitive_secrets.append(clean_rpc_url)
+ 
+     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+         raise CastSignerError(f"Timeout must be a positive finite number, got {timeout!r}.")
+ 
+-    validate_password_file(password_file)
+-    clean_pw_file = password_file.strip()
+-    abs_pw_file = os.path.abspath(clean_pw_file)
++    if password_file is not None:
++        validate_password_file(password_file)
++        clean_pw_file = password_file.strip()
++        abs_pw_file = os.path.abspath(clean_pw_file)
++        sensitive_secrets.extend([clean_pw_file, abs_pw_file])
++        pw_args = ["--password-file", clean_pw_file]
++    else:
++        import sys
++        if not sys.stdin.isatty():
++            raise CastSignerError(
++                "Interactive keystore password prompt requires an interactive TTY terminal (sys.stdin.isatty() is False). "
++                "In non-interactive environments, please provide a password file, or run directly in an interactive terminal."
++            )
++        pw_args = []
+ 
+     clean_contract = to_checksum_address(contract_address)
+     clean_calldata = validate_calldata(calldata)
+@@ -658,10 +744,7 @@ def cast_send(
+         clean_contract,
+         "--data",
+         clean_calldata,
+-        "--account",
+-        clean_account,
+-        "--password-file",
+-        clean_pw_file,
++    ] + target_args + pw_args + [
+         "--rpc-url",
+         clean_rpc_url,
+         "--nonce",
+@@ -676,8 +759,6 @@ def cast_send(
+     ]
+     isolated_env = get_isolated_cast_env()
+ 
+-    sensitive_secrets = [clean_pw_file, abs_pw_file, clean_rpc_url]
+-
+     try:
+         proc = subprocess.run(
+             cmd,
+diff --git a/script/claim.py b/script/claim.py
+index d769558..1d56db7 100644
+--- a/script/claim.py
++++ b/script/claim.py
+@@ -144,13 +144,13 @@ def _collect_sensitive_values(args=None, extra_secrets=None):
+             if isinstance(item, str) and len(item.strip()) >= 4:
+                 values.append(item.strip())
+     if args is not None:
+-        for attr in ("private_key", "password_file", "keystore_password_file", "password"):
++        for attr in ("private_key", "password_file", "keystore_password_file", "password", "keystore"):
+             val = getattr(args, attr, None)
+             if isinstance(val, (str, os.PathLike)):
+                 sval = os.fspath(val).strip()
+                 if len(sval) >= 4:
+                     values.append(sval)
+-                    if "password_file" in attr:
++                    if "password_file" in attr or "keystore" in attr:
+                         values.append(os.path.abspath(sval))
+     for key, val in os.environ.items():
+         if not isinstance(val, str):
+@@ -429,25 +429,37 @@ def claim(args):
+     miner_contract = to_checksum_address(args.miner_contract)
+     
+     # 2. Determine Miner Address & Signing Mode
+-    if bool(args.account) != bool(args.password_file):
++    has_account = bool(getattr(args, "account", None) and args.account.strip())
++    has_keystore = bool(getattr(args, "keystore", None) and args.keystore.strip())
++    has_pw = bool(getattr(args, "password_file", None) and args.password_file.strip())
++
++    if has_account and has_keystore:
++        print("[错误] 参数冲突: --account 与 --keystore 互斥，请只选择其中一种！")
++        sys.exit(1)
++
++    if (has_account and not has_pw) or (has_pw and not has_account and not has_keystore):
+         print("[错误] --account 与 --password-file 必须同时提供！")
+         sys.exit(1)
+ 
+-    has_keystore = bool(args.account and args.password_file)
++    has_signer_flags = has_account or has_keystore
+     env_pk = os.environ.get("PRIVATE_KEY") or os.environ.get("MINER_PRIVATE_KEY")
+     has_env_pk = bool(env_pk and env_pk.strip())
+ 
+-    if has_keystore and has_env_pk:
+-        print("[错误] 同时提供了 keystore 参数 (--account/--password-file) 与环境变量私钥。为避免签名方式歧义，请只选择其中一种方式。")
++    if has_signer_flags and has_env_pk:
++        print("[错误] 同时提供了 keystore 参数 (--account/--keystore) 与环境变量私钥。为避免签名方式歧义，请只选择其中一种方式。")
+         sys.exit(1)
+ 
+     private_key = None
+     miner_addr = None
+ 
+     if args.send:
+-        if has_keystore:
++        if has_signer_flags:
+             try:
+-                miner_addr = get_keystore_address(args.account, args.password_file)
++                miner_addr = get_keystore_address(
++                    account=args.account,
++                    password_file=args.password_file,
++                    keystore=args.keystore,
++                )
+             except CastSignerError as e:
+                 safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+                 print(f"[错误] Keystore 签名地址解析失败: {safe_err}")
+@@ -460,7 +472,7 @@ def claim(args):
+                     print("拒绝执行以避免资金或签名混乱。")
+                     sys.exit(1)
+         elif has_env_pk:
+-            print("[警告] 正在使用环境变量私钥签名方式（不推荐）。建议改用 Foundry keystore 方式 (--account <别名> --password-file <密码文件>) 进行签名。")
++            print("[警告] 正在使用环境变量私钥签名方式（不推荐）。建议改用 Foundry keystore 方式 (--account <别名> --password-file <密码文件> 或 --keystore <路径>) 进行签名。")
+             private_key = env_pk.strip()
+             from eth_account import Account
+             try:
+@@ -482,14 +494,18 @@ def claim(args):
+                     sys.exit(1)
+         else:
+             print("[错误] --send 模式需要提供签名方式！")
+-            print("安全规则: 推荐使用 Foundry keystore 参数: --account <别名> --password-file <密码文件>")
++            print("安全规则: 推荐使用 Foundry keystore 参数: --keystore <路径> 或 --account <别名> --password-file <密码文件>")
+             print("旧路径:   环境变量 PRIVATE_KEY (或 MINER_PRIVATE_KEY) 读取 (不推荐)")
+             sys.exit(1)
+     else:
+         # Dry-run mode: can use --miner, or derive from keystore / env PRIVATE_KEY if available
+-        if has_keystore:
++        if has_signer_flags:
+             try:
+-                derived_addr = get_keystore_address(args.account, args.password_file)
++                derived_addr = get_keystore_address(
++                    account=args.account,
++                    password_file=args.password_file,
++                    keystore=args.keystore,
++                )
+                 if args.miner:
+                     input_miner = to_checksum_address(args.miner)
+                     if input_miner.lower() != derived_addr.lower():
+@@ -500,6 +516,9 @@ def claim(args):
+                 safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+                 print(f"[错误] Keystore 签名地址解析失败: {safe_err}")
+                 sys.exit(1)
++                safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
++                print(f"[错误] Keystore 签名地址解析失败: {safe_err}")
++                sys.exit(1)
+         elif args.miner:
+             miner_addr = to_checksum_address(args.miner)
+         else:
+@@ -676,7 +695,7 @@ def claim(args):
+ 
+     print(f"\n[步骤 3/3] 正在向 BSC Testnet 广播交易 (Nonce: {account_nonce})...", flush=True)
+ 
+-    if has_keystore:
++    if has_signer_flags:
+         try:
+             tx_hash = cast_send(
+                 contract_address=miner_contract,
+@@ -688,6 +707,7 @@ def claim(args):
+                 gas_price=max_fee_wei,
+                 gas_limit=gas_limit,
+                 priority_gas_price=priority_fee_wei,
++                keystore=args.keystore,
+             )
+         except CastSendUncertainError as e:
+             safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+@@ -757,6 +777,7 @@ def main():
+     parser.add_argument("--miner", type=str, default=None, help="矿工钱包地址 (只读预检时必填或从私钥推导)")
+     parser.add_argument("--account", type=str, default=None, help="Foundry keystore 钱包别名 (与 --password-file 搭配使用)")
+     parser.add_argument("--password-file", type=str, default=None, help="Foundry keystore 密码文件路径 (与 --account 搭配使用)")
++    parser.add_argument("--keystore", type=str, default=None, help="自定义加密 keystore 文件路径 (支持交互式原生 TTY 提示或配合 --password-file)")
+     parser.add_argument("--send", action="store_true", help="发送真实链上交易 (默认仅进行 eth_call 预检)")
+     parser.add_argument("--rpc", type=str, default=None, help="自定义 BSC Testnet RPC 节点")
+     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="MinerV1 代理合约地址")
+diff --git a/script/keeper.py b/script/keeper.py
+index 5447b43..14342f7 100644
+--- a/script/keeper.py
++++ b/script/keeper.py
+@@ -895,6 +895,7 @@ class KeeperBot:
+         self.state_dir = state_dir or os.environ.get("KEEPER_STATE_DIR")
+         self.state_manager = None
+         self._domain_lock_acquired = False
++        self.read_max_retries = 3
+ 
+         if self.rpc_url and isinstance(self.rpc_url, str):
+             try:
+@@ -1218,14 +1219,25 @@ class KeeperBot:
+                 high = mid
+         return low
+ 
+-    def get_epoch_state(self):
+-        res_epoch = eth_call(self.rpc_url, self.miner, SELECTOR_EPOCH)
+-        cur_epoch = int(res_epoch, 16) if res_epoch else 0
+-        self.current_epoch = cur_epoch
+-        res_synced = eth_call(self.rpc_url, self.miner, SELECTOR_LAST_SYNCED)
+-        last_synced = int(res_synced, 16) if res_synced else 0
+-        seed = self.get_epoch_seed(cur_epoch)
+-        return cur_epoch, last_synced, seed
++    def get_epoch_state(self, max_retries: Optional[int] = None, initial_backoff: float = 1.0):
++        retries = max_retries if max_retries is not None else getattr(self, "read_max_retries", 3)
++        attempt = 0
++        while True:
++            try:
++                res_epoch = eth_call(self.rpc_url, self.miner, SELECTOR_EPOCH)
++                cur_epoch = int(res_epoch, 16) if res_epoch else 0
++                self.current_epoch = cur_epoch
++                res_synced = eth_call(self.rpc_url, self.miner, SELECTOR_LAST_SYNCED)
++                last_synced = int(res_synced, 16) if res_synced else 0
++                seed = self.get_epoch_seed(cur_epoch)
++                return cur_epoch, last_synced, seed
++            except Exception as e:
++                attempt += 1
++                if attempt >= retries:
++                    raise
++                backoff = initial_backoff * (2 ** (attempt - 1))
++                self.log("WARN", f"Transient failure reading epoch state (attempt {attempt}/{retries}): {format_exception_safe(e)}. Retrying in {backoff:.1f}s...")
++                time.sleep(backoff)
+ 
+     def get_network_gas_price(self):
+         """Fetches raw eth_gasPrice from RPC or returns floor on error."""
+diff --git a/script/submit_share.py b/script/submit_share.py
+index e3b9e5c..048a3fb 100644
+--- a/script/submit_share.py
++++ b/script/submit_share.py
+@@ -110,13 +110,13 @@ def _collect_sensitive_values(args=None, extra_secrets=None):
+             if isinstance(item, str) and len(item.strip()) >= 4:
+                 values.append(item.strip())
+     if args is not None:
+-        for attr in ("private_key", "password_file", "keystore_password_file", "password"):
++        for attr in ("private_key", "password_file", "keystore_password_file", "password", "keystore"):
+             val = getattr(args, attr, None)
+             if isinstance(val, (str, os.PathLike)):
+                 sval = os.fspath(val).strip()
+                 if len(sval) >= 4:
+                     values.append(sval)
+-                    if "password_file" in attr:
++                    if "password_file" in attr or "keystore" in attr:
+                         values.append(os.path.abspath(sval))
+     for key, val in os.environ.items():
+         if not isinstance(val, str):
+@@ -282,21 +282,33 @@ def submit(args):
+     nonces = [nonce]
+     calldata = encode_submit_shares(ks, nonces)
+ 
+-    if bool(args.account) != bool(args.password_file):
++    has_account = bool(getattr(args, "account", None) and args.account.strip())
++    has_keystore = bool(getattr(args, "keystore", None) and args.keystore.strip())
++    has_pw = bool(getattr(args, "password_file", None) and args.password_file.strip())
++
++    if has_account and has_keystore:
++        print("[ERROR] Mutual exclusion error: Cannot specify both --account and --keystore!")
++        sys.exit(1)
++
++    if (has_account and not has_pw) or (has_pw and not has_account and not has_keystore):
+         print("[ERROR] --account and --password-file must be provided together!")
+         sys.exit(1)
+ 
+-    has_keystore = bool(args.account and args.password_file)
++    has_signer_flags = has_account or has_keystore
+     env_pk = os.environ.get("MINER_PRIVATE_KEY") or os.environ.get("PRIVATE_KEY")
+     has_env_pk = bool(env_pk and env_pk.strip())
+ 
+-    if has_keystore and has_env_pk:
+-        print("[ERROR] Both keystore flags (--account/--password-file) and environment private key are provided. Please specify only one signing method.")
++    if has_signer_flags and has_env_pk:
++        print("[ERROR] Both keystore flags (--account/--keystore) and environment private key are provided. Please specify only one signing method.")
+         sys.exit(1)
+ 
+-    if not args.send and has_keystore:
++    if not args.send and has_signer_flags:
+         try:
+-            derived_signer = get_keystore_address(args.account, args.password_file)
++            derived_signer = get_keystore_address(
++                account=args.account,
++                password_file=args.password_file,
++                keystore=args.keystore,
++            )
+             if derived_signer.lower() != miner_addr.lower():
+                 print(f"[SECURITY ERROR] Keystore signer address corresponds to {derived_signer},")
+                 print(f"                 which does NOT match miner address {miner_addr}!")
+@@ -398,9 +410,13 @@ def submit(args):
+     print("=" * 50)
+ 
+     private_key = None
+-    if has_keystore:
++    if has_signer_flags:
+         try:
+-            signer_addr = get_keystore_address(args.account, args.password_file)
++            signer_addr = get_keystore_address(
++                account=args.account,
++                password_file=args.password_file,
++                keystore=args.keystore,
++            )
+         except CastSignerError as e:
+             safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+             print(f"[ERROR] Failed to resolve keystore address: {safe_err}")
+@@ -412,7 +428,7 @@ def submit(args):
+             print("Submission rejected to prevent transaction failure.")
+             sys.exit(1)
+     elif has_env_pk:
+-        print("[WARNING] Using environment private key is not recommended (不推荐). Please consider using --account and --password-file instead.")
++        print("[WARNING] Using environment private key is not recommended (不推荐). Please consider using --account and --password-file or --keystore instead.")
+         private_key = env_pk.strip()
+         try:
+             from eth_account import Account
+@@ -431,8 +447,8 @@ def submit(args):
+             print(f"[ERROR] Failed to load private key from environment: {safe_err}")
+             sys.exit(1)
+     else:
+-        print("[ERROR] --send mode requires Foundry keystore parameters (--account and --password-file).")
+-        print("Recommended: python script/submit_share.py ... --send --account <keystore_account> --password-file <password_file_path>")
++        print("[ERROR] --send mode requires Foundry keystore parameters (--account and --password-file, or --keystore).")
++        print("Recommended: python script/submit_share.py ... --send --keystore <keystore_path> (or --account <keystore_account> --password-file <password_file_path>)")
+         print("Legacy fallback: MINER_PRIVATE_KEY environment variable (not recommended; never write keys into .env or files).")
+         sys.exit(1)
+ 
+@@ -467,7 +483,7 @@ def submit(args):
+         print("Nonce query failed, aborting transaction broadcast (will not fallback to 0).")
+         sys.exit(1)
+ 
+-    if has_keystore:
++    if has_signer_flags:
+         print("\nBroadcasting transaction to BSC Testnet via cast send...", flush=True)
+         try:
+             tx_hash = cast_send(
+@@ -480,6 +496,7 @@ def submit(args):
+                 gas_price=max_fee_wei,
+                 gas_limit=gas_limit,
+                 priority_gas_price=priority_fee_wei,
++                keystore=args.keystore,
+             )
+         except CastSendUncertainError as e:
+             safe_err = format_exception_safe(e, sensitive_values=_collect_sensitive_values(args))
+@@ -555,6 +572,7 @@ def main():
+     parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="Miner proxy address")
+     parser.add_argument("--account", type=str, default=None, help="Foundry keystore account name (must be used with --password-file)")
+     parser.add_argument("--password-file", type=str, default=None, help="Path to password file for Foundry keystore (must be used with --account)")
++    parser.add_argument("--keystore", type=str, default=None, help="Path to custom encrypted keystore file (supports interactive password prompt or --password-file)")
+     parser.add_argument("--send", action="store_true", help="Broadcast transaction (default: simulation only)")
+     parser.add_argument("--gas-multiplier", type=str, default="1.15", help="Max fee multiplier over eth_gasPrice (default: 1.15)")
+     parser.add_argument("--max-fee-per-gas-gwei", type=str, default=None, help="Explicit EIP-1559 maxFeePerGas in gwei")

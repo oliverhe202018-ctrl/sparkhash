@@ -549,27 +549,83 @@ def validate_password_file(password_file: str) -> None:
         raise CastSignerError(f"Password file is empty: {safe_path}")
 
 
-def get_keystore_address(account: str, password_file: str, timeout: float = 30.0) -> str:
+def validate_keystore_path(keystore_path: str) -> str:
+    """
+    Validates that keystore file path is non-empty, exists, and is a file (not directory).
+    All error messages sanitize paths to prevent leakage.
+    """
+    if not keystore_path or not isinstance(keystore_path, str) or not keystore_path.strip():
+        raise CastSignerError("Keystore path must be specified and non-empty.")
+
+    clean_path = keystore_path.strip()
+    abs_path = os.path.abspath(clean_path)
+    safe_path = sanitize_text(clean_path, sensitive_values=[clean_path, abs_path])
+    if safe_path == clean_path:
+        safe_path = "[REDACTED_PATH]"
+
+    if not os.path.exists(clean_path):
+        raise CastSignerError(f"Keystore file does not exist: {safe_path}")
+    if os.path.isdir(clean_path):
+        raise CastSignerError(f"Keystore path is a directory, not a file: {safe_path}")
+
+    return clean_path
+
+
+def get_keystore_address(
+    account: str = None,
+    password_file: str = None,
+    timeout: float = 30.0,
+    keystore: str = None,
+) -> str:
     """
     Derives signer address using:
-    cast wallet address --account <name> --password-file <path>
+    - cast wallet address --account <name> [--password-file <path>]
+    - cast wallet address --keystore <path> [--password-file <path>]
     Strictly parses stdout into a single legal Ethereum address.
+    If password_file is None, requires sys.stdin.isatty() == True for interactive password prompt.
     """
-    if not account or not isinstance(account, str) or not account.strip():
-        raise CastSignerError("Keystore account name must be specified and non-empty.")
+    if account and keystore:
+        raise CastSignerError("Cannot specify both 'account' and 'keystore'.")
+    if not account and not keystore:
+        raise CastSignerError("Either 'account' or 'keystore' must be specified.")
 
-    clean_account = account.strip()
-    validate_password_file(password_file)
-    clean_pw_file = password_file.strip()
-    abs_pw_file = os.path.abspath(clean_pw_file)
+    target_args = []
+    sensitive_secrets = []
+
+    if account:
+        if not isinstance(account, str) or not account.strip():
+            raise CastSignerError("Keystore account name must be specified and non-empty.")
+        clean_account = account.strip()
+        target_args = ["--account", clean_account]
+    else:
+        clean_keystore = validate_keystore_path(keystore)
+        abs_keystore = os.path.abspath(clean_keystore)
+        target_args = ["--keystore", clean_keystore]
+        sensitive_secrets.extend([clean_keystore, abs_keystore])
+
+    if password_file is not None:
+        validate_password_file(password_file)
+        clean_pw_file = password_file.strip()
+        abs_pw_file = os.path.abspath(clean_pw_file)
+        sensitive_secrets.extend([clean_pw_file, abs_pw_file])
+        pw_args = ["--password-file", clean_pw_file]
+    else:
+        import sys
+        if not sys.stdin.isatty():
+            raise CastSignerError(
+                "Interactive keystore password prompt requires an interactive TTY terminal (sys.stdin.isatty() is False). "
+                "In non-interactive environments, please provide a password file, or run directly in an interactive terminal."
+            )
+        pw_args = []
 
     cast_bin = shutil.which("cast") or "cast"
-    cmd = [cast_bin, "wallet", "address", "--account", clean_account, "--password-file", clean_pw_file]
+    cmd = [cast_bin, "wallet", "address"] + target_args + pw_args
     isolated_env = get_isolated_cast_env()
 
     try:
         proc = subprocess.run(
             cmd,
+            stdin=None if pw_args else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -580,13 +636,13 @@ def get_keystore_address(account: str, password_file: str, timeout: float = 30.0
     except subprocess.TimeoutExpired:
         raise CastSignerError(f"cast wallet address timed out after {timeout}s") from None
     except Exception as e:
-        safe_msg = format_exception_safe(e, sensitive_values=[clean_pw_file, abs_pw_file])
+        safe_msg = format_exception_safe(e, sensitive_values=sensitive_secrets)
         raise CastSignerError(f"Failed to execute cast wallet address: {safe_msg}") from None
 
     if proc.returncode != 0:
         err_msg = sanitize_text(
             (proc.stderr or proc.stdout or "unknown error").strip(),
-            sensitive_values=[clean_pw_file, abs_pw_file],
+            sensitive_values=sensitive_secrets,
         )
         raise CastSignerError(f"cast wallet address failed (code {proc.returncode}): {err_msg}")
 
@@ -612,12 +668,14 @@ def cast_send(
     gas_limit: int,
     priority_gas_price: int,
     timeout: float = 60.0,
+    keystore: str = None,
 ) -> str:
     """
     Broadcasts a single EIP-1559 (type 2) transaction using:
-    cast send <contract> --data <calldata> --account <account> --password-file <file>
-              --rpc-url <rpc_url> --nonce <nonce> --gas-price <gas_price>
-              --priority-gas-price <priority_gas_price> --gas-limit <gas_limit> --async
+    cast send <contract> --data <calldata> [--account <account> | --keystore <keystore>]
+              [--password-file <file>] --rpc-url <rpc_url> --nonce <nonce>
+              --gas-price <gas_price> --priority-gas-price <priority_gas_price>
+              --gas-limit <gas_limit> --async
 
     EIP-1559 fee parameter semantics:
     - gas_price: retained interface name representing type-2 maxFeePerGas (in wei),
@@ -628,22 +686,50 @@ def cast_send(
     Shell is False, isolated env without ETH_* / PRIVATE_KEY.
     Single send, no auto-retries or price bumping.
     On timeout or missing txHash, raises CastSendUncertainError and displays warning:
-    UNCOINCERTAIN_TX_WARNING
+    UNCERTAIN_TX_WARNING
+    If password_file is None, requires sys.stdin.isatty() == True for interactive password prompt.
     """
-    if not account or not isinstance(account, str) or not account.strip():
-        raise CastSignerError("Keystore account name must be specified and non-empty.")
-    clean_account = account.strip()
+    if account and keystore:
+        raise CastSignerError("Cannot specify both 'account' and 'keystore'.")
+    if not account and not keystore:
+        raise CastSignerError("Either 'account' or 'keystore' must be specified.")
+
+    target_args = []
+    sensitive_secrets = []
+
+    if account:
+        if not isinstance(account, str) or not account.strip():
+            raise CastSignerError("Keystore account name must be specified and non-empty.")
+        clean_account = account.strip()
+        target_args = ["--account", clean_account]
+    else:
+        clean_keystore = validate_keystore_path(keystore)
+        abs_keystore = os.path.abspath(clean_keystore)
+        target_args = ["--keystore", clean_keystore]
+        sensitive_secrets.extend([clean_keystore, abs_keystore])
 
     if not rpc_url or not isinstance(rpc_url, str) or not rpc_url.strip():
         raise CastSignerError("RPC URL must be specified and non-empty.")
     clean_rpc_url = rpc_url.strip()
+    sensitive_secrets.append(clean_rpc_url)
 
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         raise CastSignerError(f"Timeout must be a positive finite number, got {timeout!r}.")
 
-    validate_password_file(password_file)
-    clean_pw_file = password_file.strip()
-    abs_pw_file = os.path.abspath(clean_pw_file)
+    if password_file is not None:
+        validate_password_file(password_file)
+        clean_pw_file = password_file.strip()
+        abs_pw_file = os.path.abspath(clean_pw_file)
+        sensitive_secrets.extend([clean_pw_file, abs_pw_file])
+        pw_args = ["--password-file", clean_pw_file]
+    else:
+        import sys
+        if not sys.stdin.isatty():
+            raise CastSignerError(
+                "Interactive keystore password prompt requires an interactive TTY terminal (sys.stdin.isatty() is False). "
+                "In non-interactive environments, please provide a password file, or run directly in an interactive terminal."
+            )
+        pw_args = []
 
     clean_contract = to_checksum_address(contract_address)
     clean_calldata = validate_calldata(calldata)
@@ -658,10 +744,7 @@ def cast_send(
         clean_contract,
         "--data",
         clean_calldata,
-        "--account",
-        clean_account,
-        "--password-file",
-        clean_pw_file,
+    ] + target_args + pw_args + [
         "--rpc-url",
         clean_rpc_url,
         "--nonce",
@@ -675,8 +758,6 @@ def cast_send(
         "--async",
     ]
     isolated_env = get_isolated_cast_env()
-
-    sensitive_secrets = [clean_pw_file, abs_pw_file, clean_rpc_url]
 
     try:
         proc = subprocess.run(
