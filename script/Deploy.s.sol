@@ -28,7 +28,7 @@ contract DeployScript is Script {
 
     struct DeployConfig {
         address liquidity;
-        address teamVesting;
+        address teamBeneficiary;
         address community;
         address timelockProposerSafe;
         address guardianSafe;
@@ -49,11 +49,12 @@ contract DeployScript is Script {
         TransparentUpgradeableProxy proxy;
         MinerV1 miner;
         ProxyAdmin proxyAdmin;
+        address teamVesting;
     }
 
     function _loadConfig() internal view returns (DeployConfig memory cfg) {
         cfg.liquidity = vm.envOr("LIQUIDITY_WALLET", address(0x1111111111111111111111111111111111111111));
-        cfg.teamVesting = vm.envOr("TEAM_VESTING_WALLET", address(0x2222222222222222222222222222222222222222));
+        cfg.teamBeneficiary = vm.envOr("TEAM_BENEFICIARY", vm.envOr("TEAM_VESTING_WALLET", address(0x2222222222222222222222222222222222222222)));
         cfg.community = vm.envOr("COMMUNITY_MULTISIG", address(0x3333333333333333333333333333333333333333));
         cfg.timelockProposerSafe = vm.envOr("TIMELOCK_PROPOSER_SAFE", address(0x4444444444444444444444444444444444444444));
         cfg.guardianSafe = vm.envOr("GUARDIAN_SAFE", address(0x5555555555555555555555555555555555555555));
@@ -116,8 +117,12 @@ contract DeployScript is Script {
             console.log(string.concat("  owner[", vm.toString(i), "]:"), owners[i]);
         }
 
-        require(threshold >= 2, string.concat(roleName, " threshold must be >= 2"));
-        require(owners.length >= 3, string.concat(roleName, " owners count must be >= 3"));
+        bool isGuardian = keccak256(bytes(roleName)) == keccak256(bytes("GUARDIAN_SAFE"));
+        uint256 minThreshold = isGuardian ? 1 : 2;
+        uint256 minOwners = isGuardian ? 2 : 3;
+
+        require(threshold >= minThreshold, string.concat(roleName, " threshold must be >= ", vm.toString(minThreshold)));
+        require(owners.length >= minOwners, string.concat(roleName, " owners count must be >= ", vm.toString(minOwners)));
         require(threshold <= owners.length, string.concat(roleName, " threshold cannot exceed owners count"));
 
         for (uint256 i = 0; i < owners.length; i++) {
@@ -155,8 +160,10 @@ contract DeployScript is Script {
         console.log("1. TimelockController deployed at:", address(dc.timelock));
 
         // 2. Token
-        dc.token = new Token(cfg.liquidity, cfg.teamVesting, cfg.community);
+        dc.token = new Token(cfg.liquidity, cfg.teamBeneficiary, cfg.community);
+        dc.teamVesting = dc.token.teamVestingWallet();
         console.log("2. Token deployed at:", address(dc.token));
+        console.log("2b. TeamVestingWallet deployed at:", dc.teamVesting);
 
         // 3. StakeVault
         dc.vault = new StakeVault(
@@ -239,7 +246,8 @@ contract DeployScript is Script {
         require(dc.token.miner() != address(0) && dc.token.miner() == address(dc.miner), "Post-check: Token.miner mismatch");
         require(dc.token.totalSupply() == 100_000_000e18, "Post-check: Token totalSupply mismatch");
         require(dc.token.balanceOf(cfg.liquidity) == 50_000_000e18, "Post-check: Liquidity premint balance mismatch");
-        require(dc.token.balanceOf(cfg.teamVesting) == 30_000_000e18, "Post-check: Team vesting premint balance mismatch");
+        require(dc.token.balanceOf(dc.token.teamVestingWallet()) == 30_000_000e18, "Post-check: Team vesting premint balance mismatch");
+        require(dc.token.teamBeneficiary() == cfg.teamBeneficiary, "Post-check: Team beneficiary mismatch");
         require(dc.token.balanceOf(cfg.community) == 20_000_000e18, "Post-check: Community premint balance mismatch");
         require(dc.miner.START() == cfg.start && dc.vault.START() == cfg.start, "Post-check: START timestamp mismatch");
         require(dc.vault.DEPOSIT() == cfg.depositBnb, "Post-check: DEPOSIT value mismatch");
@@ -287,7 +295,7 @@ contract DeployScript is Script {
             cfg.guardianSafe = address(mockB);
         }
 
-        // Validate both Safe contracts: code.length > 0, interface existence, threshold >= 2, owners >= 3, no deployer
+        // Validate both Safe contracts: code.length > 0, interface existence, threshold >= 2 (proposer) / >= 1 (guardian), owners >= 3 / >= 2, no deployer
         (address[] memory propOwners, ) = _validateSafe("TIMELOCK_PROPOSER_SAFE", cfg.timelockProposerSafe, deployer);
         (address[] memory guardOwners, ) = _validateSafe("GUARDIAN_SAFE", cfg.guardianSafe, deployer);
         _assertNoIntersection(propOwners, guardOwners);

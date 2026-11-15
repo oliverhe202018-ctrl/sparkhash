@@ -3,18 +3,23 @@ pragma solidity ^0.8.24;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IToken} from "./interfaces/IToken.sol";
+import {TeamVestingWallet} from "./TeamVestingWallet.sol";
 
-/// @title Token (TESTTOKEN / TTK)
+/// @title Token (SparkHash / SPKH)
 /// @notice Non-upgradeable standard ERC-20 token with hardcoded maximum supply and mining cap.
 /// @dev Only the designated Miner contract can call mint() for mining emissions.
 contract Token is ERC20, IToken {
     uint256 public constant override MAX_SUPPLY = 1_000_000_000e18;
     uint256 public constant override MINING_CAP = 900_000_000e18;
     uint256 public constant PREMINT_TOTAL = 100_000_000e18;
+    uint256 public constant TEAM_PREMINT = 30_000_000e18;
 
     uint256 public override totalMined;
     address public override miner;
     address public immutable deployer;
+
+    address public immutable teamBeneficiary;
+    address public immutable teamVestingWallet;
 
     event MinerSet(address indexed miner);
 
@@ -27,18 +32,25 @@ contract Token is ERC20, IToken {
 
     constructor(
         address liquidityWallet,
-        address teamVestingWallet,
+        address _teamBeneficiary,
         address communityMultisig
-    ) ERC20("TESTTOKEN", "TTK") {
-        if (liquidityWallet == address(0) || teamVestingWallet == address(0) || communityMultisig == address(0)) {
+    ) ERC20("SparkHash", "SPKH") {
+        if (liquidityWallet == address(0) || _teamBeneficiary == address(0) || communityMultisig == address(0)) {
             revert ZeroAddress();
         }
         deployer = msg.sender;
+        teamBeneficiary = _teamBeneficiary;
 
-        // Premint exactly 100M tokens to placeholder addresses
+        // Deploy Team Vesting Wallet (6 months cliff, 24 months total duration)
+        TeamVestingWallet vesting = new TeamVestingWallet(
+            _teamBeneficiary,
+            uint64(block.timestamp)
+        );
+        teamVestingWallet = address(vesting);
+
+        // Premint exactly 100M tokens
         _mint(liquidityWallet, 50_000_000e18);
-        // 占位地址(未实现归属):测试网占位使用,主网前需部署 VestingWallet 或线性归属合约
-        _mint(teamVestingWallet, 30_000_000e18);
+        _mint(teamVestingWallet, TEAM_PREMINT);
         _mint(communityMultisig, 20_000_000e18);
     }
 

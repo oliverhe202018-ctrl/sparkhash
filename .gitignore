@@ -14,6 +14,7 @@ broadcast/
 .env
 .env.*
 !.env.example
+!.env.mainnet.example
 
 # Key files, certificates and secrets
 *.key

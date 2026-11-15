@@ -44,6 +44,63 @@ contract DeployPreflightTest is Test {
         deployScript.run();
     }
 
+    function test_PreflightPassesWithGuardian1Of2() public {
+        address[] memory ownersA = new address[](3);
+        ownersA[0] = address(0x101);
+        ownersA[1] = address(0x102);
+        ownersA[2] = address(0x103);
+        MockSafe safeA = new MockSafe(ownersA, 2);
+
+        address[] memory ownersB = new address[](2);
+        ownersB[0] = address(0x201);
+        ownersB[1] = address(0x202);
+        MockSafe safeB = new MockSafe(ownersB, 1); // 1/2 Guardian Safe
+
+        vm.setEnv("TIMELOCK_PROPOSER_SAFE", vm.toString(address(safeA)));
+        vm.setEnv("GUARDIAN_SAFE", vm.toString(address(safeB)));
+        vm.setEnv("TIMELOCK_MIN_DELAY", "172800");
+        vm.setEnv("DISCLOSURE_TIMELOCK_DELAY", "172800");
+
+        deployScript.run();
+    }
+
+    function test_PreflightFailsIfGuardianThresholdLessThan1() public {
+        address[] memory ownersA = new address[](3);
+        ownersA[0] = address(0x101);
+        ownersA[1] = address(0x102);
+        ownersA[2] = address(0x103);
+        MockSafe safeA = new MockSafe(ownersA, 2);
+
+        address[] memory ownersB = new address[](2);
+        ownersB[0] = address(0x201);
+        ownersB[1] = address(0x202);
+        MockSafe safeB = new MockSafe(ownersB, 0); // threshold 0 < 1
+
+        vm.setEnv("TIMELOCK_PROPOSER_SAFE", vm.toString(address(safeA)));
+        vm.setEnv("GUARDIAN_SAFE", vm.toString(address(safeB)));
+
+        vm.expectRevert("GUARDIAN_SAFE threshold must be >= 1");
+        deployScript.run();
+    }
+
+    function test_PreflightFailsIfGuardianOwnersLessThan2() public {
+        address[] memory ownersA = new address[](3);
+        ownersA[0] = address(0x101);
+        ownersA[1] = address(0x102);
+        ownersA[2] = address(0x103);
+        MockSafe safeA = new MockSafe(ownersA, 2);
+
+        address[] memory ownersB = new address[](1);
+        ownersB[0] = address(0x201);
+        MockSafe safeB = new MockSafe(ownersB, 1); // 1 owner < 2
+
+        vm.setEnv("TIMELOCK_PROPOSER_SAFE", vm.toString(address(safeA)));
+        vm.setEnv("GUARDIAN_SAFE", vm.toString(address(safeB)));
+
+        vm.expectRevert("GUARDIAN_SAFE owners count must be >= 2");
+        deployScript.run();
+    }
+
     function test_PreflightFailsIfSafeMissingInterface() public {
         NonSafeMock nonSafe = new NonSafeMock();
 
