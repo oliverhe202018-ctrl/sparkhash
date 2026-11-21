@@ -7,8 +7,13 @@ SparkHash 是部署在 **BNB Smart Chain 主网（BSC，Chain ID 56）** 的开�
 ## 快速开始 · Quick Start
 
 - [传统矿工主网接入指南](docs/MAINNET_MINER_GUIDE.md) — 准备 BNB、质押激活、一键启动 CPU/GPU 挖矿、提交份额、领取奖励及赎回。
-- [币安 Agentic Wallet 自动挖矿教程](skills/sparkhash-agentic-miner/docs/AGENTIC_WALLET_MINING_GUIDE.md) — 创建专用钱包、设置限额、加载两个 Skill，再用一句话启动挖矿流程。
-- [SparkHash AI Agent Skill](skills/sparkhash-agentic-miner/SKILL.md) — 主网接口、只读求解器、签名流程和安全规则。
+
+### AI Agent 入口 · Agent Skill
+
+**从仓库根目录打开 [`skills/sparkhash-agentic-miner/SKILL.md`](skills/sparkhash-agentic-miner/SKILL.md)**。将整个 `skills/sparkhash-agentic-miner/` 目录加载到支持 Skills 的客户端，保留脚本和文档的目录结构，再显式调用 `sparkhash-agentic-miner`。
+
+- **本地只读求解器** [`skills/sparkhash-agentic-miner/solver.py`](skills/sparkhash-agentic-miner/solver.py)
+- **币安 Agentic Wallet 自动挖矿教程** [`skills/sparkhash-agentic-miner/docs/AGENTIC_WALLET_MINING_GUIDE.md`](skills/sparkhash-agentic-miner/docs/AGENTIC_WALLET_MINING_GUIDE.md)
 
 ## 主网合约 · Mainnet Contracts
 

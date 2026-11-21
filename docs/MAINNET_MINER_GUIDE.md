@@ -47,7 +47,7 @@ mainnet
 
 主网 CLI 包括 miner.py、miner_gpu.py、submit_share.py、status.py 和 claim.py。加上 **--chain-id 56** 即使用主网默认 RPC 和代理地址，省略时仍使用测试网（97）。CLI 会核对 RPC 返回的实际 Chain ID。
 
-使用币安 Agentic Wallet 签名的流程见[币安钱包挖矿教程](../skills/sparkhash-agentic-miner/docs/AGENTIC_WALLET_MINING_GUIDE.md)。
+使用 AI Agent 挖矿时，从仓库根目录打开 **[`skills/sparkhash-agentic-miner/SKILL.md`](../skills/sparkhash-agentic-miner/SKILL.md)**，并加载整个 `skills/sparkhash-agentic-miner/` 目录。币安钱包的配置与签名流程见[自动挖矿教程](../skills/sparkhash-agentic-miner/docs/AGENTIC_WALLET_MINING_GUIDE.md)。
 
 ## 2. 准备钱包、Gas 和质押 BNB
 
