@@ -62,6 +62,14 @@ class TestKeeperSubprocessFaultAndRecovery(unittest.TestCase):
         except Exception:
             pass
 
+    def assert_lock_released_after_process_exit(self, state_manager):
+        # Windows may still be releasing byte-range locks after the killed process has exited.
+        deadline = time.monotonic() + (2.0 if os.name == "nt" else 0.0)
+        while not state_manager.acquire_lock():
+            if time.monotonic() >= deadline:
+                self.fail("Lock must be acquirable after holding process was forcefully killed")
+            time.sleep(0.01)
+
     def test_subprocess_lock_mutual_exclusion(self):
         """[独立子进程测试] Subprocess A holds lock, Subprocess B is refused."""
         miner = "0x420382a0f874c1F120621f847d81581e8737504e"
@@ -139,10 +147,9 @@ if sm.acquire_lock():
             proc_a.wait()
             self.assertNotEqual(proc_a.returncode, 0)
 
-            # OS releases file lock: Subprocess C can now acquire lock immediately
             domain_c = StateDomain(chain_id=97, miner_address=miner, sender_address=sender)
             sm_c = KeeperStateManager(state_dir=self.state_dir, domain=domain_c)
-            self.assertTrue(sm_c.acquire_lock(), "Lock must be acquirable after holding process was forcefully killed")
+            self.assert_lock_released_after_process_exit(sm_c)
             sm_c.release_lock()
         finally:
             if proc_a.poll() is None:
@@ -205,7 +212,7 @@ time.sleep(30)
                 sm_new.recover_crash_to_manual_review(state_data)
 
             # Acquire lock and execute crash recovery transition
-            self.assertTrue(sm_new.acquire_lock())
+            self.assert_lock_released_after_process_exit(sm_new)
             try:
                 recovered_state = sm_new.recover_crash_to_manual_review(state_data)
                 self.assertEqual(recovered_state["status"], "MANUAL_REVIEW_LOCKED")
