@@ -333,6 +333,7 @@ class TestMinerDynamicVaultAndStakeEligibility(unittest.TestCase):
         args.miner_contract = self.MINER_PROXY_CUSTOM
         args.epoch = 1
         args.rpc = "http://mock-rpc"
+        args.chain_id = 97
         args.skip_stake_check = False
 
         with patch("script.miner.verify_chain_id", return_value=97), \

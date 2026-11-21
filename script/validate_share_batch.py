@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PoolCoin Offline Share Batch Validator and Calldata Generator
-Validates exactly 6 PoW share JSON files for MinerV1 on BSC Testnet (chainId 97),
+Validates exactly 6 PoW share JSON files for MinerV1 on BSC (chain IDs 56 and 97),
 re-computes each proof against MinerV1 contract rules, and produces batch parameters
 for submitShares(uint8[] ks, uint256[] nonces).
 
@@ -28,8 +28,10 @@ from decimal import Decimal
 from typing import List, Dict, Any, Tuple
 
 try:
+    from script.miner_network import NETWORK_NAMES
     from script.safe_output import format_exception_safe, sanitize_text, sanitize_url
 except ImportError:
+    from miner_network import NETWORK_NAMES
     from safe_output import format_exception_safe, sanitize_text, sanitize_url
 
 _SENSITIVE_ENV_EXACT = (
@@ -302,10 +304,10 @@ def validate_single_share_file(
         raise ValueError(f"{file_path}: chainId cannot be float or scientific notation")
     if isinstance(c_id, bool) or not isinstance(c_id, int):
         raise ValueError(f"{file_path}: chainId must be integer, got {type(c_id).__name__}")
-    if c_id != REQUIRED_CHAIN_ID:
-        raise ValueError(f"{file_path}: chainId {c_id} != {REQUIRED_CHAIN_ID} (BSC Testnet required)")
     if c_id != expected_chain_id:
-        raise ValueError(f"{file_path}: chainId {c_id} does not match expected {expected_chain_id}")
+        raise ValueError(f"{file_path}: chainId {c_id} != {expected_chain_id}")
+    if c_id not in NETWORK_NAMES:
+        raise ValueError(f"{file_path}: unsupported BSC chain ID {c_id}")
 
     # 3. Address value comparisons
     miner_norm = normalize_address(data["miner"], f"{file_path}: miner")
@@ -443,9 +445,8 @@ def validate_batch(
     """
     Validates the entire batch of 6 files and generates batch submission parameters.
     """
-    # Enforce BSC Testnet chainId == 97
-    if chain_id != REQUIRED_CHAIN_ID:
-        raise ValueError(f"Invalid chainId {chain_id}. BSC Testnet ({REQUIRED_CHAIN_ID}) required.")
+    if chain_id not in NETWORK_NAMES:
+        raise ValueError(f"Invalid chainId {chain_id}. BSC Mainnet (56) or Testnet (97) required.")
 
     # Reject duplicate input paths
     if len(files) != BATCH_SIZE:
@@ -542,7 +543,7 @@ def validate_batch(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PoolCoin Offline Share Batch Validator and Calldata Generator (BSC Testnet)",
+        description="PoolCoin Offline Share Batch Validator and Calldata Generator (BSC Mainnet / Testnet)",
         epilog="""
 RC2 REFERENCE NOTICE:
   Actual rc2 Miner proxy contract address:
@@ -568,7 +569,7 @@ ILLUSTRATIVE PARAMETERS SCHEMATIC NOTICE:
         "--chain-id",
         type=int,
         required=True,
-        help="Expected chainId (must be 97 for BSC Testnet)"
+        help="Expected chain ID (56 for BSC Mainnet or 97 for BSC Testnet)"
     )
     parser.add_argument(
         "--proxy",
@@ -635,7 +636,7 @@ ILLUSTRATIVE PARAMETERS SCHEMATIC NOTICE:
     print("             POOLCOIN SHARE BATCH OFFLINE VALIDATION             ")
     print("=================================================================")
     print(f"Validation Result:    SUCCESS (6/6 shares verified)")
-    print(f"Chain ID:             {res['chainId']} (BSC Testnet)")
+    print(f"Chain ID:             {res['chainId']} ({NETWORK_NAMES[res['chainId']]})")
     print(f"Miner Proxy:          {res['proxy']}")
     print(f"Miner Address:        {res['miner']}")
     print(f"Epoch:                {res['epoch']}")

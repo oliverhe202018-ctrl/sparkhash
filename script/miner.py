@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PoolCoin Multi-threaded PoW Miner for MinerV1 on BSC Testnet (chainId 97)
+PoolCoin Multi-threaded PoW Miner for MinerV1 on BSC (chain IDs 56 and 97)
 
 Calculates valid proof-of-work shares meeting MinerV1 target difficulty.
 Outputs verified share (nonce and hash) to a JSON file.
 
 HARD CONSTRAINTS ENFORCED:
-1. Hardcoded refusal for any chainId != 97 (BSC Testnet only).
-2. Pure read-only RPC & local PoW. Zero private key logic; never reads or touches .env.
-3. Separation of mining and submission: this script ONLY generates shares to JSON.
+1. The RPC chain ID must match the selected network (testnet by default).
+2. By default uses read-only RPC & local PoW. Never reads .env; optional seed backfill is testnet-only.
+3. Separation of mining and submission: shares are written to JSON and submitted separately.
 """
 
 import os
@@ -23,8 +23,14 @@ import urllib.request
 import threading
 import multiprocessing as mp
 import random
+from queue import Empty
 
-# Chain ID constraint: strictly BSC Testnet
+try:
+    from script.miner_network import MAINNET_CHAIN_ID, NETWORK_NAMES, add_chain_argument, chain_settings, verify_rpc_chain
+except ImportError:
+    from miner_network import MAINNET_CHAIN_ID, NETWORK_NAMES, add_chain_argument, chain_settings, verify_rpc_chain
+
+# Default chain for existing testnet callers
 REQUIRED_CHAIN_ID = 97
 
 # Default addresses and targets on BSC Testnet
@@ -171,15 +177,8 @@ def rpc_call(rpc_url, method, params, sensitive_values=None):
     return res.get("result") if isinstance(res, dict) else res
 
 
-def verify_chain_id(rpc_url):
-    """Queries chainId from RPC and asserts it equals 97."""
-    res = rpc_call(rpc_url, "eth_chainId", [])
-    chain_id = int(res, 16) if isinstance(res, str) else int(res)
-    if chain_id != REQUIRED_CHAIN_ID:
-        raise ValueError(
-            f"SECURITY REJECTION: Chain ID {chain_id} != {REQUIRED_CHAIN_ID} (BSC Testnet required)! Refusing to run."
-        )
-    return chain_id
+def verify_chain_id(rpc_url, expected=REQUIRED_CHAIN_ID):
+    return verify_rpc_chain(rpc_call(rpc_url, "eth_chainId", []), expected)
 
 
 def eth_call(rpc_url, to, data):
@@ -329,8 +328,7 @@ def monitor_progress(stats_queue, stop_event, target_hashes, log_interval=2.0):
     total_hashes = 0
     last_hashes = 0
 
-    while not stop_event.is_set():
-        time.sleep(log_interval)
+    while not stop_event.wait(log_interval):
         now = time.time()
         batch_sum = 0
         while not stats_queue.empty():
@@ -537,11 +535,11 @@ def verify_stake(rpc_url: str, miner_contract: str, miner_addr: str, cur_epoch: 
 
 
 def mine(args):
-    # Enforce BSC testnet
+    chain_id, args.rpc, args.miner_contract = chain_settings(args, DEFAULT_RPC_URL, DEFAULT_MINER_CONTRACT)
+    if chain_id == MAINNET_CHAIN_ID and getattr(args, "allow_backfill", False):
+        raise ValueError("--allow-backfill is only supported on BSC Testnet")
     if args.rpc:
-        chain_id = verify_chain_id(args.rpc)
-    else:
-        chain_id = REQUIRED_CHAIN_ID
+        verify_chain_id(args.rpc, chain_id)
 
     miner_addr = to_checksum_address(args.miner)
     miner_contract = to_checksum_address(args.miner_contract)
@@ -556,9 +554,11 @@ def mine(args):
         cur_epoch = onchain_epoch
     else:
         raise RuntimeError("Cannot resolve epoch: --rpc is not set and --epoch was omitted.")
+    if chain_id == MAINNET_CHAIN_ID and cur_epoch != onchain_epoch:
+        raise ValueError("Mainnet mining requires the current on-chain epoch")
 
     print("=== PoolCoin Multi-Threaded PoW Miner ===")
-    print(f"Target Network:   BSC Testnet (Chain ID {chain_id})")
+    print(f"Target Network:   {NETWORK_NAMES[chain_id]} (Chain ID {chain_id})")
     print(f"Miner Contract:   {miner_contract}")
     print(f"Miner Address:    {miner_addr}")
     print(f"Current Epoch:    {cur_epoch}")
@@ -722,9 +722,10 @@ def mine(args):
         p.start()
         workers.append(p)
 
+    monitor_stop = threading.Event()
     mon_thread = threading.Thread(
         target=monitor_progress,
-        args=(stats_queue, stop_event, expected_trials),
+        args=(stats_queue, monitor_stop, expected_trials),
         daemon=True,
     )
     mon_thread.start()
@@ -732,17 +733,31 @@ def mine(args):
     print("[Miner] Mining started... Press Ctrl+C to abort.", flush=True)
 
     try:
-        found_nonce, found_hash = result_queue.get()
-        stop_event.set()
+        if chain_id == MAINNET_CHAIN_ID:
+            while True:
+                try:
+                    found_nonce, found_hash = result_queue.get(timeout=15)
+                except Empty:
+                    if get_uint_call(args.rpc, miner_contract, SELECTOR_EPOCH, "epoch()") != cur_epoch:
+                        raise RuntimeError("Epoch changed during mining. Restart to get the current task.")
+                    if not any(worker.is_alive() for worker in workers):
+                        raise RuntimeError("Mining workers exited without a result")
+                else:
+                    break
+        else:
+            found_nonce, found_hash = result_queue.get()
     except KeyboardInterrupt:
         print("\n[Miner] Keyboard interrupt received! Stopping workers...")
+        sys.exit(1)
+    finally:
         stop_event.set()
         for p in workers:
-            p.join(timeout=1.0)
-        sys.exit(1)
+            p.join()
+        monitor_stop.set()
+        mon_thread.join()
 
-    for p in workers:
-        p.join()
+    if chain_id == MAINNET_CHAIN_ID and get_uint_call(args.rpc, miner_contract, SELECTOR_EPOCH, "epoch()") != cur_epoch:
+        raise RuntimeError("Epoch changed before saving the share. Restart to get the current task.")
 
     elapsed = time.time() - start_time
     total_hashes = 0
@@ -792,16 +807,16 @@ def mine(args):
         json.dump(output_data, f, indent=2)
     print(f"Share successfully saved to: {out_file}")
     print("\nNext step: Run submission simulation with:")
-    print(f"  python script/submit_share.py --file {out_file}")
+    print(f"  python script/submit_share.py --chain-id {chain_id} --file {out_file!r}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PoolCoin Multi-threaded PoW Miner (BSC Testnet)")
+    parser = argparse.ArgumentParser(description="PoolCoin Multi-threaded PoW Miner (BSC Mainnet / Testnet)")
     parser.add_argument("--miner", type=str, required=True, help="Miner wallet address")
     parser.add_argument("--epoch", type=int, default=None, help="Epoch number (queries RPC if omitted)")
     parser.add_argument("--k", type=int, default=None, help="Share index 0..5 (auto-selected if omitted)")
-    parser.add_argument("--rpc", type=str, default=DEFAULT_RPC_URL, help="BSC Testnet RPC URL")
-    parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="Miner proxy contract address")
+    parser.add_argument("--rpc", type=str, default=argparse.SUPPRESS, help="BSC RPC URL")
+    parser.add_argument("--miner-contract", type=str, default=None, help="Miner proxy contract address")
     parser.add_argument(
         "--threads",
         type=int,
@@ -816,6 +831,7 @@ def main():
     parser.add_argument("--allow-backfill", action="store_true", help="Allow sending initEpochSeed backfill tx via env private key when seed is 0")
     parser.add_argument("--out", type=str, default=None, help="Output JSON file path")
 
+    add_chain_argument(parser)
     args = parser.parse_args()
     try:
         mine(args)

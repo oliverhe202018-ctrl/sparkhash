@@ -20,6 +20,8 @@ broadcast/
 *.key
 *.pem
 *.keystore
+*.pwd
+keystores/
 *.pkcs12
 *.p12
 id_rsa*
@@ -32,11 +34,14 @@ dryrun-output.txt
 __pycache__/
 *.pyc
 .venv_gpu/
+.venv-miner/
 .pytest_cache/
 share_*.json
+share-mainnet-*.json
 /test_share_program.json
 test_gpu_share_*.json
 gpu_share_*.json
+/script/verify_mainnet.ps1
 
 # Personal vault notes
 docs/personal-vault-*

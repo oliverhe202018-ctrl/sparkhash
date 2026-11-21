@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PoolCoin Safe Share Submission Script for MinerV1 on BSC Testnet (chainId 97)
+PoolCoin Safe Share Submission Script for MinerV1 on BSC (chain IDs 56 and 97)
 
 Submits mined PoW shares to MinerV1.
 DEFAULT MODE: Read-only simulation via eth_call / cast call.
@@ -10,7 +10,7 @@ maxFeePerGas >= max(eth_gasPrice, maxPriorityFeePerGas), and signs via Foundry k
 (--account / --password-file) using cast send (or legacy MINER_PRIVATE_KEY env fallback).
 
 HARD CONSTRAINTS ENFORCED:
-1. Hardcoded refusal for any chainId != 97 (BSC Testnet only).
+1. The RPC chain ID must match the selected network (testnet by default).
 2. Never reads .env or prints private keys. Private key is strictly from MINER_PRIVATE_KEY env var.
 3. Requires explicit manual confirmation ("yes") before broadcasting.
 """
@@ -52,6 +52,11 @@ except ImportError:
         resolve_eip1559_fees,
         validate_cli_fee_and_gas_args,
     )
+
+try:
+    from script.miner_network import EXPLORERS, MAINNET_CHAIN_ID, NETWORK_NAMES, add_chain_argument, chain_settings, verify_rpc_chain
+except ImportError:
+    from miner_network import EXPLORERS, MAINNET_CHAIN_ID, NETWORK_NAMES, add_chain_argument, chain_settings, verify_rpc_chain
 
 REQUIRED_CHAIN_ID = 97
 DEFAULT_MINER_CONTRACT = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
@@ -189,14 +194,18 @@ def rpc_call(rpc_url, method, params, sensitive_values=None):
     return res.get("result") if isinstance(res, dict) else res
 
 
-def verify_chain_id(rpc_url):
-    res = rpc_call(rpc_url, "eth_chainId", [])
-    chain_id = int(res, 16) if isinstance(res, str) else int(res)
-    if chain_id != REQUIRED_CHAIN_ID:
-        raise ValueError(
-            f"SECURITY REJECTION: Chain ID {chain_id} != {REQUIRED_CHAIN_ID} (BSC Testnet required)! Refusing to run."
-        )
-    return chain_id
+def verify_chain_id(rpc_url, expected=REQUIRED_CHAIN_ID):
+    return verify_rpc_chain(rpc_call(rpc_url, "eth_chainId", []), expected)
+
+
+def verify_share_epoch(rpc_url, miner_contract, epoch):
+    if epoch is None:
+        raise ValueError("Mainnet submission requires a share epoch (--epoch or --file)")
+    selector = "0x" + keccak(b"epoch()").hex()[:8]
+    request = {"to": miner_contract, "data": selector}
+    current_epoch = int(rpc_call(rpc_url, "eth_call", [request, "latest"]), 16)
+    if epoch != current_epoch:
+        raise ValueError(f"Share epoch {epoch} is no longer current (on-chain epoch {current_epoch})")
 
 
 def to_checksum_address(address):
@@ -255,18 +264,28 @@ def submit(args):
         deprecated_gas_price_gwei=getattr(args, "gas_price_gwei", None),
     )
 
-    # 1. Enforce BSC Testnet
-    chain_id = verify_chain_id(args.rpc)
+    chain_id, args.rpc, args.miner_contract = chain_settings(args, DEFAULT_RPC_URL, DEFAULT_MINER_CONTRACT)
+    verify_chain_id(args.rpc, chain_id)
 
     # 2. Parse Share Data
     if args.file:
         with open(args.file, "r", encoding="utf-8") as f:
             data = json.load(f)
         miner_addr = to_checksum_address(data["miner"])
-        miner_contract = to_checksum_address(data.get("minerContract", DEFAULT_MINER_CONTRACT))
+        file_chain = data.get("chainId", REQUIRED_CHAIN_ID)
+        if isinstance(file_chain, str):
+            file_chain = int(file_chain, 16 if file_chain.lower().startswith("0x") else 10)
+        if file_chain != chain_id:
+            raise ValueError("Share file chainId does not match the selected chain")
+        if chain_id == MAINNET_CHAIN_ID and not data.get("minerContract"):
+            raise ValueError("A mainnet share file must include minerContract")
+        default_proxy = args.miner_contract if chain_id == MAINNET_CHAIN_ID else DEFAULT_MINER_CONTRACT
+        miner_contract = to_checksum_address(data.get("minerContract", default_proxy))
+        if chain_id == MAINNET_CHAIN_ID and miner_contract.lower() != args.miner_contract.lower():
+            raise ValueError("Share file minerContract does not match the selected mainnet proxy")
         k = int(data["k"])
         nonce = int(data["nonceDecimal"] if "nonceDecimal" in data else int(data["nonce"], 16))
-        epoch = int(data.get("epoch", 0))
+        epoch = int(data["epoch"]) if chain_id == MAINNET_CHAIN_ID else int(data.get("epoch", 0))
         share_hash = data.get("hash", "")
     else:
         if not args.miner or args.k is None or args.nonce is None:
@@ -277,6 +296,9 @@ def submit(args):
         nonce = int(args.nonce if not str(args.nonce).startswith("0x") else int(args.nonce, 16))
         epoch = args.epoch
         share_hash = ""
+
+    if chain_id == MAINNET_CHAIN_ID:
+        verify_share_epoch(args.rpc, miner_contract, epoch)
 
     ks = [k]
     nonces = [nonce]
@@ -320,7 +342,7 @@ def submit(args):
             sys.exit(1)
 
     print("=== PoolCoin Share Submitter ===")
-    print(f"Network:          BSC Testnet (Chain ID {chain_id})")
+    print(f"Network:          {NETWORK_NAMES[chain_id]} (Chain ID {chain_id})")
     print(f"Miner Contract:   {miner_contract}")
     print(f"Miner Address:    {miner_addr}")
     if epoch is not None:
@@ -398,9 +420,10 @@ def submit(args):
         print("  1. Prepare your Foundry keystore account name and password file (--account and --password-file).")
         print("  2. Re-run this script with --send, --account, and --password-file:")
         if args.file:
-            print(f"     python script/submit_share.py --file {args.file} --send --account <keystore_account> --password-file <password_file_path>")
+            print(f"     python script/submit_share.py --chain-id {chain_id} --file {args.file!r} --send --account <keystore_account> --password-file <password_file_path>")
         else:
-            print(f"     python script/submit_share.py --miner {miner_addr} --k {k} --nonce {nonce} --send --account <keystore_account> --password-file <password_file_path>")
+            epoch_arg = f" --epoch {epoch}" if epoch is not None else ""
+            print(f"     python script/submit_share.py --chain-id {chain_id} --miner {miner_addr}{epoch_arg} --k {k} --nonce {nonce} --send --account <keystore_account> --password-file <password_file_path>")
         print("=" * 50)
         return
 
@@ -463,15 +486,19 @@ def submit(args):
     print(f"Max Fee:          {max_fee_wei / 1e9:.3f} gwei ({max_fee_wei} wei)")
     print(f"Priority Fee:     {priority_fee_wei / 1e9:.3f} gwei ({priority_fee_wei} wei)")
     print(f"Max Gas Cost Cap: {max_gas_cost_bnb:.6f} BNB")
-    print(f"Chain ID:         {chain_id} (BSC Testnet: VERIFIED)")
+    print(f"Chain ID:         {chain_id} ({NETWORK_NAMES[chain_id]}: VERIFIED)")
     print(f"Preflight Sim:    PASSED")
     print("=====================================================")
 
     # Prompt manual confirmation
-    confirm = input("\nAre you sure you want to broadcast this transaction to BSC Testnet? (type 'yes' to broadcast): ")
+    confirm = input(f"\nAre you sure you want to broadcast this transaction to {NETWORK_NAMES[chain_id]}? (type 'yes' to broadcast): ")
     if confirm.strip().lower() != "yes":
         print("[ABORTED] Broadcast cancelled by user. No transaction was sent.")
         return
+
+    if chain_id == MAINNET_CHAIN_ID:
+        verify_chain_id(args.rpc, chain_id)
+        verify_share_epoch(args.rpc, miner_contract, epoch)
 
     # Fetch Nonce
     try:
@@ -484,7 +511,7 @@ def submit(args):
         sys.exit(1)
 
     if has_signer_flags:
-        print("\nBroadcasting transaction to BSC Testnet via cast send...", flush=True)
+        print(f"\nBroadcasting transaction to {NETWORK_NAMES[chain_id]} via cast send...", flush=True)
         try:
             tx_hash = cast_send(
                 contract_address=miner_contract,
@@ -525,11 +552,11 @@ def submit(args):
         signed_tx = Account.sign_transaction(tx_dict, private_key)
         raw_tx_hex = "0x" + signed_tx.raw_transaction.hex()
 
-        print("\nBroadcasting transaction to BSC Testnet...", flush=True)
+        print(f"\nBroadcasting transaction to {NETWORK_NAMES[chain_id]}...", flush=True)
         tx_hash = rpc_call(args.rpc, "eth_sendRawTransaction", [raw_tx_hex])
 
     print(f"\n[BROADCAST SUCCESS] Transaction Hash: {tx_hash}")
-    print(f"View on BscScan Testnet: https://testnet.bscscan.com/tx/{tx_hash}")
+    print(f"View on BscScan: {EXPLORERS[chain_id]}/tx/{tx_hash}")
 
     # Wait for receipt
     print("Waiting for transaction confirmation on-chain...", flush=True)
@@ -558,18 +585,18 @@ def submit(args):
             print(f"Gas Used: {gas_used:,}")
     else:
         print("[INFO] Transaction submitted. Please check status on BscScan:")
-        print(f"  https://testnet.bscscan.com/tx/{tx_hash}")
+        print(f"  {EXPLORERS[chain_id]}/tx/{tx_hash}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PoolCoin Safe Share Submitter (BSC Testnet)")
+    parser = argparse.ArgumentParser(description="PoolCoin Safe Share Submitter (BSC Mainnet / Testnet)")
     parser.add_argument("--file", type=str, default=None, help="Path to JSON file generated by miner.py")
     parser.add_argument("--miner", type=str, default=None, help="Miner wallet address")
-    parser.add_argument("--k", type=int, default=None, help="Share index (0..14)")
+    parser.add_argument("--k", type=int, default=None, help="Share index (0..5)")
     parser.add_argument("--nonce", type=str, default=None, help="Mined nonce (decimal or 0x hex)")
     parser.add_argument("--epoch", type=int, default=None, help="Target epoch")
-    parser.add_argument("--rpc", type=str, default=DEFAULT_RPC_URL, help="BSC Testnet RPC URL")
-    parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="Miner proxy address")
+    parser.add_argument("--rpc", type=str, default=argparse.SUPPRESS, help="BSC RPC URL")
+    parser.add_argument("--miner-contract", type=str, default=None, help="Miner proxy address")
     parser.add_argument("--account", type=str, default=None, help="Foundry keystore account name (must be used with --password-file)")
     parser.add_argument("--password-file", type=str, default=None, help="Path to password file for Foundry keystore (must be used with --account)")
     parser.add_argument("--keystore", type=str, default=None, help="Path to custom encrypted keystore file (supports interactive password prompt or --password-file)")
@@ -580,6 +607,7 @@ def main():
     parser.add_argument("--gas-price-gwei", type=str, default=None, help="[Compatibility alias] Equivalent to --max-fee-per-gas-gwei (gwei)")
     parser.add_argument("--gas-limit", type=int, default=350000, help="Gas limit ceiling (default: 350000)")
 
+    add_chain_argument(parser)
     args = parser.parse_args()
     try:
         submit(args)

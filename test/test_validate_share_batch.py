@@ -204,6 +204,25 @@ class TestValidateShareBatch(unittest.TestCase):
             fp = self._write_share_file(data, f"synthetic_share_k{idx}.json")
             files.append(fp)
         return files
+
+    def test_mainnet_batch_uses_mainnet_proof_domain(self):
+        proxy = "0x614b5efd21cfa99cb893abf2fb02d791b3aea843"
+        shares = [
+            self._write_share_file(self._create_synthetic_share_dict(k, k, proxy=proxy, chain_id=56), f"mainnet-{k}.json")
+            for k in range(BATCH_SIZE)
+        ]
+        batch = validate_batch(
+            shares, 56, proxy, self.fictitious_miner, self.epoch,
+            self.seed_hex, self.easy_target_hex, os.path.join(self.temp_dir, "mainnet-batch.json"),
+        )
+        self.assertEqual(batch["chainId"], 56)
+        self.assertEqual(batch["ks"], list(range(BATCH_SIZE)))
+        with self.assertRaisesRegex(ValueError, "chainId 56 != 97"):
+            validate_batch(
+                shares, 97, proxy, self.fictitious_miner, self.epoch,
+                self.seed_hex, self.easy_target_hex, os.path.join(self.temp_dir, "wrong-chain.json"),
+            )
+
     # -------------------------------------------------------------------------
     # Requirement 3: Independent verification of proof encoding
     # -------------------------------------------------------------------------

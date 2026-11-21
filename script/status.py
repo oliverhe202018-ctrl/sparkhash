@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PoolCoin Miner Status Inspector for MinerV1 on BSC Testnet (chainId 97)
+PoolCoin Miner Status Inspector for MinerV1 on BSC (chain IDs 56 and 97)
 
 Read-only inspection script.
 Queries and displays:
@@ -14,7 +14,7 @@ Queries and displays:
 
 HARD CONSTRAINTS ENFORCED:
 - Pure read-only inspection.
-- Enforces chainId == 97 (BSC Testnet).
+- Enforces the selected BSC chain ID (testnet by default).
 - Never reads or touches .env or any private keys.
 - Never writes to any external services.
 """
@@ -39,6 +39,11 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from eth_abi import encode, decode
 from eth_hash.auto import keccak
+
+try:
+    from script.miner_network import MAINNET_CHAIN_ID, NETWORK_NAMES, add_chain_argument, chain_settings, verify_rpc_chain
+except ImportError:
+    from miner_network import MAINNET_CHAIN_ID, NETWORK_NAMES, add_chain_argument, chain_settings, verify_rpc_chain
 
 REQUIRED_CHAIN_ID = 97
 DEFAULT_MINER_CONTRACT = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
@@ -263,15 +268,12 @@ def format_used_mask(mask):
 
 def inspect_status(args):
     miner_addr = to_checksum_address(args.miner)
-    miner_contract = to_checksum_address(args.miner_contract)
     
-    rpc_url = args.rpc if args.rpc else get_working_rpc(DEFAULT_RPC_URLS)
-    
-    # 1. Verify chain ID
-    cid_res = rpc_batch_call(rpc_url, [("eth_chainId", [])])[0]
-    chain_id = int(cid_res, 16) if isinstance(cid_res, str) else int(cid_res)
-    if chain_id != REQUIRED_CHAIN_ID:
-        raise ValueError(f"安全拦截: Chain ID {chain_id} != {REQUIRED_CHAIN_ID} (必须为 BSC Testnet)!")
+    chain_id, rpc_url, proxy = chain_settings(args, None, DEFAULT_MINER_CONTRACT)
+    rpc_url = rpc_url or get_working_rpc(DEFAULT_RPC_URLS)
+    verify_rpc_chain(rpc_batch_call(rpc_url, [("eth_chainId", [])])[0], chain_id)
+    token_symbol = "SPKH" if chain_id == MAINNET_CHAIN_ID else "TTK"
+    miner_contract = to_checksum_address(proxy)
 
     # 2. Fetch protocol core addresses and states
     core_calls = [
@@ -308,12 +310,12 @@ def inspect_status(args):
     print("=" * 78)
     print("                  PoolCoin 矿工链上全景状态报告 (Miner Status Report)")
     print("=" * 78)
-    print(f"网络:                BSC Testnet (Chain ID {chain_id})")
+    print(f"网络:                {NETWORK_NAMES[chain_id]} (Chain ID {chain_id})")
     print(f"RPC 节点:            {sanitize_url(rpc_url)}")
     print(f"矿工地址:            {miner_addr}")
     print(f"MinerV1 代理合约:    {miner_contract}")
     print(f"StakeVault 质押合约: {vault_contract}")
-    print(f"Token (TTK) 合约:    {token_contract}")
+    print(f"Token ({token_symbol}) 合约:    {token_contract}")
     print("-" * 78)
     print("【1. 质押与基础轮次状态 (Staking & Protocol Status)】")
     print(f"  [*] 质押状态 (active):        {'Active (已激活生效)' if active else 'Inactive (未质押或已申请提款)'}")
@@ -327,8 +329,8 @@ def inspect_status(args):
     sync_status = "已完全同步" if last_synced >= cur_epoch else f"落后 {cur_epoch - last_synced} 轮 (需要 keeper 调用 sync 追赶)"
     print(f"  [*] 协议同步轮次 (lastSynced): Epoch {last_synced} ({sync_status})")
     print(f"  [*] 当前轮预热权重 (ramp):    {cur_ramp_desc}")
-    print(f"  [*] Token 余额 (TTK):         {token_balance_wei / 1e18:.6f} TTK ({token_balance_wei} wei)")
-    print(f"  [*] 剩余未分配配额 (R):       {remaining_emission / 1e18:.4f} TTK (上限 900,000,000 TTK)")
+    print(f"  [*] Token 余额 ({token_symbol}):         {token_balance_wei / 1e18:.6f} {token_symbol} ({token_balance_wei} wei)")
+    print(f"  [*] 剩余未分配配额 (R):       {remaining_emission / 1e18:.4f} {token_symbol} (上限 900,000,000 {token_symbol})")
     print("-" * 78)
 
     # 4. Fetch per-epoch participation
@@ -431,14 +433,14 @@ def inspect_status(args):
                 maxAmt = (effQ * capBps) // 10000
                 final_amt = min(amt, maxAmt)
 
-                print(f"    [-] 轮次有效配额 (effQuota):    {effQ / 1e18:.4f} TTK")
+                print(f"    [-] 轮次有效配额 (effQuota):    {effQ / 1e18:.4f} {token_symbol}")
                 print(f"    [-] 权重分母 (denom):           {denom:,} (totalWeight={tw:,}, wMin={wm:,})")
-                print(f"    [-] 单地址比例上限 (addrCap):   {capBps / 100:.2f}% (单地址最大奖励: {maxAmt / 1e18:.4f} TTK)")
+                print(f"    [-] 单地址比例上限 (addrCap):   {capBps / 100:.2f}% (单地址最大奖励: {maxAmt / 1e18:.4f} {token_symbol})")
                 
                 if cl:
                     print(f"    [+] 奖励结算状态:               [已在链上领取] Token 已铸造到矿工钱包")
                 else:
-                    print(f"    [+] 可领取奖励 (Claimable):     {final_amt / 1e18:.6f} TTK ({final_amt} wei)")
+                    print(f"    [+] 可领取奖励 (Claimable):     {final_amt / 1e18:.6f} {token_symbol} ({final_amt} wei)")
                     total_claimable_wei += final_amt
                     claimable_epochs.append((e, final_amt))
             elif e == cur_epoch:
@@ -450,22 +452,24 @@ def inspect_status(args):
     print("\n" + "-" * 78)
     print("【3. 可领取奖励总计 (Claimable Reward Summary)】")
     if claimable_epochs:
-        epoch_list_str = ", ".join(f"Epoch {e} ({amt / 1e18:.4f} TTK)" for e, amt in claimable_epochs)
+        epoch_list_str = ", ".join(f"Epoch {e} ({amt / 1e18:.4f} {token_symbol})" for e, amt in claimable_epochs)
         print(f"  [+] 待领取轮次:             {epoch_list_str}")
-        print(f"  [+] 待领取总奖励:           {total_claimable_wei / 1e18:.6f} TTK ({total_claimable_wei} wei)")
-        print(f"  [+] 领取命令提示:           python script/claim.py --epoch {claimable_epochs[0][0]}")
+        print(f"  [+] 待领取总奖励:           {total_claimable_wei / 1e18:.6f} {token_symbol} ({total_claimable_wei} wei)")
+        print(f"  [+] 领取命令提示:           python script/claim.py --chain-id {chain_id} "
+              f"--epoch {claimable_epochs[0][0]} --miner {miner_addr}")
     else:
-        print("  [*] 待领取总奖励:           0 TTK (暂无待领取的已结束轮次)")
+        print(f"  [*] 待领取总奖励:           0 {token_symbol} (暂无待领取的已结束轮次)")
     print("=" * 78)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PoolCoin 矿工链上全景状态查询工具 (BSC Testnet)")
+    parser = argparse.ArgumentParser(description="PoolCoin 矿工链上全景状态查询工具 (BSC Mainnet / Testnet)")
     parser.add_argument("miner", nargs="?", default=None, help="矿工 EOA 钱包地址")
     parser.add_argument("--miner", dest="miner_flag", default=None, help="矿工 EOA 钱包地址 (--miner 方式)")
-    parser.add_argument("--rpc", type=str, default=None, help="自定义 BSC Testnet RPC 节点地址")
-    parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="MinerV1 代理合约地址")
+    parser.add_argument("--rpc", type=str, default=argparse.SUPPRESS, help="自定义 BSC RPC 节点地址")
+    parser.add_argument("--miner-contract", type=str, default=None, help="MinerV1 代理合约地址")
     parser.add_argument("--all-epochs", action="store_true", help="全量扫描自 Epoch 0 起的所有轮次")
+    add_chain_argument(parser)
     args = parser.parse_args()
 
     miner_addr = args.miner or args.miner_flag

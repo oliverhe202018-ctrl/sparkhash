@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PoolCoin Mining Reward Claim Script for MinerV1 on BSC Testnet (chainId 97)
+PoolCoin Mining Reward Claim Script for MinerV1 on BSC (chain IDs 56 and 97)
 
 Claims finalized epoch mining rewards from MinerV1.
 DEFAULT MODE: Read-only simulation via eth_call (dry-run preflight).
@@ -10,7 +10,7 @@ maxFeePerGas >= max(eth_gasPrice, maxPriorityFeePerGas), and signs via Foundry k
 (--account / --password-file) using cast send (or legacy PRIVATE_KEY env fallback).
 
 HARD CONSTRAINTS ENFORCED:
-1. Hardcoded refusal for any chainId != 97 (BSC Testnet only).
+1. The RPC chain ID must match the selected network (testnet by default).
 2. Never reads .env or prints private keys. Private key is strictly from PRIVATE_KEY env var.
 3. Requires explicit manual confirmation ("yes") before broadcasting.
 4. EIP-1559 maxFeePerGas strictly >= network eth_gasPrice floor and >= maxPriorityFeePerGas.
@@ -59,6 +59,11 @@ except ImportError:
         resolve_eip1559_fees,
         validate_cli_fee_and_gas_args,
     )
+
+try:
+    from script.miner_network import EXPLORERS, MAINNET_CHAIN_ID, NETWORK_NAMES, add_chain_argument, chain_settings, verify_rpc_chain
+except ImportError:
+    from miner_network import EXPLORERS, MAINNET_CHAIN_ID, NETWORK_NAMES, add_chain_argument, chain_settings, verify_rpc_chain
 
 REQUIRED_CHAIN_ID = 97
 DEFAULT_MINER_CONTRACT = "0x565D06e8d0313E2f8b5aa4b19DE569ca2200C4cf"
@@ -416,17 +421,12 @@ def claim(args):
         deprecated_gas_price_gwei=getattr(args, "gas_price_gwei", None),
     )
 
-    rpc_url = args.rpc if args.rpc else get_working_rpc(DEFAULT_RPC_URLS)
-    
-    # 1. Enforce BSC Testnet
-    res = rpc_call(rpc_url, "eth_chainId", [])
-    chain_id = int(res, 16) if isinstance(res, str) else int(res)
-    if chain_id != REQUIRED_CHAIN_ID:
-        raise ValueError(
-            f"安全拦截: Chain ID {chain_id} != {REQUIRED_CHAIN_ID} (必须为 BSC Testnet)! 拒绝执行。"
-        )
+    chain_id, rpc_url, proxy = chain_settings(args, None, DEFAULT_MINER_CONTRACT)
+    rpc_url = rpc_url or get_working_rpc(DEFAULT_RPC_URLS)
+    verify_rpc_chain(rpc_call(rpc_url, "eth_chainId", []), chain_id)
+    token_symbol = "SPKH" if chain_id == MAINNET_CHAIN_ID else "TTK"
+    miner_contract = to_checksum_address(proxy)
 
-    miner_contract = to_checksum_address(args.miner_contract)
     
     # 2. Determine Miner Address & Signing Mode
     has_account = bool(getattr(args, "account", None) and args.account.strip())
@@ -542,7 +542,7 @@ def claim(args):
     print("=" * 78)
     print("                 PoolCoin 挖矿奖励领取脚本 (Reward Claimer)")
     print("=" * 78)
-    print(f"网络:                BSC Testnet (Chain ID {chain_id})")
+    print(f"网络:                {NETWORK_NAMES[chain_id]} (Chain ID {chain_id})")
     print(f"RPC 节点:            {sanitize_url(rpc_url)}")
     print(f"MinerV1 代理合约:    {miner_contract}")
     print(f"矿工地址 (msg.sender): {miner_addr}")
@@ -579,12 +579,12 @@ def claim(args):
         reward_label = "估算参考奖励 (待确认)"
 
     print(f"  • 轮次结算状态:     {settlement_status}")
-    print(f"  • 轮次有效配额:     {r_details['effectiveQuota'] / 1e18:.4f} TTK")
+    print(f"  • 轮次有效配额:     {r_details['effectiveQuota'] / 1e18:.4f} {token_symbol}")
     print(f"  • 矿工有效权重:     {r_details['userWeight']:,}")
     print(f"  • 全网总权重分母:   {max(r_details['totalWeight'], r_details['wMin']):,} (totalWeight={r_details['totalWeight']:,}, wMin={r_details['wMin']:,})")
     print(f"  • 单地址比例上限:   {r_details['capBps'] / 100:.2f}%")
     print(f"  • 链上已领取标记:   {r_details['claimed']}")
-    print(f"  • {reward_label}: {r_details['expectedReward'] / 1e18:.6f} TTK ({r_details['expectedReward']} wei)")
+    print(f"  • {reward_label}: {r_details['expectedReward'] / 1e18:.6f} {token_symbol} ({r_details['expectedReward']} wei)")
 
     if r_details["claimed"]:
         print(f"\n[提示] 该轮次 Epoch {epoch_to_claim} 的奖励此前已在链上领取完毕，无需重复操作。")
@@ -656,7 +656,7 @@ def claim(args):
         print(f"若要向网络广播真实领取交易，请使用 Foundry keystore 签名并执行:")
         print(f"  1. 准备 Foundry keystore 账户与密码文件 (--account 与 --password-file)")
         print(f"  2. 添加 --send 参数执行:")
-        print(f"     python script/claim.py --epoch {epoch_to_claim} --send --account <keystore_account> --password-file <password_file_path>")
+        print(f"     python script/claim.py --chain-id {chain_id} --epoch {epoch_to_claim} --send --account <keystore_account> --password-file <password_file_path>")
         print("=" * 78)
         return
 
@@ -668,9 +668,9 @@ def claim(args):
     print(f"签名调用方:   {miner_addr}")
     print(f"调用函数:     claim(uint256 e = {epoch_to_claim})")
     if epoch_settled is True:
-        print(f"已结算领取量: {r_details['expectedReward'] / 1e18:.6f} TTK")
+        print(f"已结算领取量: {r_details['expectedReward'] / 1e18:.6f} {token_symbol}")
     else:
-        print(f"估算铸造量:   {r_details['expectedReward'] / 1e18:.6f} TTK (以链上结算为准)")
+        print(f"估算铸造量:   {r_details['expectedReward'] / 1e18:.6f} {token_symbol} (以链上结算为准)")
     print(f"Gas Limit:    {gas_limit:,}")
     print(f"Max Fee:      {max_fee_wei / 1e9:.3f} gwei ({max_fee_wei} wei)")
     print(f"Priority Fee: {priority_fee_wei / 1e9:.3f} gwei ({priority_fee_wei} wei)")
@@ -678,7 +678,7 @@ def claim(args):
     print("=" * 78)
 
     # Secondary confirmation prompt
-    confirm = input("\n请确认是否向 BSC Testnet 广播领取交易？(输入 'yes' 确认发送): ")
+    confirm = input(f"\n请确认是否向 {NETWORK_NAMES[chain_id]} 广播领取交易？(输入 'yes' 确认发送): ")
     if confirm.strip().lower() != "yes":
         print("[已取消] 用户取消操作，未发送任何交易。")
         return
@@ -693,7 +693,7 @@ def claim(args):
         print("查询失败直接中止，不得回退为 0。")
         sys.exit(1)
 
-    print(f"\n[步骤 3/3] 正在向 BSC Testnet 广播交易 (Nonce: {account_nonce})...", flush=True)
+    print(f"\n[步骤 3/3] 正在向 {NETWORK_NAMES[chain_id]} 广播交易 (Nonce: {account_nonce})...", flush=True)
 
     if has_signer_flags:
         try:
@@ -736,7 +736,7 @@ def claim(args):
         raw_tx_hex = "0x" + signed_tx.raw_transaction.hex()
         tx_hash = rpc_call(rpc_url, "eth_sendRawTransaction", [raw_tx_hex])
     print(f"\n[广播成功] 交易哈希: {tx_hash}")
-    print(f"BscScan 浏览器查询: https://testnet.bscscan.com/tx/{tx_hash}")
+    print(f"BscScan 浏览器查询: {EXPLORERS[chain_id]}/tx/{tx_hash}")
 
     # Wait for receipt
     print("正在等待区块链打包上链确认...", flush=True)
@@ -760,33 +760,34 @@ def claim(args):
             print(f"[交易成功] 交易已在区块 #{block_num} 确认！")
             print(f"实际消耗 Gas: {gas_used:,}")
             if epoch_settled is True:
-                print(f"成功领取 Epoch {epoch_to_claim} 奖励 {r_details['expectedReward'] / 1e18:.6f} TTK！")
+                print(f"成功领取 Epoch {epoch_to_claim} 奖励 {r_details['expectedReward'] / 1e18:.6f} {token_symbol}！")
             else:
-                print(f"成功领取 Epoch {epoch_to_claim} 奖励（估算参考 {r_details['expectedReward'] / 1e18:.6f} TTK，实际以链上结算为准）！")
+                print(f"成功领取 Epoch {epoch_to_claim} 奖励（估算参考 {r_details['expectedReward'] / 1e18:.6f} {token_symbol}，实际以链上结算为准）！")
         else:
             print(f"[交易回滚] 交易在区块 #{block_num} 回滚，执行失败！")
             print(f"消耗 Gas: {gas_used:,}")
     else:
         print("[提示] 交易已提交，但超时未获取到回执。请在 BscScan 上查看最新状态:")
-        print(f"  https://testnet.bscscan.com/tx/{tx_hash}")
+        print(f"  {EXPLORERS[chain_id]}/tx/{tx_hash}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PoolCoin 挖矿奖励领取工具 (BSC Testnet)")
+    parser = argparse.ArgumentParser(description="PoolCoin 挖矿奖励领取工具 (BSC Mainnet / Testnet)")
     parser.add_argument("--epoch", type=int, default=None, help="目标领取轮次 (epoch id)")
     parser.add_argument("--miner", type=str, default=None, help="矿工钱包地址 (只读预检时必填或从私钥推导)")
     parser.add_argument("--account", type=str, default=None, help="Foundry keystore 钱包别名 (与 --password-file 搭配使用)")
     parser.add_argument("--password-file", type=str, default=None, help="Foundry keystore 密码文件路径 (与 --account 搭配使用)")
     parser.add_argument("--keystore", type=str, default=None, help="自定义加密 keystore 文件路径 (支持交互式原生 TTY 提示或配合 --password-file)")
     parser.add_argument("--send", action="store_true", help="发送真实链上交易 (默认仅进行 eth_call 预检)")
-    parser.add_argument("--rpc", type=str, default=None, help="自定义 BSC Testnet RPC 节点")
-    parser.add_argument("--miner-contract", type=str, default=DEFAULT_MINER_CONTRACT, help="MinerV1 代理合约地址")
+    parser.add_argument("--rpc", type=str, default=argparse.SUPPRESS, help="自定义 BSC RPC 节点")
+    parser.add_argument("--miner-contract", type=str, default=None, help="MinerV1 代理合约地址")
     parser.add_argument("--gas-multiplier", type=str, default="1.15", help="Max fee 浮动乘数 (默认: 1.15)")
     parser.add_argument("--max-fee-per-gas-gwei", type=str, default=None, help="显式指定 EIP-1559 maxFeePerGas (gwei)")
     parser.add_argument("--priority-fee-per-gas-gwei", type=str, default=None, help="显式指定 EIP-1559 maxPriorityFeePerGas (gwei)")
     parser.add_argument("--gas-price-gwei", type=str, default=None, help="[兼容别名] 等同于 --max-fee-per-gas-gwei (gwei)")
     parser.add_argument("--gas-limit", type=int, default=250000, help="Gas Limit 上限 (默认: 250000)")
 
+    add_chain_argument(parser)
     args = parser.parse_args()
     try:
         claim(args)
