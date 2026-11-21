@@ -49,7 +49,7 @@ mainnet
 
 使用 AI Agent 挖矿时，从仓库根目录打开 **[`skills/sparkhash-agentic-miner/SKILL.md`](../skills/sparkhash-agentic-miner/SKILL.md)**，并加载整个 `skills/sparkhash-agentic-miner/` 目录。币安钱包的配置与签名流程完整路径为 **[`skills/sparkhash-agentic-miner/AGENTIC_WALLET_MINING_GUIDE.md`](../skills/sparkhash-agentic-miner/AGENTIC_WALLET_MINING_GUIDE.md)**；请勿到根目录或顶层 `docs/` 下查找同名文件。
 
-当前为主网矿工预览版。[2026-11-21 实盘验收报告](../reports/07-mainnet-miner-preview-verification.md)记录了 RTX 4060 Ti CLI 与币安 Agentic Wallet 的验收结果及待补回执。生产推荐本地 GPU/多核离线求解，币安 AI 复算哈希并 preview 后签名提交；App 内置 AI 沙盒本次实测仅有 2 核 CPU，不适合直接主网求解。Agentic Wallet 建议使用独立小额隔离钱包，仅转入 0.03–0.05 BNB，并逐笔核对 preview 的目标合约与 value。
+当前为 BSC 主网矿工预览版。项目方尚未提供官方交易池，SPKH 奖励不承诺兑换、回购或收益；初始预分配和供应口径见[供应披露](DISCLOSURE.md)。[2026-11-21 实盘验收报告](../reports/07-mainnet-miner-preview-verification.md)记录了 RTX 4060 Ti CLI 与币安 Agentic Wallet 的提交、领奖证据及仍待验证的本金赎回。本次流程为本机 GPU 为币安钱包公开地址求解，币安 Agent 复核参数和 preview，用户确认后钱包签名提交。App AI 沙盒本次实测为 2 核 CPU，运行 400 秒本次实测未出解，不推广为所有版本的限制。Agentic Wallet 建议使用独立小额隔离钱包，仅转入 0.03–0.05 BNB，并逐笔核对 preview 的目标合约与 value。
 
 ## 2. 准备钱包、Gas 和质押 BNB
 

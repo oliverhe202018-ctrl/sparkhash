@@ -6,7 +6,7 @@
 
 ## 主网实盘经验（2026-11-21）
 
-- **算力架构：** 本次实测币安 App 内置 AI 沙盒仅有 2 核 CPU，不适合直接跑主网 PoW 求解。求解放到本地 GPU 或多核机器，只处理公开任务和钱包地址，不接触私钥。将 k、nonce、calldata 交给钱包侧 AI，重新读取链上任务、复算哈希并校验 calldata 后再 preview 和签名。
+- **算力架构：** 本次币安 App AI 沙盒为 2 核 CPU，运行 400 秒本次实测未出解；这不代表所有版本或环境均有相同限制。本次成功流程由本机 GPU 为币安钱包公开地址求解，只处理公开任务和地址，不接触私钥。将 k、nonce、calldata 交给币安 Agent，重新读取链上任务、复算哈希并校验 calldata 后展示 preview，用户确认本笔交易后由钱包签名提交。
 - **安全风控：** 本次币安 App 实测日限额最低为 **$1,000**，且暂未提供合约白名单界面。强烈建议新建独立小额隔离钱包，仅转入 **0.03–0.05 BNB** 用于质押与 Gas；逐笔核对 preview 中的目标合约与 value。Skill 内的地址限制不能代替钱包端强制白名单。App 功能与限额可能变化，以实际界面为准。
 - **路径指引：** 教程统一使用上述完整仓库路径；入口为同目录的 [SKILL.md](SKILL.md)。链上证据与待验收项见[主网矿工预览版实盘验收报告](../../reports/07-mainnet-miner-preview-verification.md)。
 
@@ -22,6 +22,8 @@ flowchart LR
 ```
 
 ## 1. 创建隔离钱包并转入 0.03–0.05 BNB
+
+当前为 BSC 主网矿工预览。项目方尚未提供官方交易池，SPKH 奖励不承诺兑换、回购或收益。SPKH 有初始预分配，详见[供应披露](../../docs/DISCLOSURE.md)；实测钱包领取余额不直接代表独立公众流通。
 
 打开币安 App，在 **钱包 → Agentic Wallet** 入口新建独立小额隔离钱包，打开收款页面，复制它在 **BNB Smart Chain（BSC）** 上的地址。仅向这个地址转入 **0.03–0.05 BNB**，转账时网络也选 BNB Smart Chain。检查 App 是否显示余额到账。 [币安 Agentic Wallet 官方说明](https://developers.binance.com/en/docs/products/agentic-wallet/welcome)
 
