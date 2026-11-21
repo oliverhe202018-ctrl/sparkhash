@@ -429,7 +429,7 @@ def submit(args):
 
     # 6. Real Send Mode
     print("\n" + "=" * 50)
-    print("WARNING: YOU ARE ABOUT TO BROADCAST A REAL TRANSACTION TO BSC TESTNET!")
+    print(f"WARNING: YOU ARE ABOUT TO BROADCAST A REAL TRANSACTION TO {NETWORK_NAMES[chain_id].upper()}!")
     print("=" * 50)
 
     private_key = None

@@ -513,6 +513,32 @@ class TestScriptsSafeOutput(unittest.TestCase):
         self._assert_no_secrets(out, err)
         self.assertIn("FileNotFoundError:", err)
 
+    def test_submit_share_send_warning_uses_verified_chain(self):
+        for chain_id, network in ((56, "BSC MAINNET"), (97, "BSC TESTNET")):
+            with self.subTest(chain_id=chain_id):
+                argv = [
+                    "submit_share.py", "--chain-id", str(chain_id), "--rpc", TOKEN_URL,
+                    "--miner", TEST_MINER, "--epoch", "18", "--k", "0", "--nonce", "1",
+                    "--keystore", "miner.json", "--password-file", PW_PATH_WIN, "--send",
+                ]
+                rpc_results = {
+                    "eth_chainId": hex(chain_id),
+                    "eth_call": _abi_word_uint(18),
+                    "eth_gasPrice": hex(3_000_000_000),
+                    "eth_maxPriorityFeePerGas": hex(100_000_000),
+                }
+                with (
+                    patch.object(submit_share, "rpc_call", side_effect=lambda url, method, params: rpc_results[method]),
+                    patch.object(submit_share, "simulate_call", return_value=(True, 140000, None)),
+                    patch.object(submit_share, "get_keystore_address", return_value=TEST_MINER),
+                    patch.object(submit_share, "cast_send") as send,
+                    patch("builtins.input", return_value="no"),
+                ):
+                    code, out, err = _run_cli(submit_share.main, argv, {"PRIVATE_KEY": "", "MINER_PRIVATE_KEY": ""})
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"WARNING: YOU ARE ABOUT TO BROADCAST A REAL TRANSACTION TO {network}!", out)
+                send.assert_not_called()
+
     def test_submit_share_normal_dry_run_preserves_output_and_hashes(self):
         def fake_urlopen(req, timeout=15):
             payload = json.loads(req.data.decode("utf-8"))
