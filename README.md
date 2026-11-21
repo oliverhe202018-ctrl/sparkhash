@@ -2,7 +2,9 @@
 
 SparkHash 是部署在 **BNB Smart Chain 主网（BSC，Chain ID 56）** 的开源工作量证明挖矿协议。矿工质押原生 BNB，用 CPU 或 GPU 在本地寻找有效的 PoW share，再由合约按统一规则验证份额、结算轮次并分配 SPKH。
 
-社区矿工可以通过命令行挖矿，也可以使用 **SparkHash Agent Skill + 币安 Agentic Wallet**。AI Agent 可自动读取任务、调用本地 CPU 求解并准备提交或领奖交易。钱包负责预览和签名，用户逐笔确认。
+社区矿工可以通过命令行挖矿，也可以使用 **SparkHash Agent Skill + 币安 Agentic Wallet**。推荐本地 GPU/多核离线求解（不接触私钥，仅产出 k/nonce/calldata），由币安 AI 复算哈希校验，钱包负责 preview 预览和签名，用户逐笔确认。
+
+当前为**主网矿工预览版**。2026-11-21 的传统 CLI 与 Agentic Wallet 两次实盘结果、链上证据及待完成的领奖/本金赎回见[实盘验收报告](reports/07-mainnet-miner-preview-verification.md)。
 
 ## 快速开始 · Quick Start
 
@@ -13,7 +15,7 @@ SparkHash 是部署在 **BNB Smart Chain 主网（BSC，Chain ID 56）** 的开�
 **从仓库根目录打开 [`skills/sparkhash-agentic-miner/SKILL.md`](skills/sparkhash-agentic-miner/SKILL.md)**。将整个 `skills/sparkhash-agentic-miner/` 目录加载到支持 Skills 的客户端，保留脚本和文档的目录结构，再显式调用 `sparkhash-agentic-miner`。
 
 - **本地只读求解器** [`skills/sparkhash-agentic-miner/solver.py`](skills/sparkhash-agentic-miner/solver.py)
-- **币安 Agentic Wallet 自动挖矿教程** [`skills/sparkhash-agentic-miner/docs/AGENTIC_WALLET_MINING_GUIDE.md`](skills/sparkhash-agentic-miner/docs/AGENTIC_WALLET_MINING_GUIDE.md)
+- **币安 Agentic Wallet 自动挖矿教程** [`skills/sparkhash-agentic-miner/AGENTIC_WALLET_MINING_GUIDE.md`](skills/sparkhash-agentic-miner/AGENTIC_WALLET_MINING_GUIDE.md)。这是从仓库根目录读取的完整路径；请勿到根目录或顶层 `docs/` 下查找同名文件。
 
 ## 主网合约 · Mainnet Contracts
 
