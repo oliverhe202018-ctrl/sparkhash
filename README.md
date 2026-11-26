@@ -4,7 +4,7 @@ SparkHash 是部署在 **BNB Smart Chain 主网（BSC，Chain ID 56）** 的开�
 
 社区矿工可以通过命令行挖矿，也可以使用 **SparkHash Agent Skill + 币安 Agentic Wallet**。推荐本地 GPU/多核离线求解（不接触私钥，仅产出 k/nonce/calldata），由币安 AI 复算哈希校验，钱包负责 preview 预览和签名，用户逐笔确认。
 
-当前为 **BSC 主网矿工预览版**。项目方尚未提供官方交易池；SPKH 奖励不承诺兑换、回购或收益。2026-11-21 的传统 CLI 与 Agentic Wallet 两条实盘路径、已复核的提交和领奖回执及仍待验证的本金赎回见[实盘验收报告](reports/07-mainnet-miner-preview-verification.md)。[供应与主网预览披露](docs/DISCLOSURE.md)区分初始预分配、已铸造、项目控制、团队归属、矿工已领取与经确认的独立公众流通。
+当前为 **BSC 主网矿工预览版**。项目方尚未提供官方交易池；SPKH 奖励不承诺兑换、回购或收益。2026-11-21 两条实盘路径（传统 CLI 与 Agentic Wallet）的提交和领奖回执，以及 2026-11-26 传统 CLI 补录并核验的 Epoch 129 本金赎回闭环、复挖质押、Epoch 130 满额领奖与 Epoch 131 6 份批量打包提交见[实盘验收报告](reports/07-mainnet-miner-preview-verification.md)。[供应与主网预览披露](docs/DISCLOSURE.md)区分初始预分配、已铸造、项目控制、团队归属、矿工已领取与经确认的独立公众流通。
 
 ## 快速开始 · Quick Start
 
